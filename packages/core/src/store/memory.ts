@@ -67,7 +67,8 @@ import {
   sameFacts,
 } from './rules.js'
 import { ConstraintError, NotFoundError, TransactionClosedError } from './store.js'
-import type { EventQuery, NewOutboxEvent, OutboxEvent } from './events.js'
+import { EventHistoryPrunedError } from './events.js'
+import type { EventQuery, NewOutboxEvent, OutboxEvent, PruneEventsResult } from './events.js'
 import { exceptionChanged, expectationAmended, expectationChanged, movementDecided } from './events.js'
 import { expectationReferenceKeys } from '../matching/reference.js'
 
@@ -95,6 +96,7 @@ interface State {
   readonly journal: Map<string, JournalEntry>
   eventSeq: number
   readonly events: Map<string, OutboxEvent>
+  readonly eventPrunedThrough: Map<string, number>
   /** Movement id → its entry ids in posting order. Arrays are replaced, never pushed to. */
   readonly journalByMovement: Map<string, readonly string[]>
   periodActions: readonly {
@@ -123,6 +125,7 @@ function emptyState(): State {
     journalByMovement: new Map(),
     eventSeq: 0,
     events: new Map(),
+    eventPrunedThrough: new Map(),
     periodActions: [],
   }
 }
@@ -144,6 +147,7 @@ function cloneState(s: State): State {
     journalByMovement: new Map(s.journalByMovement),
     eventSeq: s.eventSeq,
     events: new Map(s.events),
+    eventPrunedThrough: new Map(s.eventPrunedThrough),
     periodActions: [...s.periodActions],
   }
 }
@@ -185,9 +189,12 @@ abstract class MemoryReader implements StoreReader {
 
   async listMovements(q: MovementQuery): Promise<Movement[]> {
     this.check()
+    if (q.ids?.length === 0) return []
+    const ids = q.ids === undefined ? null : new Set(q.ids)
     const out: Movement[] = []
     for (const m of this.snapshot().movements.values()) {
       if (m.tenantId !== q.tenantId) continue
+      if (ids !== null && !ids.has(m.id)) continue
       if (q.disposition !== undefined && m.disposition !== q.disposition) continue
       if (q.account !== undefined && m.account !== q.account) continue
       if (q.afterSeq !== undefined && m.seq <= q.afterSeq) continue
@@ -222,9 +229,12 @@ abstract class MemoryReader implements StoreReader {
 
   async listExpectations(q: ExpectationQuery): Promise<Expectation[]> {
     this.check()
+    if (q.ids?.length === 0) return []
+    const ids = q.ids === undefined ? null : new Set(q.ids)
     const out: Expectation[] = []
     for (const e of this.snapshot().expectations.values()) {
       if (e.tenantId !== q.tenantId) continue
+      if (ids !== null && !ids.has(e.id)) continue
       if (q.account !== undefined && e.account !== q.account) continue
       if (q.asset !== undefined && e.amount.asset !== q.asset) continue
       if (q.direction !== undefined && e.direction !== q.direction) continue
@@ -239,11 +249,16 @@ abstract class MemoryReader implements StoreReader {
 
   async listAllocations(q: AllocationQuery): Promise<Allocation[]> {
     this.check()
+    if (q.movementIds?.length === 0 || q.expectationIds?.length === 0) return []
+    const movementIds = q.movementIds === undefined ? null : new Set(q.movementIds)
+    const expectationIds = q.expectationIds === undefined ? null : new Set(q.expectationIds)
     const out: Allocation[] = []
     for (const a of this.snapshot().allocations.values()) {
       if (a.tenantId !== q.tenantId) continue
       if (q.movementId !== undefined && a.movementId !== q.movementId) continue
+      if (movementIds !== null && !movementIds.has(a.movementId)) continue
       if (q.expectationId !== undefined && a.expectationId !== q.expectationId) continue
+      if (expectationIds !== null && !expectationIds.has(a.expectationId)) continue
       out.push(a)
     }
     return out
@@ -257,13 +272,20 @@ abstract class MemoryReader implements StoreReader {
 
   async listExceptions(q: ExceptionQuery): Promise<ExceptionRecord[]> {
     this.check()
+    if (q.ids?.length === 0 || q.movementIds?.length === 0 || q.expectationIds?.length === 0) return []
+    const ids = q.ids === undefined ? null : new Set(q.ids)
+    const movementIds = q.movementIds === undefined ? null : new Set(q.movementIds)
+    const expectationIds = q.expectationIds === undefined ? null : new Set(q.expectationIds)
     const out: ExceptionRecord[] = []
     for (const e of this.snapshot().exceptions.values()) {
       if (e.tenantId !== q.tenantId) continue
+      if (ids !== null && !ids.has(e.id)) continue
       if (q.status !== undefined && e.status !== q.status) continue
       if (q.code !== undefined && e.code !== q.code) continue
       if (q.movementId !== undefined && e.movementId !== q.movementId) continue
+      if (movementIds !== null && (e.movementId === null || !movementIds.has(e.movementId))) continue
       if (q.expectationId !== undefined && e.expectationId !== q.expectationId) continue
+      if (expectationIds !== null && (e.expectationId === null || !expectationIds.has(e.expectationId))) continue
       if (q.afterSeq !== undefined && e.seq <= q.afterSeq) continue
       out.push(e)
       if (q.limit !== undefined && out.length >= q.limit) break
@@ -273,6 +295,10 @@ abstract class MemoryReader implements StoreReader {
 
   async listEvents(q: EventQuery): Promise<OutboxEvent[]> {
     this.check()
+    const prunedThrough = this.snapshot().eventPrunedThrough.get(q.tenantId) ?? 0
+    if (q.afterSeq !== undefined && q.afterSeq < prunedThrough) {
+      throw new EventHistoryPrunedError(q.tenantId, q.afterSeq, prunedThrough)
+    }
     const out: OutboxEvent[] = []
     for (const e of this.snapshot().events.values()) {
       if (e.tenantId !== q.tenantId) continue
@@ -283,15 +309,23 @@ abstract class MemoryReader implements StoreReader {
     return out
   }
 
+  async getEventsPrunedThrough(tenantId: string): Promise<number> {
+    this.check()
+    return this.snapshot().eventPrunedThrough.get(tenantId) ?? 0
+  }
+
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
     this.check()
+    if (q.movementIds?.length === 0) return []
     const state = this.snapshot()
     const ids =
       q.movementId === undefined ? [...state.journal.keys()] : (state.journalByMovement.get(q.movementId) ?? [])
+    const movementIds = q.movementIds === undefined ? null : new Set(q.movementIds)
     const out: JournalEntry[] = []
     for (const id of ids) {
       const e = state.journal.get(id)!
       if (e.tenantId !== q.tenantId) continue
+      if (movementIds !== null && (e.movementId === null || !movementIds.has(e.movementId))) continue
       if (q.afterSeq !== undefined && e.seq <= q.afterSeq) continue
       if (q.effectiveFrom !== undefined && e.effectiveAt.getTime() < q.effectiveFrom.getTime()) continue
       if (q.effectiveBefore !== undefined && e.effectiveAt.getTime() >= q.effectiveBefore.getTime()) continue
@@ -482,6 +516,28 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.check()
     checkCursorValue(value)
     this.draft.cursors.set(cursorKey(k), value)
+  }
+
+  async pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult> {
+    this.check()
+    if (!Number.isFinite(olderThan.getTime())) throw new Error('olderThan must be a valid date')
+    const events = [...this.draft.events.values()]
+      .filter((event) => event.tenantId === tenantId)
+      .sort((a, b) => a.seq - b.seq)
+    const firstRecent = events.find((event) => event.createdAt > olderThan)
+    const prefixThrough = firstRecent?.seq === undefined
+      ? events.at(-1)?.seq ?? 0
+      : firstRecent.seq - 1
+    const consumerPositions = [...this.draft.cursors.entries()].flatMap(([storedKey, value]) => {
+      const [cursorTenant, network, source] = JSON.parse(storedKey) as string[]
+      return cursorTenant === tenantId && network === 'nostro' && source === 'outbox' ? [Number(value)] : []
+    })
+    const safeThrough = Math.min(prefixThrough, consumerPositions.length === 0 ? prefixThrough : Math.min(...consumerPositions))
+    const removed = events.filter((event) => event.seq <= safeThrough && event.createdAt <= olderThan)
+    for (const event of removed) this.draft.events.delete(event.id)
+    const prunedThrough = Math.max(this.draft.eventPrunedThrough.get(tenantId) ?? 0, removed.at(-1)?.seq ?? 0)
+    if (prunedThrough > 0) this.draft.eventPrunedThrough.set(tenantId, prunedThrough)
+    return { deleted: removed.length, prunedThrough }
   }
 
   async insertExpectation(n: NewExpectation): Promise<Expectation> {

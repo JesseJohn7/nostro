@@ -89,7 +89,10 @@ export async function deliverWebhooks(options: DeliverOptions): Promise<DeliverR
   const now = options.now ?? (() => new Date())
   const key = eventCursorKey(tenantId, options.consumer ?? 'webhook')
   const saved = await store.getCursor(key)
-  let position = saved === null ? 0 : Number(saved)
+  let position = saved === null ? await store.getEventsPrunedThrough(tenantId) : Number(saved)
+  if (saved === null) {
+    await store.transaction((tx) => tx.setCursor(key, String(position)))
+  }
   let delivered = 0
 
   const events = await store.listEvents({ tenantId, afterSeq: position, limit: options.limit ?? 100 })

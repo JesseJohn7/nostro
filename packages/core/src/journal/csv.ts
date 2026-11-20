@@ -60,42 +60,38 @@ export function journalCsvCell(value: string | number | null, text = false): str
 
 export const journalCsvRow = (cells: readonly string[]) => `${cells.join(',')}\r\n`
 
-/** Read the matching journal entries in bounded pages. */
-export async function* journalEntries(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry> {
+async function* journalEntryPages(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry[]> {
   const { store, tenantId } = options
   const pageSize = options.pageSize ?? 500
   let afterSeq: number | undefined
   for (;;) {
-    const page: JournalEntry[] = await store.listJournalEntries({
+    const page = await store.listJournalEntries({
       tenantId,
       limit: pageSize,
       ...(afterSeq === undefined ? {} : { afterSeq }),
       ...(includeBeforeFrom || options.from === undefined ? {} : { effectiveFrom: options.from }),
       ...(options.to === undefined ? {} : { effectiveBefore: options.to }),
     })
+    if (page.length === 0) return
+    yield page
+    if (page.length < pageSize) return
+    afterSeq = page[page.length - 1]!.seq
+  }
+}
+
+/** Read the matching journal entries in bounded pages. */
+export async function* journalEntries(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry> {
+  for await (const page of journalEntryPages(options, includeBeforeFrom)) {
     for (const entry of page) {
       if (options.throughSeq !== undefined && entry.seq > options.throughSeq) return
       yield entry
     }
-    if (page.length < pageSize) return
-    afterSeq = page[page.length - 1]!.seq
   }
 }
 
 /** The CSV, header first, a row at a time; suitable for streaming large ledgers. */
 export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerator<string> {
   const { store, tenantId } = options
-  const txHash = new Map<string, string | null>()
-  const reference = new Map<string, string | null>()
-  const code = new Map<string, string | null>()
-  const dimensionValues = new Map<string, Map<string, string | null>>()
-
-  if (options.dimensions) {
-    for (const dim of options.dimensions) {
-      dimensionValues.set(dim, new Map())
-    }
-  }
-
   const dimColumnNames = options.dimensions ?? []
   const allColumns = [...JOURNAL_CSV_COLUMNS, ...dimColumnNames]
   yield journalCsvRow(allColumns.map((c) => c))
@@ -103,51 +99,55 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
   const expectationMetadatas = new Map<string, Record<string, string | null>>()
   const rounder = options.decimals === undefined ? null : new JournalRounder(options.decimals)
 
-  for await (const original of journalEntries(options, rounder !== null)) {
-    const entry = rounder === null ? original : rounder.round(original)
-    if (rounder !== null && options.from !== undefined && original.effectiveAt < options.from) continue
-    if (entry.movementId !== null && !txHash.has(entry.movementId)) {
-      txHash.set(entry.movementId, (await store.getMovement(tenantId, entry.movementId))?.txHash ?? null)
-    }
-    for (const [i, line] of entry.lines.entries()) {
-      if (line.expectationId !== null && !reference.has(line.expectationId)) {
-        reference.set(line.expectationId, (await store.getExpectation(tenantId, line.expectationId))?.reference ?? null)
+  for await (const originalPage of journalEntryPages(options, rounder !== null)) {
+    const page = originalPage.filter((entry) => options.throughSeq === undefined || entry.seq <= options.throughSeq)
+    if (page.length === 0) return
+    const movementIds = [...new Set(page.flatMap((entry) => entry.movementId === null ? [] : [entry.movementId]))]
+    const expectationIds = [...new Set(page.flatMap((entry) => entry.lines.flatMap((line) => line.expectationId === null ? [] : [line.expectationId])))]
+    const exceptionIds = [...new Set(page.flatMap((entry) => entry.lines.flatMap((line) => line.exceptionId === null ? [] : [line.exceptionId])))]
+    const [movements, expectations, exceptions] = await Promise.all([
+      store.listMovements({ tenantId, ids: movementIds }),
+      store.listExpectations({ tenantId, ids: expectationIds }),
+      store.listExceptions({ tenantId, ids: exceptionIds }),
+    ])
+    const txHash = new Map(movements.map((movement) => [movement.id, movement.txHash]))
+    const reference = new Map(expectations.map((expectation) => [expectation.id, expectation.reference]))
+    const codes = new Map(exceptions.map((exception) => [exception.id, exception.code]))
+    const expectationMetadatas = new Map(expectations.map((expectation) => [expectation.id, expectation.metadata]))
+
+    for (const original of page) {
+      const entry = rounder === null ? original : rounder.round(original)
+      if (rounder !== null && options.from !== undefined && original.effectiveAt < options.from) continue
+      for (const [i, line] of entry.lines.entries()) {
+        const expectationId = line.expectationId ?? null
+        const amount = line.amount.toString()
+        const dimCells: string[] = []
+        for (const dim of dimColumnNames) {
+          const metadata = expectationMetadatas.get(expectationId) ?? {}
+          const val = metadata[dim] ?? ''
+          dimCells.push(journalCsvCell(val, true))
+        }
+        yield journalCsvRow([
+          journalCsvCell(entry.id),
+          journalCsvCell(entry.seq),
+          journalCsvCell(entry.kind),
+          journalCsvCell(entry.postedAt.toISOString()),
+          journalCsvCell(entry.effectiveAt.toISOString()),
+          journalCsvCell(entry.description, true),
+          journalCsvCell(i + 1),
+          journalCsvCell(line.account, true),
+          journalCsvCell(line.role),
+          journalCsvCell(line.amount.asset),
+          journalCsvCell(line.side === 'debit' ? amount : null),
+          journalCsvCell(line.side === 'credit' ? amount : null),
+          journalCsvCell(entry.movementId),
+          journalCsvCell(entry.movementId === null ? null : (txHash.get(entry.movementId) ?? null)),
+          journalCsvCell(line.expectationId === null ? null : (reference.get(line.expectationId) ?? null), true),
+          ...dimCells,
+          journalCsvCell(line.exceptionId),
+          journalCsvCell(line.exceptionId === null ? null : (codes.get(line.exceptionId) ?? null)),
+        ])
       }
-      if (line.exceptionId !== null && !code.has(line.exceptionId)) {
-        code.set(line.exceptionId, (await store.getException(tenantId, line.exceptionId))?.code ?? null)
-      }
-      const expectationId = line.expectationId ?? null
-      if (expectationId && !expectationMetadatas.has(expectationId) && options.dimensions) {
-        const expectation = await store.getExpectation(tenantId, expectationId)
-        expectationMetadatas.set(expectationId, expectation ? expectation.metadata : {})
-      }
-      const amount = line.amount.toString()
-      const dimCells: string[] = []
-      for (const dim of dimColumnNames) {
-        const metadata = expectationMetadatas.get(expectationId) ?? {}
-        const val = metadata[dim] ?? ''
-        dimCells.push(journalCsvCell(val, true))
-      }
-      yield journalCsvRow([
-        journalCsvCell(entry.id),
-        journalCsvCell(entry.seq),
-        journalCsvCell(entry.kind),
-        journalCsvCell(entry.postedAt.toISOString()),
-        journalCsvCell(entry.effectiveAt.toISOString()),
-        journalCsvCell(entry.description, true),
-        journalCsvCell(i + 1),
-        journalCsvCell(line.account, true),
-        journalCsvCell(line.role),
-        journalCsvCell(line.amount.asset),
-        journalCsvCell(line.side === 'debit' ? amount : null),
-        journalCsvCell(line.side === 'credit' ? amount : null),
-        journalCsvCell(entry.movementId),
-        journalCsvCell(entry.movementId === null ? null : (txHash.get(entry.movementId) ?? null)),
-        journalCsvCell(line.expectationId === null ? null : (reference.get(line.expectationId) ?? null), true),
-        ...dimCells,
-        journalCsvCell(line.exceptionId),
-        journalCsvCell(line.exceptionId === null ? null : (code.get(line.exceptionId) ?? null)),
-      ])
     }
   }
 }

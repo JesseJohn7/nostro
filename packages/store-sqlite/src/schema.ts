@@ -381,4 +381,20 @@ PRIMARY KEY (tenant_id, destination)
       )
       BEGIN SELECT RAISE(ABORT, 'muxed id already used on account'); END;
   `,
+
+  // Support batched exception lookups by expectation.
+  () => `CREATE INDEX IF NOT EXISTS exceptions_expectation
+    ON exceptions (tenant_id, expectation_id) WHERE expectation_id IS NOT NULL;`,
+
+  // Event retention watermark and guarded pruning.
+  () => `
+    CREATE TABLE event_prune_state (
+      tenant_id TEXT PRIMARY KEY,
+      pruned_through INTEGER NOT NULL DEFAULT 0 CHECK (pruned_through >= 0)
+    );
+    DROP TRIGGER events_no_delete;
+    CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+      WHEN nostro_event_prune_allowed() = 0
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+  `,
 ]

@@ -75,11 +75,22 @@ async function candidatesFor(tx: StoreTx, movement: Movement): Promise<Candidate
     if (normalized !== '') add(await tx.getExpectationsByNormalizedReference(tenantId, normalized))
   }
 
+  const allocations = await tx.listAllocations({
+    tenantId,
+    expectationIds: [...found.keys()],
+  })
+  const allocationsByExpectation = new Map<string, typeof allocations>()
+  for (const allocation of allocations) {
+    allocationsByExpectation.set(allocation.expectationId, [
+      ...(allocationsByExpectation.get(allocation.expectationId) ?? []),
+      allocation,
+    ])
+  }
+
   const candidates: Candidate[] = []
   for (const expectation of found.values()) {
-    const allocations = await tx.listAllocations({ tenantId, expectationId: expectation.id })
     const paid = sumAmounts(
-      allocations.map((a) => a.amount),
+      (allocationsByExpectation.get(expectation.id) ?? []).map((a) => a.amount),
       expectation.amount,
     )
     candidates.push({ expectation, remaining: expectation.amount.subtract(paid) })
