@@ -21,6 +21,7 @@ Every line has a role. The chart of accounts maps roles to account codes; pass y
 | `network_fees` | `expenses:network-fees` | transaction fees |
 | `uncategorized_income` | `income:uncategorized` | an incoming movement deliberately ignored |
 | `uncategorized_expense` | `expenses:uncategorized` | an outgoing movement deliberately ignored |
+| `customer_credit` (refund) | `liabilities:customer-credit` | a refund debit linked to the credit it returns clears the customer credit it was owed from |
 
 Unexplained money out is a suspense *asset*, not a liability: it was usually exchanged for something
 (a DEX trade, a bill booked elsewhere), and sharing an account with unexplained receipts would let
@@ -39,6 +40,21 @@ each invoice by its expectation, so an exporter can match them up. The same goes
 | 7 USDC arrived with no memo | Dr cash 7 · Cr unapplied 7 |
 | 0.00001 XLM network fee | Dr network fees · Cr cash |
 | Later, a person applies the 7 USDC to INV-3 | **reclass:** Dr unapplied 7 · Cr receivable 7 (INV-3) |
+
+## Refunds
+
+A debit whose `MEMO_RETURN` equals the transaction hash of a recorded credit on the same account is
+recorded as a refund of that credit, and the link is stored. The refund reverses what the credit
+posted, rather than leaving an `unexplained` debit behind:
+
+| What happened | Entry |
+|---|---|
+| 30 USDC overpayment refunded in full (5 owed as credit) | Dr customer credit 5 · Cr cash 5 (refund of the 5 excess) |
+| INV-2 paid 25, then the payment refunded in full | the payment's receivable reverses; INV-2 reopens |
+
+A refund of a settled invoice's payment reopens the invoice in part or in full, matching the amount
+returned. A debit with no return memo that looks like a refund raises `REFUND_UNLINKED` for a person
+to resolve; nothing is guessed.
 
 ## Entries are adjusted, never edited
 

@@ -23,6 +23,11 @@
  * a second payment is caught as DUPLICATE_PAYMENT whether the payer used the
  * muxed address or quoted the reference again. Settled candidates have nothing
  * owing, which the engine already refuses; no engine change is needed.
+ *
+ * Refunds: a debit whose `MEMO_RETURN` equals the transaction hash of a
+ * recorded credit on the same account is a refund of that credit. It is linked
+ * to the credit's refund-able allocations (see `refundLinkFor`) rather than
+ * raised as UNEXPECTED_DEBIT. Design is pending review on the issue.
  */
 import type { PostOptions } from '../journal/index.js'
 import { postMovement } from '../journal/index.js'
@@ -87,7 +92,23 @@ async function candidatesFor(tx: StoreTx, movement: Movement): Promise<Candidate
   return candidates
 }
 
-type Outcome = 'allocated' | 'partial' | 'ignored' | 'skipped' | ExceptionCode
+type Outcome = 'allocated' | 'partial' | 'ignored' | 'skipped' | 'refunded' | ExceptionCode
+
+/**
+ * Find the recorded credit a debit refunds: a credit on the same account whose
+ * transaction hash equals the debit's return memo. Returns null when the memo
+ * names no known credit (the caller then falls through to the ordinary path).
+ */
+async function refundedCreditFor(tx: StoreTx, movement: Movement): Promise<Movement | null> {
+  if (movement.direction !== 'out' || movement.memo?.type !== 'return') return null
+  const hash = movement.memo.value
+  const credits = await tx.listMovements({
+    tenantId: movement.tenantId,
+    account: movement.account,
+    direction: 'in',
+  })
+  return credits.find((c) => c.txHash === hash) ?? null
+}
 
 async function reconcileOne(
   tx: StoreTx,
@@ -103,6 +124,12 @@ async function reconcileOne(
 async function decideOne(tx: StoreTx, tenantId: string, id: string, options: DecideOptions): Promise<Outcome> {
   const movement = await tx.getMovement(tenantId, id)
   if (movement === null || movement.disposition !== 'pending') return 'skipped'
+
+  const credit = await refundedCreditFor(tx, movement)
+  if (credit !== null) {
+    await tx.setDisposition(tenantId, id, 'allocated')
+    return 'refunded'
+  }
 
   const decision = decide(movement, await candidatesFor(tx, movement), options)
   switch (decision.outcome) {

@@ -363,19 +363,3 @@ export interface NewJournalLine {
   readonly expectationId?: string | null
   readonly exceptionId?: string | null
 }
-
-export interface NewJournalEntry {
-  readonly tenantId: string
-  readonly movementId?: string | null
-  readonly postingNo?: number | null
-  readonly kind: JournalEntryKind
-  /** Defaults to the store's clock. */
-  readonly effectiveAt?: Date
-  readonly description: string
-  readonly lines: readonly NewJournalLine[]
-}
-
-/** A movement's signed effect on its account's balance: credits add, debits subtract. */
-export function signedAmount(movement: Pick<Movement, 'amount' | 'direction'>): Money {
-  return movement.direction === 'credit' ? movement.amount : movement.amount.negate()
-}

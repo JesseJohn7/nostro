@@ -135,4 +135,6 @@ These are known gaps, each planned as its own self-contained piece of work:
 - **One payment covering several invoices** with no per-invoice reference. Today this is an
   exception for a person to split.
 - **Return memos on credits.** A `MEMO_RETURN` currently raises `MEMO_MALFORMED`. Pairing it with
-  the original payment is left for the refunds work (#15).
+  the original payment is left for the refunds work (#15). Once that lands, a debit whose
+  `MEMO_RETURN` equals the transaction hash of a recorded credit on the same account will be recorded
+  as a refund of that credit rather than `UNEXPECTED_DEBIT`; see the refunds design in #15.

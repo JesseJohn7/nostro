@@ -39,6 +39,11 @@ export interface MovementQuery {
   /** Return movements with `seq` greater than this; for paging in ingest order. */
   readonly afterSeq?: number
   readonly limit?: number
+  /**
+   * Movements whose `txHash` equals this value (case-insensitive hex).
+   * Used to find the credit a refund's `MEMO_RETURN` points at.
+   */
+  readonly txHash?: string
 }
 
 export interface ExpectationQuery {
@@ -103,6 +108,26 @@ export interface JournalPeriod {
   readonly closedAt: Date
 }
 
+/**
+ * A recorded link from a refund debit to the credit it returns.
+ *
+ * A refund is an allocation-like fact between two movements rather than
+ * between a movement and an expectation, so it gets its own record. Amounts
+ * are in the credit's asset; `amount` is the part of the original credit
+ * returned by this debit. The sum of `amount` across all links for one credit
+ * never exceeds that credit's amount.
+ */
+export interface RefundLink {
+  readonly id: string
+  readonly tenantId: string
+  /** The original inbound credit being refunded. */
+  readonly creditMovementId: string
+  /** The outbound debit that returns money to the sender. */
+  readonly refundMovementId: string
+  readonly amount: bigint
+  readonly createdAt: Date
+}
+
 /** Read access. Every lookup is scoped by tenant; ids from another tenant read as absent. */
 export interface StoreReader extends JournalReader {
   getMovement(tenantId: string, id: string): Promise<Movement | null>
@@ -119,6 +144,7 @@ export interface StoreReader extends JournalReader {
   getExpectationsByNormalizedReference(tenantId: string, key: string): Promise<Expectation[]>
   listExpectations(query: ExpectationQuery): Promise<Expectation[]>
   listAllocations(query: AllocationQuery): Promise<Allocation[]>
+  listRefundLinks(tenantId: string, opts?: { creditMovementId?: string; refundMovementId?: string }): Promise<RefundLink[]>
   getException(tenantId: string, id: string): Promise<ExceptionRecord | null>
   listExceptions(query: ExceptionQuery): Promise<ExceptionRecord[]>
   getJournalPeriod(tenantId: string): Promise<JournalPeriod | null>
@@ -190,6 +216,20 @@ export interface StoreTx extends StoreReader, JournalTx {
    * when the status changes.
    */
   allocate(allocation: NewAllocation): Promise<Allocation>
+
+  /**
+   * Record that `refundMovementId` returns `amount` of `creditMovementId`.
+   * Refuses a link whose movements are not in the same tenant, whose assets
+   * differ, whose directions are not credit-in and debit-out, or that would
+   * push the credit's refunded total above its amount. Does not change any
+   * expectation status: the caller reverses allocations explicitly.
+   */
+  linkRefund(
+    tenantId: string,
+    creditMovementId: string,
+    refundMovementId: string,
+    amount: bigint,
+  ): Promise<RefundLink>
 
   /** Writes an `exception.opened` event. */
   openException(exception: NewException): Promise<ExceptionRecord>
@@ -271,6 +311,10 @@ export type ConstraintName =
   | 'disposition_unsupported'
   | 'movement_not_open'
   | 'exception_not_open'
+  | 'refund_asset'
+  | 'refund_direction'
+  | 'refund_tenant'
+  | 'refund_over_credit'
   | 'journal_unbalanced'
   | 'journal_posting_conflict'
   | 'journal_cash_mismatch'

@@ -107,7 +107,7 @@ export interface AttestOptions {
    */
   readonly sources: readonly MovementSource[]
   readonly accounts: readonly string[]
-  /** Comparisons made before a mismatch is reported. Default 3. */
+  /* * Comparisons made before a mismatch is reported. Default 3. */
   readonly attempts?: number
   /** Wait between comparisons. Default 6 seconds, about one ledger. */
   readonly retryDelayMs?: number

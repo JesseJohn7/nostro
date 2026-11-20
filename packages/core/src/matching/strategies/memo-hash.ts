@@ -8,6 +8,10 @@ import type { MatchStrategy } from '../types.js'
  *
  * False-positive risk: a payer can reuse or mistype an old hash. As with memo
  * ids, the settled and duplicate checks still run after matching.
+ *
+ * Refund handling is out of scope for this strategy. A debit whose
+ * `MEMO_RETURN` names a recorded credit's transaction hash is a refund and is
+ * linked separately; it is never matched here as an expectation payment.
  */
 export const memoHashStrategy: MatchStrategy = {
   name: 'memo_hash',
