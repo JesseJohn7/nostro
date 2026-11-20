@@ -274,27 +274,4 @@ export const MIGRATIONS: readonly string[] = [
     CREATE INDEX IF NOT EXISTS expectation_reference_keys
       ON expectation_reference_index (tenant_id, normalized);
   `,
-  // 7: allow negative allocations (reversals). Recreate allocations table
-  // without the unique constraint on (movement_id, expectation_id).
-  `
-    CREATE TABLE allocations_new (
-      seq            INTEGER PRIMARY KEY AUTOINCREMENT,
-      id             TEXT NOT NULL UNIQUE,
-      tenant_id      TEXT NOT NULL,
-      movement_id    TEXT NOT NULL REFERENCES movements (id),
-      expectation_id TEXT NOT NULL REFERENCES expectations (id),
-      asset          TEXT NOT NULL,
-      decimals       INTEGER NOT NULL,
-      amount         TEXT NOT NULL CHECK (
-        typeof(amount) = 'text' AND (amount GLOB '[1-9]*' OR amount GLOB '-[1-9]*')
-      ),
-      strategy       TEXT NOT NULL,
-      score          REAL CHECK (score BETWEEN 0 AND 1),
-      created_at     INTEGER NOT NULL
-    );
-    CREATE INDEX allocations_expectation_new ON allocations_new (expectation_id);
-    INSERT INTO allocations_new SELECT * FROM allocations;
-    DROP TABLE allocations;
-    ALTER TABLE allocations_new RENAME TO allocations;
-  `,
 ]

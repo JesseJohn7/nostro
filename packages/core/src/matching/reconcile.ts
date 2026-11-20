@@ -61,32 +61,18 @@ export interface ReconcileReport {
 async function candidatesFor(tx: StoreTx, movement: Movement): Promise<Candidate[]> {
   const { tenantId, account, direction } = movement
   const found = new Map<string, Expectation>()
-
-  const addPrimary = (list: readonly Expectation[]) => {
+  const add = (list: readonly Expectation[]) => {
     for (const e of list) {
+      // A muxed id only means something on its own base account.
       if (e.status !== 'cancelled' && e.account === account && e.direction === direction) found.set(e.id, e)
     }
   }
-
-  const addCrossAccount = (list: readonly Expectation[]) => {
-    for (const e of list) {
-      if (e.status !== 'cancelled' && e.direction === direction && e.account !== account) {
-        const group = e.metadata['account_group']
-        if (group) found.set(e.id, e)
-      }
-    }
-  }
-
-  addPrimary(await tx.listExpectations({ tenantId, account, direction, status: ['open', 'partially_paid'] }))
-  if (movement.muxedId !== null) addPrimary(await tx.listExpectations({ tenantId, muxedId: movement.muxedId }))
-  if (movement.memo?.type === 'id') addPrimary(await tx.listExpectations({ tenantId, muxedId: movement.memo.value }))
+  add(await tx.listExpectations({ tenantId, account, direction, status: ['open', 'partially_paid'] }))
+  if (movement.muxedId !== null) add(await tx.listExpectations({ tenantId, muxedId: movement.muxedId }))
+  if (movement.memo?.type === 'id') add(await tx.listExpectations({ tenantId, muxedId: movement.memo.value }))
   if (movement.memo?.type === 'text') {
     const normalized = normalizeReference(movement.memo.value)
-    if (normalized !== '') {
-      const textMatches = await tx.getExpectationsByNormalizedReference(tenantId, normalized)
-      addPrimary(textMatches)
-      addCrossAccount(textMatches)
-    }
+    if (normalized !== '') add(await tx.getExpectationsByNormalizedReference(tenantId, normalized))
   }
 
   const candidates: Candidate[] = []
@@ -163,47 +149,6 @@ async function decideOne(tx: StoreTx, tenantId: string, id: string, options: Dec
       await tx.setDisposition(tenantId, id, 'partial')
       return 'partial'
     }
-  }
-}
-
-export interface RedecideOptions extends DecideOptions, PostOptions {
-  readonly store: Store
-  readonly tenantId: string
-  readonly account?: string
-  readonly limit?: number
-}
-
-export async function redecide(options: RedecideOptions): Promise<ReconcileReport> {
-  const { store, tenantId, account, limit: pageLimit } = options
-  const movements = await store.listMovements({
-    tenantId,
-    disposition: 'exception',
-    account,
-    limit: pageLimit ?? 100,
-  })
-
-  const counts = { allocated: 0, partial: 0, ignored: 0, skipped: 0 }
-  let journalEntries = 0
-  const exceptions: Partial<Record<ExceptionCode, number>> = {}
-  const errors: { movementId: string; error: Error }[] = []
-
-  for (const { id } of movements) {
-    try {
-      const { outcome, posted } = await store.transaction((tx) => reconcileOne(tx, tenantId, id, options))
-      if (posted) journalEntries += 1
-      if (outcome in counts) counts[outcome as keyof typeof counts] += 1
-      else exceptions[outcome as ExceptionCode] = (exceptions[outcome as ExceptionCode] ?? 0) + 1
-    } catch (err) {
-      errors.push({ movementId: id, error: err instanceof Error ? err : new Error(String(err)) })
-    }
-  }
-
-  return {
-    processed: movements.length - counts.skipped - errors.length,
-    ...counts,
-    journalEntries,
-    exceptions,
-    errors,
   }
 }
 

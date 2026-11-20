@@ -133,65 +133,6 @@ export async function applyMovement(options: ApplyOptions): Promise<MovementReso
   })
 }
 
-export async function reverseAllocation(options: ReverseOptions): Promise<MovementResolution> {
-  const { store, tenantId, movementId, expectationId, note } = options
-  required('note', note)
-
-  return store.transaction(async (tx) => {
-    const movement = await undecided(tx, tenantId, movementId)
-    const expectation = await tx.getExpectation(tenantId, expectationId)
-    if (expectation === null) throw new NotFoundError('expectation', expectationId)
-
-    const allocation = await tx.listAllocations({ tenantId, movementId, expectationId })
-    if (allocation.length === 0) {
-      throw new ConstraintError('no_allocation', `movement ${movementId} has no allocation to expectation ${expectationId}`)
-    }
-
-    const toReverse = allocation[0]
-    if (!toReverse.amount.isPositive()) {
-      throw new ConstraintError('already_reversed', `allocation is already a reversal (amount: ${toReverse.amount.toString()})`)
-    }
-
-    const reversal = await tx.allocate({
-      tenantId,
-      movementId,
-      expectationId,
-      amount: toReverse.amount.negate(),
-      strategy: 'reversal',
-      score: null,
-    })
-
-    const left = movement.amount.subtract(
-      sumAmounts(
-        (await tx.listAllocations({ tenantId, movementId })).map((a) => a.amount),
-        movement.amount,
-      ),
-    )
-
-    const open = await tx.listExceptions({ tenantId, movementId, status: 'open' })
-    const closed: ExceptionRecord[] = []
-    for (const x of open) {
-      closed.push(await tx.resolveException(tenantId, x.id, { status: 'resolved', note }))
-    }
-
-    let opened: ExceptionRecord | null = null
-    if (left.isPositive()) {
-      opened = await tx.openException({
-        tenantId,
-        code: 'PARTIAL_UNRESOLVED',
-        movementId,
-        account: movement.account,
-        amount: left,
-        detail: `Reversed allocation to ${expectation.reference}; ${left.toString()} of ${movement.amount.toString()} remains.`,
-        evidence: { note },
-      })
-    }
-
-    const next = await tx.setDisposition(tenantId, movementId, left.isPositive() ? 'partial' : 'exception')
-    return { movement: next, allocations: [reversal], closed, opened, journalEntry: await postMovement(tx, tenantId, movementId, options) }
-  })
-}
-
 export async function ignoreMovement(options: IgnoreOptions): Promise<MovementResolution> {
   const { store, tenantId, movementId, reason } = options
   required('reason', reason)
@@ -204,11 +145,6 @@ export async function ignoreMovement(options: IgnoreOptions): Promise<MovementRe
     const next = await tx.setDisposition(tenantId, movementId, 'ignored', reason)
     return { movement: next, allocations: [], closed, opened: null, journalEntry: await postMovement(tx, tenantId, movementId, options) }
   })
-}
-
-export interface ReverseOptions extends ResolveOptions {
-  readonly expectationId: string
-  readonly note: string
 }
 
 export interface CloseOptions {

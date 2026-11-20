@@ -100,19 +100,15 @@ export function checkAllocation(
     )
   }
   if (movement.account !== expectation.account) {
-    const group = expectation.metadata['account_group']
-    if (!group) {
-      throw new ConstraintError(
-        'allocation_account',
-        `money that moved on ${movement.account} cannot settle an expectation on ${expectation.account}`,
-      )
-    }
+    throw new ConstraintError(
+      'allocation_account',
+      `money that moved on ${movement.account} cannot settle an expectation on ${expectation.account}`,
+    )
   }
-  const existing = onMovement.find((a) => a.expectationId === expectation.id)
-  if (existing && allocation.amount.isPositive() === existing.amount.isPositive()) {
+  if (onMovement.some((a) => a.expectationId === expectation.id)) {
     throw new ConstraintError(
       'allocation_unique',
-      `movement ${movement.id} already has a ${allocation.amount.isPositive() ? 'positive' : 'negative'} allocation to expectation ${expectation.id}`,
+      `movement ${movement.id} is already allocated to expectation ${expectation.id}`,
     )
   }
   const movementTotal = sumAmounts(onMovement.map((a) => a.amount), movement.amount).add(allocation.amount)
