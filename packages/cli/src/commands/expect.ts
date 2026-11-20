@@ -134,7 +134,12 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const recorded = await withStore(args, io, (store) =>
       store.transaction(async (tx) => {
         try {
-          return await tx.insertExpectation(expectation)
+          const e = await tx.insertExpectation(expectation)
+          const accrualActive = await tx.accrualGetMode(tenant(args, io))
+          if (accrualActive) {
+            await tx.postAccrualExpectation(e.id, tenant(args, io), e.direction, e.amount, e.reference)
+          }
+          return e
         } catch (err) {
           if (err instanceof ValidationError) throw new UsageError(err.message)
           if (err instanceof ConstraintError && err.constraint === 'expectation_reference_unique') {

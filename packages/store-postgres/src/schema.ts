@@ -38,6 +38,7 @@ const LINE_ROLES = list([
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
 ])
 const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
 const EVENT_TYPES = list([
@@ -365,5 +366,26 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
     DROP TRIGGER IF EXISTS expectations_muxed_id_update_unique ON ${s}.expectations;
     CREATE TRIGGER expectations_muxed_id_update_unique BEFORE UPDATE ON ${s}.expectations
       FOR EACH ROW EXECUTE FUNCTION ${s}.expectations_muxed_id_unique();
+  `,
+
+  // 7: export destination high-water marks
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.exports (
+      tenant_id     text NOT NULL,
+      destination   text NOT NULL,
+      last_seq      bigint NOT NULL DEFAULT 0,
+      last_exported_at timestamptz NOT NULL DEFAULT now(),
+      control_totals jsonb NOT NULL DEFAULT '{}',
+      checksum      text NOT NULL DEFAULT '',
+      PRIMARY KEY (tenant_id, destination)
+    );
+  `,
+
+  // 8: per-tenant accrual mode for expectations
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.accrual_modes (
+      tenant_id    text NOT NULL PRIMARY KEY,
+      active       boolean NOT NULL DEFAULT false
+    );
   `,
 ]

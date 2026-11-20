@@ -27,6 +27,7 @@ const LINE_ROLES = list([
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
 ])
 const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
 const EVENT_TYPES = [
@@ -276,7 +277,26 @@ export const MIGRATIONS: readonly string[] = [
     CREATE INDEX IF NOT EXISTS expectation_reference_keys
       ON expectation_reference_index (tenant_id, normalized);
   `,
+  // 7: export destination high-water marks
   `
+    CREATE TABLE IF NOT EXISTS exports (
+      tenant_id     TEXT NOT NULL,
+      destination   TEXT NOT NULL,
+      last_seq      INTEGER NOT NULL DEFAULT 0,
+      last_exported_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
+      control_totals TEXT NOT NULL DEFAULT '{}',
+      checksum      TEXT NOT NULL DEFAULT '',
+PRIMARY KEY (tenant_id, destination)
+    );
+  `,
+  // 8: per-tenant accrual mode for expectations
+  `
+    CREATE TABLE IF NOT EXISTS accrual_modes (
+      tenant_id     TEXT NOT NULL PRIMARY KEY,
+      active        INTEGER NOT NULL DEFAULT 0
+    );
+  `,
+`
     CREATE TABLE exceptions_new (
       seq             INTEGER PRIMARY KEY AUTOINCREMENT,
       id              TEXT NOT NULL UNIQUE,

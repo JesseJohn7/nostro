@@ -310,6 +310,7 @@ export type LineRole =
   | 'network_fees'
   | 'uncategorized_income'
   | 'uncategorized_expense'
+  | 'conversion'
 
 export const LINE_ROLES: readonly LineRole[] = [
   'cash',
@@ -322,6 +323,7 @@ export const LINE_ROLES: readonly LineRole[] = [
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
 ]
 
 export type Side = 'debit' | 'credit'
@@ -331,9 +333,9 @@ export type Side = 'debit' | 'credit'
  * `reclass`: moves an amount between counter-accounts; cash is untouched.
  * `correction`: changes the cash leg itself (a source correction).
  */
-export type JournalEntryKind = 'initial' | 'reclass' | 'correction'
+export type JournalEntryKind = 'initial' | 'reclass' | 'correction' | 'conversion'
 
-export const JOURNAL_ENTRY_KINDS: readonly JournalEntryKind[] = ['initial', 'reclass', 'correction']
+export const JOURNAL_ENTRY_KINDS: readonly JournalEntryKind[] = ['initial', 'reclass', 'correction', 'conversion']
 
 export interface JournalLine {
   readonly account: string
@@ -374,6 +376,7 @@ export interface NewJournalLine {
   readonly amount: Money
   readonly expectationId?: string | null
   readonly exceptionId?: string | null
+  readonly accrual?: boolean
 }
 
 export interface NewJournalEntry {

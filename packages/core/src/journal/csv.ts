@@ -41,6 +41,8 @@ export interface JournalCsvOptions {
   readonly pageSize?: number
   /** Internal upper bound used to keep a multi-pass export on one journal snapshot. */
   readonly throughSeq?: number
+  /** Metadata keys to read as dimensions. Each key becomes a column named after it. */
+  readonly dimensions?: readonly string[]
 }
 
 const FORMULA = /^[=+\-@\t\r]/
@@ -83,8 +85,20 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
   const txHash = new Map<string, string | null>()
   const reference = new Map<string, string | null>()
   const code = new Map<string, string | null>()
+  const dimensionValues = new Map<string, Map<string, string | null>>()
 
-  yield journalCsvRow(JOURNAL_CSV_COLUMNS.map((c) => c))
+  if (options.dimensions) {
+    for (const dim of options.dimensions) {
+      dimensionValues.set(dim, new Map())
+    }
+  }
+
+  const dimColumnNames = options.dimensions ?? []
+  const allColumns = [...JOURNAL_CSV_COLUMNS, ...dimColumnNames]
+  yield journalCsvRow(allColumns.map((c) => c))
+
+  const expectationMetadatas = new Map<string, Record<string, string | null>>()
+
   for await (const entry of journalEntries(options)) {
     if (entry.movementId !== null && !txHash.has(entry.movementId)) {
       txHash.set(entry.movementId, (await store.getMovement(tenantId, entry.movementId))?.txHash ?? null)
@@ -96,7 +110,18 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
       if (line.exceptionId !== null && !code.has(line.exceptionId)) {
         code.set(line.exceptionId, (await store.getException(tenantId, line.exceptionId))?.code ?? null)
       }
+      const expectationId = line.expectationId ?? null
+      if (expectationId && !expectationMetadatas.has(expectationId) && options.dimensions) {
+        const expectation = await store.getExpectation(tenantId, expectationId)
+        expectationMetadatas.set(expectationId, expectation ? expectation.metadata : {})
+      }
       const amount = line.amount.toString()
+      const dimCells: string[] = []
+      for (const dim of dimColumnNames) {
+        const metadata = expectationMetadatas.get(expectationId) ?? {}
+        const val = metadata[dim] ?? ''
+        dimCells.push(journalCsvCell(val, true))
+      }
       yield journalCsvRow([
         journalCsvCell(entry.id),
         journalCsvCell(entry.seq),
@@ -113,6 +138,7 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
         journalCsvCell(entry.movementId),
         journalCsvCell(entry.movementId === null ? null : (txHash.get(entry.movementId) ?? null)),
         journalCsvCell(line.expectationId === null ? null : (reference.get(line.expectationId) ?? null), true),
+        ...dimCells,
         journalCsvCell(line.exceptionId),
         journalCsvCell(line.exceptionId === null ? null : (code.get(line.exceptionId) ?? null)),
       ])

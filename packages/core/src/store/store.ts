@@ -239,6 +239,18 @@ export interface Store extends StoreReader {
    */
   transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>
   close(): Promise<void>
+  exportGetMark(tenantId: string, destination: string): Promise<string | null>
+  exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void>
+  accrualGetMode(tenantId: string): Promise<boolean>
+  postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void>
+}
+
+export interface ExportBatch {
+  readonly destination: string
+  readonly last_seq: number
+  readonly last_exported_at: number
+  control_totals: string
+  checksum: string
 }
 
 /** Where a database's schema is, against where this store would take it. */

@@ -19,6 +19,7 @@ import type {
   Allocation,
   CursorKey,
   Disposition,
+  ExportBatch,
   ExceptionRecord,
   Expectation,
   ExpectationChanges,
@@ -706,6 +707,18 @@ export class MemoryStore extends MemoryReader implements Store {
     super()
     this.ids = options.ids ?? (() => globalThis.crypto.randomUUID())
     this.now = options.now ?? (() => new Date())
+  }
+
+  async exportGetMark(tenantId: string, destination: string): Promise<string | null> {
+    return null
+  }
+
+  async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
+    // no-op for in-memory store
+  }
+
+  async exportListBatches(tenantId: string): Promise<ExportBatch[]> {
+    return []
   }
 
   protected snapshot(): State {
