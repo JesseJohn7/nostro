@@ -826,6 +826,73 @@ class SqliteTx extends SqliteReader implements StoreTx {
 }
 
 export class SqliteStore extends SqliteReader implements MigratableStore {
+  async exportGetMark(tenantId: string, destination: string): Promise<string | null> {
+    const row = this.one(
+      'SELECT last_seq FROM exports WHERE tenant_id = ? AND destination = ?',
+      [tenantId, destination],
+    )
+    return row === undefined ? null : String(row.last_seq)
+  }
+
+  async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
+    this.exec(
+      `INSERT INTO exports (tenant_id, destination, last_seq, last_exported_at, control_totals, checksum)
+       VALUES (?, ?, ?, ?, '{}', '')
+       ON CONFLICT (tenant_id, destination) DO UPDATE SET last_seq = ?, last_exported_at = CAST(strftime('%s', 'now') AS INTEGER)`,
+      [tenantId, destination, lastSeq, lastSeq, lastSeq],
+    )
+  }
+
+  async accrualGetMode(tenantId: string): Promise<boolean> {
+    const row = this.one('SELECT active FROM accrual_modes WHERE tenant_id = ?', [tenantId])
+    return row !== undefined ? row.active === 1 : false
+  }
+
+async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void> {
+    const now = new Date()
+
+    // For credit expectations: Dr receivable · Cr revenue
+    // For debit expectations: Dr expense · Cr payable
+    const isCredit = isCredit
+    const receivableAccount = 'Assets:Receivable'
+    const revenueAccount = isCredit ? 'Revenue' : 'Expense'
+
+    const ownSide = isCredit ? 'debit' : 'credit'
+    const otherSide = isCredit ? 'credit' : 'debit'
+
+    // Post the first journal entry: Dr receivable · Cr revenue/payable
+    await this.exec(
+      `INSERT INTO journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [this.ids(), tenantId, null, 1, 'initial', now, now, `Accrual for expectation ${reference}`],
+    )
+    await this.exec(
+      `INSERT INTO journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [1, 1, tenantId, receivableAccount, 'convention', ownSide, amount, 18, amount, expectationId, null],
+    )
+
+    // Post the second journal entry: Cr revenue/payable · Dr receivable
+    await this.exec(
+      `INSERT INTO journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [this.ids(), tenantId, null, 2, 'initial', now, now, `Reverse accrual for expectation ${reference}`],
+    )
+    await this.exec(
+      `INSERT INTO journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id)
+       VALUES (1, 1, tenantId, revenueAccount, 'convention', otherSide, amount, 18, amount, expectationId, null)`,
+    )
+  }
+
+  
+
+  async exportListBatches(tenantId: string): Promise<readonly { readonly destination: string; readonly last_seq: number; readonly last_exported_at: number; readonly control_totals: string; readonly checksum: string }[]> {
+    const rows = this.all(
+      'SELECT destination, last_seq, last_exported_at, control_totals, checksum FROM exports WHERE tenant_id = ?',
+      [tenantId],
+    ) as { destination: string; last_seq: number; last_exported_at: number; control_totals: string; checksum: string }[]
+    return rows
+  }
   private readonly writer: Database.Database
   private readonly reader: Database.Database
   private tail: Promise<unknown> = Promise.resolve()

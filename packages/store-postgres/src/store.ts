@@ -746,6 +746,88 @@ class PgTx extends PgReader implements StoreTx {
 }
 
 export class PostgresStore extends PgReader implements MigratableStore {
+  async exportGetMark(tenantId: string, destination: string): Promise<string | null> {
+    const [row] = await this.run<{ last_seq: string | null }>(
+      `SELECT last_seq FROM ${this.s}.exports WHERE tenant_id = $1 AND destination = $2`,
+      [tenantId, destination],
+    )
+    return row?.last_seq ?? null
+  }
+
+  async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
+    await this.run(
+      `INSERT INTO ${this.s}.exports (tenant_id, destination, last_seq, last_exported_at, control_totals, checksum)
+       VALUES ($1, $2, $3, now(), '{}', '')
+       ON CONFLICT (tenant_id, destination) DO UPDATE SET last_seq = $3, last_exported_at = now()`,
+      [tenantId, destination, lastSeq],
+    )
+  }
+
+  async accrualGetMode(tenantId: string): Promise<boolean> {
+    const [row] = await this.run<{ active: boolean }>(
+      `SELECT active FROM ${this.s}.accrual_modes WHERE tenant_id = $1`,
+      [tenantId],
+    )
+    return row?.active ?? false
+  }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amountRaw: string, reference: string): Promise<void> {
+    const now = new Date()
+    const amount = amountRaw
+
+    // For credit expectations: Dr receivable · Cr revenue
+    // For debit expectations: Dr expense · Cr payable
+    const isCredit = isCredit
+    const receivableAccount = 'Assets:Receivable'
+    const revenueAccount = isCredit ? 'Revenue' : 'Expense'
+    const payableAccount = isCredit ? 'Liabilities:Payable' : 'Expense'
+    const otherSide = isCredit ? 'credit' : 'debit'
+    const ownSide = isCredit ? 'debit' : 'credit'
+
+    // Post the first entry: Dr receivable/exception · Cr revenue/payable
+    const [entry1] = await this.run<JournalEntryRow>(
+      `INSERT INTO ${this.s}.journal_entries (
+         id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [this.ids(), tenantId, null, 1, 'initial', now, now, `Accrual for expectation ${reference}`],
+    )
+
+    const [line1] = await this.run<JournalLineRow>(
+      `INSERT INTO ${this.s}.journal_lines (
+         entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [entry1.id, 1, tenantId, receivableAccount, 'convention', ownSide, amount, 18, amount, expectationId, null],
+    )
+
+    // Post the second entry: Cr revenue/payable · Dr receivable
+    const [entry2] = await this.run<JournalEntryRow>(
+      `INSERT INTO ${this.s}.journal_entries (
+         id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [this.ids(), tenantId, null, 2, 'initial', now, now, `Reverse accrual for expectation ${reference}`],
+    )
+
+    const [line2] = await this.run<JournalLineRow>(
+      `INSERT INTO ${this.s}.journal_lines (
+         entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+      [entry2.id, 1, tenantId, revenueAccount, 'convention', otherSide, amount, 18, amount, expectationId, null],
+    )
+  }
+
+  async exportListBatches(tenantId: string): Promise<readonly { readonly destination: string; readonly last_seq: number; readonly last_exported_at: number; readonly control_totals: string; readonly checksum: string }[]> {
+    const rows = await this.run<{ destination: string; last_seq: number; last_exported_at: string; control_totals: string; checksum: string }>(
+      `SELECT destination, last_seq, last_exported_at, control_totals, checksum FROM ${this.s}.exports WHERE tenant_id = $1`,
+      [tenantId],
+    )
+    return rows.map(r => ({
+      destination: r.destination,
+      last_seq: r.last_seq,
+      last_exported_at: Number(r.last_exported_at),
+      control_totals: r.control_totals,
+      checksum: r.checksum,
+    }))
+  }
   private readonly pool: Pool
   private readonly ownsPool: boolean
   private readonly schema: string

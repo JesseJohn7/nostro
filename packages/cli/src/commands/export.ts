@@ -61,6 +61,7 @@ Options:
   --tax-rate <name>   Xero tax rate already configured in the organisation (default "No Tax")
   --db <path|url>     SQLite file, or a postgres:// URL (env NOSTRO_DB; default ./nostro.db)
   --tenant <id>       Whose records to use (env NOSTRO_TENANT; default "default")
+  --destination       Name of the export destination high-water mark to use (default: none)
   -h, --help          Show this help
 
 Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17:00:00+01:00.`,
@@ -74,6 +75,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     'account-map': { type: 'string' },
     'commodity-map': { type: 'string' },
     'tax-rate': { type: 'string' },
+    destination: { type: 'string' },
   },
   async run(args, io) {
     positionals(args, 0)
@@ -106,8 +108,15 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const output = string(args, 'output')
     if (output === undefined && flag(args, 'force')) throw new UsageError('--force only applies with --output.')
 
+    const destination = string(args, 'destination')
+    const showBatches = flag(args, 'batches')
+
     return withStore(args, io, async (store) => {
       const base = { store, tenantId, ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) }
+      if (destination) {
+        const mark = await store.exportGetMark(tenantId, destination)
+        base.afterSeq = mark !== undefined ? Number(mark) : undefined
+      }
       const accountMap = accountMapPath === undefined ? undefined : await readMap(accountMapPath, io.cwd, 'account')
       const commodityMap = commodityMapPath === undefined ? undefined : await readMap(commodityMapPath, io.cwd, 'commodity')
       let rows: AsyncGenerator<string>
@@ -125,37 +134,67 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
       }
       if (output === undefined) {
         for await (const row of rows) await write(io.stdout, row)
-        return 0
+      } else {
+        const path = resolve(io.cwd, output)
+        const file = createWriteStream(path, { flags: flag(args, 'force') ? 'w' : 'wx' })
+        try {
+          await once(file, 'open')
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'EEXIST') throw new CliError(`${path} exists; pass --force to overwrite it.`)
+          throw err
+        }
+        let chunks = 0
+        async function* counted() {
+          for await (const row of rows) {
+            chunks += 1
+            yield row
+          }
+        }
+        try {
+          // pipeline() waits for drain, and destroys the file on an error at either end.
+          await pipeline(Readable.from(counted()), file)
+        } catch (err) {
+          // Half a ledger is worse than none: leave no partial file behind.
+          await rm(path, { force: true })
+          throw err
+        }
+        const message =
+          format === 'beancount'
+            ? `Wrote Beancount ledger to ${path}.\n`
+            : `Wrote ${Math.max(0, chunks - 1)} journal line(s) to ${path}.\n`
+        await write(io.stdout, message)
       }
 
-      const path = resolve(io.cwd, output)
-      const file = createWriteStream(path, { flags: flag(args, 'force') ? 'w' : 'wx' })
-      try {
-        await once(file, 'open')
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'EEXIST') throw new CliError(`${path} exists; pass --force to overwrite it.`)
-        throw err
-      }
-      let chunks = 0
-      async function* counted() {
-        for await (const row of rows) {
-          chunks += 1
-          yield row
+      // Update the high-water mark for the destination after export
+      if (destination) {
+        // Track the last seq exported by scanning the rows output
+        let lastSeq = 0
+        // Re-consume: if output went to stdout, we already wrote it; if to a file, re-read
+        // For simplicity, we'll query the store for the max seq in the range
+        const entries = await store.listJournalEntries({
+          tenantId,
+          ...(from !== undefined ? { effectiveFrom: from } : {}),
+          ...(to !== undefined ? { effectiveBefore: to } : {}),
+          ...(afterSeq !== undefined ? { afterSeq: Number(afterSeq) } : {}),
+        })
+        for (const entry of entries) {
+          if (entry.seq > lastSeq) lastSeq = entry.seq
+        }
+        if (entries.length > 0) {
+          await store.exportSetMark(tenantId, destination, lastSeq)
         }
       }
-      try {
-        // pipeline() waits for drain, and destroys the file on an error at either end.
-        await pipeline(Readable.from(counted()), file)
-      } catch (err) {
-        // Half a ledger is worse than none: leave no partial file behind.
-        await rm(path, { force: true })
-        throw err
+
+      // List batches if requested
+      if (showBatches) {
+        const batches = await store.exportListBatches(tenantId)
+        const header = 'destination,last_seq,last_exported_at,control_totals,checksum'
+        await write(io.stdout, header + '\r\n')
+        for (const b of batches) {
+          await write(io.stdout, `${b.destination},${b.last_seq},${b.last_exported_at},${b.control_totals},${b.checksum}\r\n`)
+        }
       }
-      const message =
-        format === 'beancount'
-          ? `Wrote Beancount ledger to ${path}.\n`
-          : `Wrote ${Math.max(0, chunks - 1)} journal line(s) to ${path}.\n`
-      await write(io.stdout, message)
+
       return 0
     })
   },
