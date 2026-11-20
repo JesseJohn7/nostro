@@ -138,6 +138,33 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
     afterSeq = page[page.length - 1]!.seq
   }
 
+  const seenMuxed = new Map<string, string>()
+  let after: number | undefined
+  for (;;) {
+    const page = await store.listExpectations({ tenantId, limit, ...(after === undefined ? {} : { afterSeq: after }) })
+    if (page.length === 0) break
+    after = page[page.length - 1]!.seq
+    for (const e of page) {
+      if (e.muxedId === null) continue
+      const key = `${e.account}:${e.muxedId.toString()}`
+      const first = seenMuxed.get(key)
+      if (first === undefined) seenMuxed.set(key, e.id)
+      else {
+        findings.push({
+          invariant: 'I1',
+          severity: 'error',
+          code: 'muxed_id_duplicate',
+          detail: `muxed id ${e.muxedId.toString()} is used by expectations ${first} and ${e.id} on ${e.account}`,
+          movementId: null,
+          entryId: null,
+          account: e.account,
+          asset: null,
+        })
+      }
+    }
+    if (page.length < limit) break
+  }
+
   return {
     ok: findings.every((f) => f.severity !== 'error'),
     findings,

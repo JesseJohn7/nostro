@@ -25,6 +25,7 @@ import type {
   Movement,
   NewAllocation,
   NewException,
+  ExpectationChanges,
   NewExpectation,
   NewJournalEntry,
   NewMovement,
@@ -179,6 +180,8 @@ export interface StoreTx extends StoreReader, JournalTx {
    */
   cancelExpectation(tenantId: string, id: string, reason: string): Promise<Expectation>
 
+  amendExpectation(tenantId: string, id: string, changes: ExpectationChanges, reason: string): Promise<Expectation>
+
   /**
    * Allocate part of a movement to an expectation, and update the
    * expectation's status. Refuses (see `ConstraintName`) a cross-asset,
@@ -266,8 +269,11 @@ export type ConstraintName =
   | 'allocation_over_expectation'
   | 'allocation_expectation_cancelled'
   | 'expectation_reference_unique'
+  | 'expectation_muxed_id_unique'
   | 'expectation_has_allocations'
   | 'expectation_not_open'
+  | 'expectation_not_amendable'
+  | 'amendment_below_allocated'
   | 'disposition_unsupported'
   | 'movement_not_open'
   | 'exception_not_open'

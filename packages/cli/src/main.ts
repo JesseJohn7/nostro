@@ -11,6 +11,8 @@ import { doctor } from './commands/doctor.js'
 import { exceptions } from './commands/exceptions.js'
 import { expect } from './commands/expect.js'
 import { expectations } from './commands/expectations.js'
+import { cancel } from './commands/cancel.js'
+import { amend } from './commands/amend.js'
 import { exportJournal } from './commands/export.js'
 import { migrate } from './commands/migrate.js'
 import { post } from './commands/post.js'
@@ -28,6 +30,8 @@ export const COMMANDS: readonly Command[] = [
   sync,
   expect,
   expectations,
+  cancel,
+  amend,
   reconcile,
   exceptions,
   resolve,

@@ -6,6 +6,7 @@ import { afterAll, describe, expect, it } from 'vitest'
 import { Money, NATIVE, doctor } from '@nostro-labs/nostro'
 import { describeStoreConformance, describeStoreProperties } from 'nostro-testkit'
 import { SqliteStore } from '../src/index.js'
+import { MIGRATIONS } from '../src/schema.js'
 
 const dir = mkdtempSync(join(tmpdir(), 'nostro-sqlite-'))
 let files = 0
@@ -78,13 +79,13 @@ describe('SqliteStore', () => {
   it('migrates idempotently and records the schema version', async () => {
     const filename = freshFile()
     const store = new SqliteStore({ filename })
-    expect(await store.schemaVersion()).toEqual({ current: 0, latest: 6 })
+    expect(await store.schemaVersion()).toEqual({ current: 0, latest: 7 })
     await store.migrate()
     await store.migrate()
-    expect(await store.schemaVersion()).toEqual({ current: 6, latest: 6 })
+    expect(await store.schemaVersion()).toEqual({ current: 7, latest: 7 })
     await store.close()
     const db = new Database(filename, { readonly: true })
-    expect(db.pragma('user_version', { simple: true })).toBe(6)
+    expect(db.pragma('user_version', { simple: true })).toBe(7)
     expect(db.pragma('journal_mode', { simple: true })).toBe('wal')
     db.close()
   })
@@ -157,16 +158,42 @@ describe('SqliteStore', () => {
     await store.transaction((tx) => tx.setCursor({ tenantId: 't', network: 'n', source: 's', account: 'a' }, 'kept'))
     await store.close()
     const db = new Database(filename)
-    db.exec(
-      'DROP TABLE journal_lines; DROP TABLE journal_entries; DROP TABLE events; ' +
-        'DROP TABLE journal_period_actions; PRAGMA user_version = 1',
-    )
+    db.exec(`DROP TABLE journal_lines; DROP TABLE journal_entries; DROP TABLE events; DROP TABLE journal_period_actions;
+      DROP TRIGGER expectations_muxed_id_insert_unique; DROP TRIGGER expectations_muxed_id_update_unique;
+      PRAGMA user_version = 1`)
     db.close()
     const upgraded = await freshStore(filename)
     expect(await upgraded.getCursor({ tenantId: 't', network: 'n', source: 's', account: 'a' })).toBe('kept')
     expect(await upgraded.listJournalEntries({ tenantId: 't' })).toEqual([])
     expect(await upgraded.listEvents({ tenantId: 't' })).toEqual([])
     await upgraded.close()
+  })
+
+  it('migrates a v6 database with duplicate muxed ids and refuses later duplicates', async () => {
+    const filename = freshFile()
+    const insertSql = `INSERT INTO expectations (id, tenant_id, reference, account, direction, asset, decimals, amount, muxed_id, payers, status, metadata, created_at, updated_at)
+      VALUES (?, 't', ?, 'G${'A'.repeat(55)}', 'credit', 'native', 7, '1', '7', '[]', 'open', '{}', 0, 0)`
+
+    const v6 = new Database(filename)
+    for (const migration of MIGRATIONS.slice(0, 6)) v6.exec(migration)
+    v6.pragma('user_version = 6')
+    v6.prepare(insertSql).run('e1', 'r1')
+    v6.prepare(insertSql).run('e2', 'r2')
+    v6.close()
+
+    const store = await freshStore(filename)
+    expect(await store.schemaVersion()).toEqual({ current: 7, latest: 7 })
+    expect((await doctor({ store, tenantId: 't' })).findings).toEqual([
+      expect.objectContaining({ code: 'muxed_id_duplicate' }),
+    ])
+    await store.transaction((tx) =>
+      tx.amendExpectation('t', 'e1', { memo: { type: 'text', value: 'still here' } }, 'legacy duplicate'),
+    )
+    await store.close()
+
+    const raw = new Database(filename)
+    expect(() => raw.prepare(insertSql).run('e3', 'r3')).toThrow(/muxed id already used on account/)
+    raw.close()
   })
 
   it('backfills the text-memo index when upgrading a database with existing rows', async () => {

@@ -21,6 +21,7 @@ import type {
   Disposition,
   ExceptionRecord,
   Expectation,
+  ExpectationChanges,
   JournalEntry,
   Movement,
   NewAllocation,
@@ -51,6 +52,7 @@ import type {
   StoreTx,
 } from './store.js'
 import {
+  amendExpectationRecord,
   checkAllocation,
   checkCancel,
   checkCursorValue,
@@ -59,12 +61,13 @@ import {
   checkJournalPeriodClose,
   checkJournalPeriodReopen,
   checkResolution,
+  issueMuxedId,
   storedMemo,
   sameFacts,
 } from './rules.js'
 import { ConstraintError, NotFoundError, TransactionClosedError } from './store.js'
 import type { EventQuery, NewOutboxEvent, OutboxEvent } from './events.js'
-import { exceptionChanged, expectationChanged, movementDecided } from './events.js'
+import { exceptionChanged, expectationAmended, expectationChanged, movementDecided } from './events.js'
 import { expectationReferenceKeys } from '../matching/reference.js'
 
 export interface MemoryStoreOptions {
@@ -149,6 +152,23 @@ const movementKey = (m: { tenantId: string; network: string; source: string; ext
   key(m.tenantId, m.network, m.source, m.externalId)
 const cursorKey = (k: CursorKey) => key(k.tenantId, k.network, k.source, k.account)
 const copyDate = (d: Date): Date => new Date(d.getTime())
+
+const addReferenceKeys = (state: State, e: Expectation): void => {
+  for (const normalized of expectationReferenceKeys(e.reference, e.memo)) {
+    const indexKey = key(e.tenantId, normalized)
+    const ids = state.expectationKeys.get(indexKey) ?? []
+    if (!ids.includes(e.id)) state.expectationKeys.set(indexKey, [...ids, e.id])
+  }
+}
+
+const removeReferenceKeys = (state: State, e: Expectation): void => {
+  for (const normalized of expectationReferenceKeys(e.reference, e.memo)) {
+    const indexKey = key(e.tenantId, normalized)
+    const ids = (state.expectationKeys.get(indexKey) ?? []).filter((id) => id !== e.id)
+    if (ids.length === 0) state.expectationKeys.delete(indexKey)
+    else state.expectationKeys.set(indexKey, ids)
+  }
+}
 
 abstract class MemoryReader implements StoreReader {
   /** The state reads run against: committed state, or a transaction's draft. */
@@ -473,6 +493,26 @@ class MemoryTx extends MemoryReader implements StoreTx {
         `reference ${JSON.stringify(n.reference)} already exists in this tenant`,
       )
     }
+    let muxedId: bigint | null
+    if (n.muxedId === 'issue') {
+      let max = 0n
+      for (const e of this.draft.expectations.values()) {
+        if (e.tenantId === n.tenantId && e.account === n.account && e.muxedId !== null && e.muxedId > max) max = e.muxedId
+      }
+      muxedId = issueMuxedId(max)
+    } else {
+      muxedId = n.muxedId ?? null
+    }
+    if (muxedId !== null) {
+      for (const e of this.draft.expectations.values()) {
+        if (e.tenantId === n.tenantId && e.account === n.account && e.muxedId === muxedId) {
+          throw new ConstraintError(
+            'expectation_muxed_id_unique',
+            `muxed id ${muxedId.toString()} is already used on account ${n.account}`,
+          )
+        }
+      }
+    }
     const now = this.now()
     const expectation: Expectation = Object.freeze({
       id: this.ids(),
@@ -482,7 +522,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       account: n.account,
       direction: n.direction ?? 'credit',
       amount: n.amount,
-      muxedId: n.muxedId ?? null,
+      muxedId,
       memo: n.memo == null ? null : Object.freeze(storedMemo(n.memo)),
       payers: Object.freeze([...(n.payers ?? [])]),
       dueAt: n.dueAt == null ? null : copyDate(n.dueAt),
@@ -495,11 +535,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
     })
     this.draft.expectations.set(expectation.id, expectation)
     this.draft.expectationRefs.set(refKey, expectation.id)
-    for (const normalized of expectationReferenceKeys(n.reference, expectation.memo)) {
-      const indexKey = key(n.tenantId, normalized)
-      const ids = this.draft.expectationKeys.get(indexKey) ?? []
-      this.draft.expectationKeys.set(indexKey, [...ids, expectation.id])
-    }
+    addReferenceKeys(this.draft, expectation)
     return expectation
   }
 
@@ -515,6 +551,27 @@ class MemoryTx extends MemoryReader implements StoreTx {
     })
     this.draft.expectations.set(id, next)
     this.emit(expectationChanged(next, null))
+    return next
+  }
+
+  async amendExpectation(tenantId: string, id: string, changes: ExpectationChanges, reason: string): Promise<Expectation> {
+    this.check()
+    const e = this.expectation(tenantId, id)
+    const allocations = this.allocationsOf('expectationId', e.id)
+    let muxedIdTaken = false
+    if (changes.muxedId !== undefined && changes.muxedId !== e.muxedId && changes.muxedId !== null) {
+      for (const other of this.draft.expectations.values()) {
+        if (other.id !== e.id && other.tenantId === tenantId && other.account === e.account && other.muxedId === changes.muxedId) {
+          muxedIdTaken = true
+          break
+        }
+      }
+    }
+    const next = amendExpectationRecord(e, allocations, changes, reason, this.now(), muxedIdTaken)
+    this.draft.expectations.set(id, next)
+    removeReferenceKeys(this.draft, e)
+    addReferenceKeys(this.draft, next)
+    this.emit(expectationAmended(next, e, reason))
     return next
   }
 

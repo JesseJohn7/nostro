@@ -164,6 +164,16 @@ export interface NewExpectation {
   readonly account: string
   readonly direction?: Direction
   readonly amount: Money
+  readonly muxedId?: bigint | 'issue' | null
+  readonly memo?: Memo | null
+  readonly payers?: readonly string[]
+  readonly dueAt?: Date | null
+  readonly expiresAt?: Date | null
+  readonly metadata?: Readonly<Record<string, string>>
+}
+
+export interface ExpectationChanges {
+  readonly amount?: Money
   readonly muxedId?: bigint | null
   readonly memo?: Memo | null
   readonly payers?: readonly string[]
@@ -208,6 +218,7 @@ export type ExceptionCode =
   | 'DUPLICATE_PAYMENT'
   | 'PARTIAL_UNRESOLVED'
   | 'LATE_BEYOND_WINDOW'
+  | 'EXPECTATION_EXPIRED'
   | 'MEMO_MISSING'
   | 'MEMO_MALFORMED'
   | 'MEMO_TRUNCATED'
@@ -226,6 +237,7 @@ export const EXCEPTION_CODES: readonly ExceptionCode[] = [
   'DUPLICATE_PAYMENT',
   'PARTIAL_UNRESOLVED',
   'LATE_BEYOND_WINDOW',
+  'EXPECTATION_EXPIRED',
   'MEMO_MISSING',
   'MEMO_MALFORMED',
   'MEMO_TRUNCATED',

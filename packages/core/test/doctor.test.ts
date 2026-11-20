@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest'
 import type {
   Allocation,
   ExceptionRecord,
+  Expectation,
   HorizonEffect,
   HorizonOperation,
   HorizonTransaction,
@@ -259,6 +260,18 @@ function tampered(
   return wrap(store)
 }
 
+function tamperedExpectations(store: Store, edit: (expectations: Expectation[]) => Expectation[]): Store {
+  return new Proxy(store, {
+    get(t, prop) {
+      if (prop === 'listExpectations') {
+        return async (q: Parameters<Store['listExpectations']>[0]) => edit(await t.listExpectations(q))
+      }
+      const value = Reflect.get(t, prop) as unknown
+      return typeof value === 'function' ? (value as (...a: unknown[]) => unknown).bind(t) : value
+    },
+  })
+}
+
 async function reconciled() {
   const store = new MemoryStore()
   await store.transaction(async (tx) => {
@@ -302,6 +315,28 @@ describe('doctor', () => {
     const report = await doctor({ store, tenantId: T, pageSize: 2 })
     expect(report.movements.total).toBe(6)
     expect(report.journal.entries).toBe(4)
+  })
+
+  it('flags a duplicated muxed id on an expectation', async () => {
+    const store = new MemoryStore()
+    const e = await store.transaction((tx) =>
+      tx.insertExpectation({ tenantId: T, reference: 'MUX-DUP', account: ACCOUNT, amount: usdc('10'), muxedId: 7n }),
+    )
+    const tamperedStore = tamperedExpectations(store, (expectations) =>
+      expectations.flatMap((x) => (x.id === e.id ? [x, { ...x, id: `${x.id}-copy` }] : [x])),
+    )
+
+    const report = await doctor({ store: tamperedStore, tenantId: T })
+    expect(report.ok).toBe(false)
+    expect(report.findings).toEqual([
+      expect.objectContaining({
+        invariant: 'I1',
+        severity: 'error',
+        code: 'muxed_id_duplicate',
+        account: ACCOUNT,
+        detail: expect.stringContaining('7'),
+      }),
+    ])
   })
 
   it('flags a partial movement left behind when its exception is resolved, until it is re-marked', async () => {

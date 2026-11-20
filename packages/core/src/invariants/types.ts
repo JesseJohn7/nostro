@@ -18,6 +18,7 @@ export type FindingCode =
   | 'disposition_unsupported'
   | 'allocation_asset'
   | 'allocation_over_movement'
+  | 'muxed_id_duplicate'
   // I2
   | 'balance_mismatch'
   // I3

@@ -23,6 +23,7 @@ import type {
   ExceptionQuery,
   ExceptionRecord,
   Expectation,
+  ExpectationChanges,
   ExpectationQuery,
   InsertMovementsResult,
   JournalEntry,
@@ -56,6 +57,7 @@ import {
   assertValidNewExpectation,
   assertValidNewJournalEntry,
   assertValidNewMovement,
+  amendExpectationRecord,
   checkAllocation,
   checkCancel,
   checkCursorValue,
@@ -65,6 +67,8 @@ import {
   checkJournalPeriodReopen,
   checkResolution,
   exceptionChanged,
+  issueMuxedId,
+  expectationAmended,
   expectationChanged,
   expectationReferenceKeys,
   movementDecided,
@@ -577,12 +581,29 @@ class SqliteTx extends SqliteReader implements StoreTx {
 
   async insertExpectation(n: NewExpectation): Promise<Expectation> {
     assertValidNewExpectation(n)
-    // Transactions are serialised, so nothing can take the reference between this check and the insert.
     if ((await this.getExpectationByReference(n.tenantId, n.reference)) !== null) {
       throw new ConstraintError(
         'expectation_reference_unique',
         `reference ${JSON.stringify(n.reference)} already exists in this tenant`,
       )
+    }
+    let muxedId: bigint | null
+    if (n.muxedId === 'issue') {
+      const rows = this.all('SELECT muxed_id FROM expectations WHERE tenant_id = ? AND account = ? AND muxed_id IS NOT NULL', [n.tenantId, n.account]) as Row[]
+      let max = 0n
+      for (const r of rows) {
+        const v = BigInt(r.muxed_id as string)
+        if (v > max) max = v
+      }
+      muxedId = issueMuxedId(max)
+    } else {
+      muxedId = n.muxedId ?? null
+    }
+    if (muxedId !== null) {
+      const taken = this.one('SELECT id FROM expectations WHERE tenant_id = ? AND account = ? AND muxed_id = ?', [n.tenantId, n.account, muxedId.toString()])
+      if (taken !== undefined) {
+        throw new ConstraintError('expectation_muxed_id_unique', `muxed id ${muxedId.toString()} is already used on account ${n.account}`)
+      }
     }
     const [memoType, memoValue, memoText] = memoColumns(n.memo)
     const now = this.now().getTime()
@@ -603,7 +624,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
         n.amount.asset,
         n.amount.decimals,
         n.amount.raw.toString(),
-        n.muxedId == null ? null : n.muxedId.toString(),
+        muxedId == null ? null : muxedId.toString(),
         memoType,
         memoValue,
         memoText,
@@ -633,6 +654,48 @@ class SqliteTx extends SqliteReader implements StoreTx {
     )
     this.emit(expectationChanged(next, null))
     return next
+  }
+
+  async amendExpectation(tenantId: string, id: string, changes: ExpectationChanges, reason: string): Promise<Expectation> {
+    const e = this.expectation(tenantId, id)
+    const allocations = await this.listAllocations({ tenantId, expectationId: id })
+    let muxedIdTaken = false
+    if (changes.muxedId !== undefined && changes.muxedId !== e.muxedId && changes.muxedId !== null) {
+      const taken = this.one('SELECT id FROM expectations WHERE tenant_id = ? AND account = ? AND muxed_id = ? AND id != ?', [tenantId, e.account, changes.muxedId.toString(), id])
+      muxedIdTaken = taken !== undefined
+    }
+    const next = amendExpectationRecord(e, allocations, changes, reason, this.now(), muxedIdTaken)
+    const [memoType, memoValue, memoText] = memoColumns(next.memo)
+    const saved = toExpectation(
+      this.one(
+        `UPDATE expectations SET amount = ?, decimals = ?, asset = ?, muxed_id = ?, memo_type = ?, memo_value = ?, memo_text = ?,
+           payers = ?, due_at = ?, expires_at = ?, status = ?, metadata = ?, updated_at = ?
+         WHERE id = ? RETURNING *`,
+        [
+          next.amount.raw.toString(),
+          next.amount.decimals,
+          next.amount.asset,
+          next.muxedId == null ? null : next.muxedId.toString(),
+          memoType,
+          memoValue,
+          memoText,
+          JSON.stringify([...next.payers]),
+          ms(next.dueAt),
+          ms(next.expiresAt),
+          next.status,
+          JSON.stringify({ ...next.metadata }),
+          next.updatedAt.getTime(),
+          e.id,
+        ],
+      )!,
+    )
+    this.db.prepare('DELETE FROM expectation_reference_index WHERE expectation_id = ?').run(e.id)
+    const index = this.db.prepare(
+      'INSERT OR IGNORE INTO expectation_reference_index (tenant_id, normalized, expectation_id) VALUES (?, ?, ?)',
+    )
+    for (const values of referenceIndexRows(saved.id, saved.tenantId, saved.reference, saved.memo)) index.run(...values)
+    this.emit(expectationAmended(saved, e, reason))
+    return saved
   }
 
   async allocate(n: NewAllocation): Promise<Allocation> {

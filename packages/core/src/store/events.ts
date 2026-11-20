@@ -20,6 +20,7 @@ export type EventType =
   | 'expectation.partially_paid'
   | 'expectation.settled'
   | 'expectation.cancelled'
+  | 'expectation.amended'
   | 'exception.opened'
   | 'exception.resolved'
   | 'exception.dismissed'
@@ -29,6 +30,7 @@ export const EVENT_TYPES: readonly EventType[] = [
   'expectation.partially_paid',
   'expectation.settled',
   'expectation.cancelled',
+  'expectation.amended',
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
@@ -110,6 +112,19 @@ export function exceptionChanged(exception: ExceptionRecord): NewOutboxEvent {
     type: exception.status === 'open' ? 'exception.opened' : exception.status === 'resolved' ? 'exception.resolved' : 'exception.dismissed',
     subjectId: exception.id,
     payload: json({ exception: exceptionJson(exception) }),
+  }
+}
+
+export function expectationAmended(
+  expectation: Expectation,
+  previous: Expectation,
+  reason: string,
+): NewOutboxEvent {
+  return {
+    tenantId: expectation.tenantId,
+    type: 'expectation.amended',
+    subjectId: expectation.id,
+    payload: json({ expectation: expectationJson(expectation), previous: expectationJson(previous), reason }),
   }
 }
 

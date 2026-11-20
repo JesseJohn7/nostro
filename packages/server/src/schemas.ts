@@ -73,7 +73,7 @@ export const expectationBody = {
     amount: { type: 'string', pattern: AMOUNT, description: 'A decimal string, never a JSON number; never rounded.' },
     asset: { type: 'string', minLength: 1, description: '`native` (the default) or `CODE:ISSUER`.' },
     direction: { enum: ['credit', 'debit'] },
-    muxedId: { type: 'string', pattern: UINT64 },
+    muxedId: { anyOf: [{ type: 'string', pattern: UINT64 }, { const: 'issue' }] },
     memo: {
       oneOf: [
         {
@@ -147,6 +147,52 @@ export const resolveBody = {
   ],
 } as const
 
+
+export const cancelExpectationBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['reason'],
+  properties: { reason: { type: 'string', minLength: 1, maxLength: 2000 } },
+} as const
+
+export const amendExpectationBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['reason'],
+  properties: {
+    reason: { type: 'string', minLength: 1, maxLength: 2000 },
+    amount: { type: 'string', pattern: AMOUNT, description: 'A decimal string, never a JSON number; never rounded.' },
+    muxedId: { anyOf: [{ type: 'string', pattern: UINT64 }, { type: 'null' }] },
+    memo: {
+      anyOf: [
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'value'],
+          properties: { type: { const: 'text' }, value: { type: 'string', minLength: 1 } },
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'value'],
+          properties: { type: { const: 'id' }, value: { type: 'string', minLength: 1 } },
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'value'],
+          properties: { type: { const: 'hash' }, value: { type: 'string', pattern: HASH } },
+        },
+        { type: 'null' },
+      ],
+    },
+    payers: { type: 'array', maxItems: 100, items: { type: 'string', pattern: ACCOUNT } },
+    dueAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] },
+    expiresAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] },
+    metadata: { type: 'object', maxProperties: 50, additionalProperties: { type: 'string', maxLength: 1024 } },
+  },
+} as const
+
 // Responses.
 
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` })
@@ -170,10 +216,14 @@ const PROBLEM_CODES: readonly ProblemCode[] = [
   'resolution_refused',
   'not_found',
   'reference_taken',
+  'muxed_id_taken',
+  'expectation_conflict',
   'internal',
 ]
 
 export const components = {
+  CancelExpectationBody: cancelExpectationBody,
+  AmendExpectationBody: amendExpectationBody,
   Memo: record({ type: { enum: ['text', 'id', 'hash', 'return'] }, value: str }),
   Movement: record({
     id: str,

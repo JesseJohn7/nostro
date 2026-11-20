@@ -11,6 +11,7 @@ import type {
   Disposition,
   ExceptionRecord,
   Expectation,
+  ExpectationChanges,
   ExpectationStatus,
   JournalEntry,
   LineRole,
@@ -21,13 +22,20 @@ import type {
   NewMovement,
   Side,
 } from '../model/index.js'
-import { ValidationError, assertStorableText, signedAmount } from '../model/index.js'
+import { ValidationError, assertStorableText, assertValidExpectationChanges, signedAmount } from '../model/index.js'
 import { Money, isSameCodeDifferentIssuer } from '../money/index.js'
 import type { Resolution } from './store.js'
 import { ConstraintError } from './store.js'
 
 export function sumAmounts(amounts: readonly Money[], like: Money): Money {
   return amounts.reduce((acc, m) => acc.add(m), Money.zero(like.asset, like.decimals))
+}
+
+const MUXED_ID_MAX = (1n << 64n) - 1n
+
+export function issueMuxedId(max: bigint): bigint {
+  if (max >= MUXED_ID_MAX) throw new ValidationError('muxedId', `muxed id ${max.toString()} cannot be increased past 2^64 - 1`)
+  return max + 1n
 }
 
 /**
@@ -200,6 +208,70 @@ export function checkResolution(exception: ExceptionRecord, resolution: Resoluti
   if (exception.status !== 'open') {
     throw new ConstraintError('exception_not_open', `exception ${exception.id} is already ${exception.status}`)
   }
+}
+export function amendExpectationRecord(
+  expectation: Expectation,
+  allocations: readonly Allocation[],
+  changes: ExpectationChanges,
+  reason: string,
+  now: Date,
+  muxedIdTaken: boolean,
+): Expectation {
+  if (typeof reason !== 'string' || reason.trim() === '') {
+    throw new ValidationError('reason', 'must be a non-empty string')
+  }
+  assertStorableText('reason', reason)
+  assertValidExpectationChanges(changes)
+  if (expectation.status !== 'open' && expectation.status !== 'partially_paid') {
+    throw new ConstraintError('expectation_not_amendable', `expectation ${expectation.id} is ${expectation.status}`)
+  }
+  if ('reference' in (changes as object) || 'account' in (changes as object) || 'direction' in (changes as object)) {
+    throw new ValidationError('changes', 'reference, account and direction cannot be changed')
+  }
+
+  const allocated = sumAmounts(allocations.map((a) => a.amount), expectation.amount)
+  const nextAmount = changes.amount ?? expectation.amount
+  if (nextAmount.asset !== expectation.amount.asset || nextAmount.decimals !== expectation.amount.decimals) {
+    throw new ConstraintError('allocation_asset', `cannot change expectation ${expectation.id} to a different asset`)
+  }
+  if (nextAmount.compare(allocated) < 0) {
+    throw new ConstraintError(
+      'amendment_below_allocated',
+      `amount ${nextAmount.toString()} is below ${allocated.toString()} already allocated`,
+    )
+  }
+  const nextMuxedId = changes.muxedId === undefined ? expectation.muxedId : changes.muxedId
+  if (nextMuxedId !== expectation.muxedId && muxedIdTaken) {
+    throw new ConstraintError(
+      'expectation_muxed_id_unique',
+      `muxed id ${String(nextMuxedId)} is already used on account ${expectation.account}`,
+    )
+  }
+
+  const status: ExpectationStatus = allocated.isZero()
+    ? 'open'
+    : allocated.equals(nextAmount)
+      ? 'settled'
+      : 'partially_paid'
+
+  const nextMemo = changes.memo === undefined ? expectation.memo : changes.memo == null ? null : Object.freeze(storedMemo(changes.memo))
+  return Object.freeze({
+    ...expectation,
+    amount: nextAmount,
+    muxedId: nextMuxedId,
+    memo: nextMemo,
+    payers: changes.payers === undefined ? expectation.payers : Object.freeze([...changes.payers]),
+    dueAt: changes.dueAt === undefined ? expectation.dueAt : changes.dueAt == null ? null : new Date(changes.dueAt.getTime()),
+    expiresAt:
+      changes.expiresAt === undefined
+        ? expectation.expiresAt
+        : changes.expiresAt == null
+          ? null
+          : new Date(changes.expiresAt.getTime()),
+    metadata: changes.metadata === undefined ? expectation.metadata : Object.freeze({ ...changes.metadata }),
+    status,
+    updatedAt: new Date(now.getTime()),
+  })
 }
 
 /** Check a cursor value before it is stored. */

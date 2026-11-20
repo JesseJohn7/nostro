@@ -24,6 +24,7 @@ import type {
   ExceptionQuery,
   ExceptionRecord,
   Expectation,
+  ExpectationChanges,
   ExpectationQuery,
   InsertMovementsResult,
   JournalEntry,
@@ -55,6 +56,7 @@ import {
   assertValidNewExpectation,
   assertValidNewJournalEntry,
   assertValidNewMovement,
+  amendExpectationRecord,
   checkAllocation,
   checkCancel,
   checkCursorValue,
@@ -64,6 +66,8 @@ import {
   checkJournalPeriodReopen,
   checkResolution,
   exceptionChanged,
+  issueMuxedId,
+  expectationAmended,
   expectationChanged,
   expectationReferenceKeys,
   movementDecided,
@@ -474,10 +478,22 @@ class PgTx extends PgReader implements StoreTx {
       )
     if ((await this.getExpectationByReference(n.tenantId, n.reference)) !== null) throw taken()
 
+    await this.run('SELECT pg_advisory_xact_lock(hashtext($1))', [`nostro:muxed:${this.s}:${n.tenantId}:${n.account}`])
+    let muxedId: bigint | null
+    if (n.muxedId === 'issue') {
+      const rows = await this.run<{ max: string | null }>(`SELECT max(muxed_id)::text AS max FROM ${this.s}.expectations WHERE tenant_id = $1 AND account = $2 AND muxed_id IS NOT NULL`, [n.tenantId, n.account])
+      const max = rows[0]?.max == null ? 0n : BigInt(rows[0].max)
+      muxedId = issueMuxedId(max)
+    } else {
+      muxedId = n.muxedId ?? null
+    }
+    if (muxedId !== null) {
+      const rows = await this.run<{ id: string }>(`SELECT id FROM ${this.s}.expectations WHERE tenant_id = $1 AND account = $2 AND muxed_id = $3`, [n.tenantId, n.account, muxedId.toString()])
+      if (rows.length > 0) throw new ConstraintError('expectation_muxed_id_unique', `muxed id ${muxedId.toString()} is already used on account ${n.account}`)
+    }
+
     const [memoType, memoValue, memoText] = memoColumns(n.memo)
     const now = this.now()
-    // A concurrent insert of the same reference surfaces as a unique
-    // violation; the savepoint keeps this transaction usable afterwards.
     const savepoint = `nostro_${++this.savepoints}`
     await this.run(`SAVEPOINT ${savepoint}`)
     try {
@@ -497,7 +513,7 @@ class PgTx extends PgReader implements StoreTx {
           n.amount.asset,
           n.amount.decimals,
           n.amount.raw.toString(),
-          n.muxedId == null ? null : n.muxedId.toString(),
+          muxedId == null ? null : muxedId.toString(),
           memoType,
           memoValue,
           memoText,
@@ -520,6 +536,12 @@ class PgTx extends PgReader implements StoreTx {
     } catch (err) {
       await this.run(`ROLLBACK TO SAVEPOINT ${savepoint}`)
       if (isUniqueViolation(err, 'expectations_reference_unique')) throw taken()
+      if (isUniqueViolation(err, 'expectation_muxed_id_unique')) {
+        throw new ConstraintError(
+          'expectation_muxed_id_unique',
+          `muxed id ${muxedId!.toString()} is already used on account ${n.account}`,
+        )
+      }
       throw err
     }
   }
@@ -535,6 +557,53 @@ class PgTx extends PgReader implements StoreTx {
     const next = toExpectation(row!)
     await this.emit(expectationChanged(next, null))
     return next
+  }
+
+  async amendExpectation(tenantId: string, id: string, changes: ExpectationChanges, reason: string): Promise<Expectation> {
+    const e = await this.lockExpectation(tenantId, id)
+    const allocations = await this.listAllocations({ tenantId, expectationId: id })
+    let muxedIdTaken = false
+    if (changes.muxedId !== undefined && changes.muxedId !== e.muxedId && changes.muxedId !== null) {
+      await this.run('SELECT pg_advisory_xact_lock(hashtext($1))', [`nostro:muxed:${this.s}:${tenantId}:${e.account}`])
+      const rows = await this.run<{ id: string }>(`SELECT id FROM ${this.s}.expectations WHERE tenant_id = $1 AND account = $2 AND muxed_id = $3 AND id <> $4`, [tenantId, e.account, changes.muxedId.toString(), id])
+      muxedIdTaken = rows.length > 0
+    }
+    const next = amendExpectationRecord(e, allocations, changes, reason, this.now(), muxedIdTaken)
+    const [memoType, memoValue, memoText] = memoColumns(next.memo)
+    const [row] = await this.run<ExpectationRow>(
+      `UPDATE ${this.s}.expectations
+         SET amount = $3, decimals = $4, asset = $5, muxed_id = $6, memo_type = $7, memo_value = $8, memo_text = $9,
+             payers = $10, due_at = $11, expires_at = $12, status = $13, metadata = $14, updated_at = $15
+       WHERE tenant_id = $1 AND id = $2 RETURNING *`,
+      [
+        tenantId,
+        id,
+        next.amount.raw.toString(),
+        next.amount.decimals,
+        next.amount.asset,
+        next.muxedId == null ? null : next.muxedId.toString(),
+        memoType,
+        memoValue,
+        memoText,
+        [...next.payers],
+        next.dueAt,
+        next.expiresAt,
+        next.status,
+        JSON.stringify({ ...next.metadata }),
+        next.updatedAt,
+      ],
+    )
+    const saved = toExpectation(row!)
+    await this.run(`DELETE FROM ${this.s}.expectation_reference_index WHERE expectation_id = $1`, [e.id])
+    for (const normalized of expectationReferenceKeys(saved.reference, saved.memo)) {
+      await this.run(
+        `INSERT INTO ${this.s}.expectation_reference_index (tenant_id, normalized, expectation_id)
+         VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+        [saved.tenantId, normalized, saved.id],
+      )
+    }
+    await this.emit(expectationAmended(saved, e, reason))
+    return saved
   }
 
   async allocate(n: NewAllocation): Promise<Allocation> {

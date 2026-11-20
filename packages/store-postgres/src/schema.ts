@@ -45,6 +45,7 @@ const EVENT_TYPES = list([
   'expectation.partially_paid',
   'expectation.settled',
   'expectation.cancelled',
+  'expectation.amended',
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
@@ -57,6 +58,7 @@ const EXCEPTION_CODES = list([
   'DUPLICATE_PAYMENT',
   'PARTIAL_UNRESOLVED',
   'LATE_BEYOND_WINDOW',
+  'EXPECTATION_EXPIRED',
   'MEMO_MISSING',
   'MEMO_MALFORMED',
   'MEMO_TRUNCATED',
@@ -309,5 +311,59 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       PRIMARY KEY (tenant_id, normalized, expectation_id)
     );
     CREATE INDEX IF NOT EXISTS expectation_reference_keys ON ${s}.expectation_reference_index (tenant_id, normalized);
+  `,
+
+  (s) => `
+    DO $do$
+    DECLARE c text;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '${s}.exceptions'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%code%'
+      LOOP
+        EXECUTE format('ALTER TABLE ${s}.exceptions DROP CONSTRAINT %I', c);
+      END LOOP;
+    END $do$;
+    ALTER TABLE ${s}.exceptions ADD CONSTRAINT exceptions_code_check CHECK (code IN (${EXCEPTION_CODES}));
+
+    DO $do$
+    DECLARE c text;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '${s}.events'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%type%'
+      LOOP
+        EXECUTE format('ALTER TABLE ${s}.events DROP CONSTRAINT %I', c);
+      END LOOP;
+    END $do$;
+    ALTER TABLE ${s}.events ADD CONSTRAINT events_type_check CHECK (type IN (${EVENT_TYPES}));
+
+    DROP INDEX IF EXISTS ${s}.exceptions_expiry_once;
+    CREATE UNIQUE INDEX exceptions_expiry_once ON ${s}.exceptions (tenant_id, expectation_id)
+      WHERE code = 'EXPECTATION_EXPIRED' AND expectation_id IS NOT NULL;
+
+    CREATE OR REPLACE FUNCTION ${s}.expectations_muxed_id_unique() RETURNS trigger LANGUAGE plpgsql AS $fn$
+    BEGIN
+      IF TG_OP = 'UPDATE' THEN
+        IF NEW.muxed_id IS NOT DISTINCT FROM OLD.muxed_id THEN
+          RETURN NEW;
+        END IF;
+      END IF;
+      IF NEW.muxed_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM ${s}.expectations
+        WHERE tenant_id = NEW.tenant_id AND account = NEW.account
+          AND muxed_id = NEW.muxed_id AND id <> NEW.id
+      ) THEN
+        RAISE EXCEPTION 'muxed id % already used on account %', NEW.muxed_id, NEW.account
+          USING ERRCODE = 'unique_violation', CONSTRAINT = 'expectation_muxed_id_unique';
+      END IF;
+      RETURN NEW;
+    END $fn$;
+    DROP TRIGGER IF EXISTS expectations_muxed_id_insert_unique ON ${s}.expectations;
+    CREATE TRIGGER expectations_muxed_id_insert_unique BEFORE INSERT ON ${s}.expectations
+      FOR EACH ROW EXECUTE FUNCTION ${s}.expectations_muxed_id_unique();
+    DROP TRIGGER IF EXISTS expectations_muxed_id_update_unique ON ${s}.expectations;
+    CREATE TRIGGER expectations_muxed_id_update_unique BEFORE UPDATE ON ${s}.expectations
+      FOR EACH ROW EXECUTE FUNCTION ${s}.expectations_muxed_id_unique();
   `,
 ]

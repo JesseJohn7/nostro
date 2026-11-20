@@ -34,6 +34,7 @@ const EVENT_TYPES = [
   'expectation.partially_paid',
   'expectation.settled',
   'expectation.cancelled',
+  'expectation.amended',
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
@@ -51,6 +52,7 @@ const EXCEPTION_CODES = list([
   'DUPLICATE_PAYMENT',
   'PARTIAL_UNRESOLVED',
   'LATE_BEYOND_WINDOW',
+  'EXPECTATION_EXPIRED',
   'MEMO_MISSING',
   'MEMO_MALFORMED',
   'MEMO_TRUNCATED',
@@ -273,5 +275,90 @@ export const MIGRATIONS: readonly string[] = [
     ) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS expectation_reference_keys
       ON expectation_reference_index (tenant_id, normalized);
+  `,
+  `
+    CREATE TABLE exceptions_new (
+      seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+      id              TEXT NOT NULL UNIQUE,
+      tenant_id       TEXT NOT NULL,
+      code            TEXT NOT NULL CHECK (code IN (${EXCEPTION_CODES})),
+      status          TEXT NOT NULL CHECK (status IN (${EXCEPTION_STATUSES})),
+      movement_id     TEXT REFERENCES movements (id),
+      expectation_id  TEXT REFERENCES expectations (id),
+      account         TEXT,
+      asset           TEXT,
+      decimals        INTEGER,
+      amount          TEXT,
+      detail          TEXT NOT NULL,
+      evidence        TEXT NOT NULL,
+      opened_at       INTEGER NOT NULL,
+      resolved_at     INTEGER,
+      resolution_note TEXT,
+      CHECK (movement_id IS NOT NULL OR expectation_id IS NOT NULL OR account IS NOT NULL),
+      CHECK ((amount IS NULL) = (asset IS NULL) AND (asset IS NULL) = (decimals IS NULL))
+    );
+    INSERT INTO exceptions_new (seq,id,tenant_id,code,status,movement_id,expectation_id,account,asset,decimals,amount,detail,evidence,opened_at,resolved_at,resolution_note)
+      SELECT seq,id,tenant_id,code,status,movement_id,expectation_id,account,asset,decimals,amount,detail,evidence,opened_at,resolved_at,resolution_note FROM exceptions;
+
+    CREATE TABLE journal_lines_new (
+      entry_id       TEXT NOT NULL REFERENCES journal_entries (id),
+      line_no        INTEGER NOT NULL CHECK (line_no >= 1),
+      tenant_id      TEXT NOT NULL,
+      account        TEXT NOT NULL,
+      role           TEXT NOT NULL CHECK (role IN (${LINE_ROLES})),
+      side           TEXT NOT NULL CHECK (side IN ('debit', 'credit')),
+      asset          TEXT NOT NULL,
+      decimals       INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount         TEXT NOT NULL ${positive('amount')},
+      expectation_id TEXT REFERENCES expectations (id),
+      exception_id   TEXT REFERENCES exceptions_new (id),
+      PRIMARY KEY (entry_id, line_no)
+    );
+    INSERT INTO journal_lines_new (entry_id,line_no,tenant_id,account,role,side,asset,decimals,amount,expectation_id,exception_id)
+      SELECT entry_id,line_no,tenant_id,account,role,side,asset,decimals,amount,expectation_id,exception_id FROM journal_lines;
+    DROP TABLE journal_lines;
+    DROP TABLE exceptions;
+    ALTER TABLE exceptions_new RENAME TO exceptions;
+    ALTER TABLE journal_lines_new RENAME TO journal_lines;
+    CREATE INDEX exceptions_queue ON exceptions (tenant_id, status, code);
+    CREATE INDEX exceptions_movement ON exceptions (movement_id) WHERE movement_id IS NOT NULL;
+    CREATE UNIQUE INDEX exceptions_expiry_once ON exceptions (tenant_id, expectation_id)
+      WHERE code = 'EXPECTATION_EXPIRED' AND expectation_id IS NOT NULL;
+    CREATE INDEX journal_lines_account ON journal_lines (tenant_id, account, asset);
+    ${appendOnly('journal_lines')}
+
+    CREATE TABLE events_new (
+      seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+      id         TEXT NOT NULL UNIQUE,
+      tenant_id  TEXT NOT NULL,
+      type       TEXT NOT NULL CHECK (type IN (${list(EVENT_TYPES)})),
+      subject_id TEXT NOT NULL,
+      payload    TEXT NOT NULL CHECK (json_valid(payload)),
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO events_new (seq,id,tenant_id,type,subject_id,payload,created_at)
+      SELECT seq,id,tenant_id,type,subject_id,payload,created_at FROM events;
+    DROP TABLE events;
+    ALTER TABLE events_new RENAME TO events;
+    CREATE INDEX events_tenant ON events (tenant_id, seq);
+    CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+    CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+
+    DROP TRIGGER IF EXISTS expectations_muxed_id_insert_unique;
+    DROP TRIGGER IF EXISTS expectations_muxed_id_update_unique;
+    CREATE TRIGGER expectations_muxed_id_insert_unique BEFORE INSERT ON expectations
+      WHEN NEW.muxed_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM expectations
+        WHERE tenant_id = NEW.tenant_id AND account = NEW.account AND muxed_id = NEW.muxed_id
+      )
+      BEGIN SELECT RAISE(ABORT, 'muxed id already used on account'); END;
+    CREATE TRIGGER expectations_muxed_id_update_unique BEFORE UPDATE ON expectations
+      WHEN NEW.muxed_id IS NOT NULL AND NEW.muxed_id IS NOT OLD.muxed_id AND EXISTS (
+        SELECT 1 FROM expectations
+        WHERE tenant_id = NEW.tenant_id AND account = NEW.account AND muxed_id = NEW.muxed_id AND id <> NEW.id
+      )
+      BEGIN SELECT RAISE(ABORT, 'muxed id already used on account'); END;
   `,
 ]

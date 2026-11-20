@@ -98,7 +98,7 @@ export function buildOpenApi() {
               ...ok('Expectation', 'Recorded'),
               headers: { Location: { description: 'Where it can be read back.', schema: { type: 'string' } } },
             },
-            '409': problem('The reference is already used in this tenant (`reference_taken`).'),
+            '409': problem('The reference or muxed id is already used in this tenant (`reference_taken`, `muxed_id_taken`).'),
             '422': problem('Well formed but not recordable exactly, e.g. more decimals than the asset has (`invalid_expectation`).'),
             ...errors,
           },
@@ -110,6 +110,36 @@ export function buildOpenApi() {
           summary: 'One expectation, with what has been allocated to it',
           parameters: [idParam('expectation')],
           responses: { '200': ok('ExpectationDetail'), '404': problem('No such expectation in this tenant (`not_found`).'), ...errors },
+        },
+      },
+      '/v1/expectations/{id}/cancel': {
+        post: {
+          operationId: 'cancelExpectation',
+          summary: 'Cancel an open expectation with no allocations',
+          parameters: [idParam('expectation')],
+          requestBody: { required: true, content: { 'application/json': { schema: ref('CancelExpectationBody') } } },
+          responses: {
+            '200': ok('Expectation'),
+            '404': problem('No such expectation in this tenant (`not_found`).'),
+            '409': problem('Cannot be cancelled in its current state (`expectation_conflict`).'),
+            '422': problem('The cancellation is not valid (`invalid_expectation`).'),
+            ...errors,
+          },
+        },
+      },
+      '/v1/expectations/{id}/amend': {
+        post: {
+          operationId: 'amendExpectation',
+          summary: 'Change an open or part-paid expectation',
+          parameters: [idParam('expectation')],
+          requestBody: { required: true, content: { 'application/json': { schema: ref('AmendExpectationBody') } } },
+          responses: {
+            '200': ok('Expectation'),
+            '404': problem('No such expectation in this tenant (`not_found`).'),
+            '409': problem('The amendment is refused (`expectation_conflict` or `muxed_id_taken`).'),
+            '422': problem('The amendment is not valid (`invalid_expectation`).'),
+            ...errors,
+          },
         },
       },
       '/v1/exceptions': {

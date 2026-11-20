@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net'
 import { resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { Store } from '@nostro-labs/nostro'
-import { MIN_WEBHOOK_SECRET_LENGTH, StreamWatcher, deliverWebhooks } from '@nostro-labs/nostro'
+import { MIN_WEBHOOK_SECRET_LENGTH, StreamWatcher, deliverWebhooks, sweepExpectations } from '@nostro-labs/nostro'
 import { apiKeys, createServer } from '@nostro-labs/server'
 import type { Args } from '../args.js'
 import { CliError, NETWORK, RATE_LIMIT, UsageError, accounts, database, flag, integer, network, positionals, rateLimit, string, strings, tenant } from '../args.js'
@@ -167,6 +167,8 @@ SSE accelerator (--sse):
                 if (s.error !== null) await write(io.stderr, `${s.source} ${s.account}: ${clean(s.error.message)}\n`)
               }
               for (const [id, error] of totals.errors) await write(io.stderr, `Failed on movement ${id}: ${clean(error)}\n`)
+            } else {
+              await sweepExpectations({ store, tenantId })
             }
             if (hook !== null) await deliver(store, tenantId, hook, io)
           } catch (err) {

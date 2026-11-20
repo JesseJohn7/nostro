@@ -120,6 +120,43 @@ describe('movements', () => {
 describe('expectations', () => {
   const post = (app: ReturnType<typeof server>, payload: unknown) =>
     app.inject({ method: 'POST', url: '/v1/expectations', headers: auth(), payload: payload as object })
+  const cancel = (app: ReturnType<typeof server>, id: string, payload: unknown, key = ACME_KEY) =>
+    app.inject({ method: 'POST', url: `/v1/expectations/${id}/cancel`, headers: auth(key), payload: payload as object })
+  const amend = (app: ReturnType<typeof server>, id: string, payload: unknown, key = ACME_KEY) =>
+    app.inject({ method: 'POST', url: `/v1/expectations/${id}/amend`, headers: auth(key), payload: payload as object })
+
+  async function partlyPaid(): Promise<{ app: ReturnType<typeof server>; id: string }> {
+    const store = new MemoryStore()
+    const { inserted } = await store.transaction((tx) =>
+      tx.insertMovements([
+        {
+          tenantId: 'acme',
+          network: 'testnet',
+          source: 'x',
+          externalId: 'y',
+          account: A,
+          direction: 'credit',
+          kind: 'transfer',
+          amount: Money.parse('25', NATIVE),
+          ledger: 10,
+          occurredAt: new Date(),
+        },
+      ]),
+    )
+    const expectation = await store.transaction((tx) =>
+      tx.insertExpectation({ tenantId: 'acme', reference: 'INV-P', account: A, amount: Money.parse('25', NATIVE) }),
+    )
+    await store.transaction((tx) =>
+      tx.allocate({
+        tenantId: 'acme',
+        movementId: inserted[0]!.id,
+        expectationId: expectation.id,
+        amount: Money.parse('10', NATIVE),
+        strategy: 'manual',
+      }),
+    )
+    return { app: server(store), id: expectation.id }
+  }
 
   it('records one, says where it is, and refuses the same reference twice', async () => {
     const app = server(new MemoryStore())
@@ -238,6 +275,130 @@ describe('expectations', () => {
     expect((await app.inject({ url: '/v1/expectations', headers: auth() })).json().data).toEqual([])
     const big = await post(app, { ...ok, metadata: { note: 'x'.repeat(70 * 1024) } })
     expect(big.statusCode).toBe(400)
+  })
+
+  it('cancels an open expectation, records its reason and event, and maps refusals', async () => {
+    const app = server(new MemoryStore())
+    const e = (await post(app, { reference: 'INV-C', account: A, amount: '7' })).json()
+    const res = await cancel(app, e.id, { reason: 'customer cancelled' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({ id: e.id, status: 'cancelled', cancelReason: 'customer cancelled', amount: '7.0000000' })
+    expect((await app.inject({ url: `/v1/expectations/${e.id}`, headers: auth() })).json().expectation).toEqual(res.json())
+    const events = (await app.inject({ url: '/v1/events', headers: auth() })).json().data
+    expect(events).toEqual([
+      expect.objectContaining({ type: 'expectation.cancelled', subjectId: e.id, data: expect.objectContaining({ expectation: res.json() }) }),
+    ])
+    expect((await cancel(app, 'nope', { reason: 'n' })).json()).toMatchObject({ status: 404, code: 'not_found' })
+    for (const payload of [{}, { reason: '' }, { reason: 1 }, { reason: 'n', colour: 'red' }, { reason: 'x'.repeat(2001) }]) {
+      const bad = await cancel(app, e.id, payload)
+      expect(bad.statusCode, JSON.stringify(payload)).toBe(400)
+      expect(bad.json()).toMatchObject({ code: 'invalid_request' })
+    }
+    expect((await cancel(app, e.id, { reason: 'a\u0000b' })).json()).toMatchObject({ status: 422, code: 'invalid_expectation' })
+    expect((await cancel(app, e.id, { reason: 'again' })).json()).toMatchObject({ status: 409, code: 'expectation_conflict' })
+    expect((await cancel(app, e.id, { reason: 'other tenant' }, OTHER_KEY)).statusCode).toBe(404)
+    const allocatedApp = server(await seeded())
+    const settled = (await allocatedApp.inject({ url: '/v1/expectations?status=settled', headers: auth() })).json().data[0]
+    expect((await cancel(allocatedApp, settled.id, { reason: 'n' })).json()).toMatchObject({ status: 409, code: 'expectation_conflict' })
+  })
+
+  it('amends an expectation, clears fields with null, and logs the amendment', async () => {
+    const app = server(new MemoryStore())
+    const original = (await post(app, { reference: 'INV-A', account: A, amount: '10' })).json()
+    const res = await amend(app, original.id, {
+      reason: 'customer asked',
+      amount: '12.5',
+      memo: { type: 'text', value: 'new memo' },
+      payers: [B],
+      dueAt: '2026-11-01T00:00:00Z',
+      expiresAt: '2026-12-01T17:00:00+01:00',
+      metadata: { po: '99' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({
+      id: original.id,
+      status: 'open',
+      reference: original.reference,
+      account: original.account,
+      amount: '12.5000000',
+      muxedId: null,
+      memo: { type: 'text', value: 'new memo' },
+      payers: [B],
+      dueAt: '2026-11-01T00:00:00.000Z',
+      expiresAt: '2026-12-01T16:00:00.000Z',
+      metadata: { po: '99' },
+    })
+    const events = (await app.inject({ url: '/v1/events', headers: auth() })).json().data
+    expect(events).toEqual([
+      expect.objectContaining({
+        type: 'expectation.amended',
+        subjectId: original.id,
+        data: { expectation: res.json(), previous: original, reason: 'customer asked' },
+      }),
+    ])
+    const cleared = await amend(app, original.id, { reason: 'clear', muxedId: null, memo: null, dueAt: null, expiresAt: null })
+    expect(cleared.statusCode).toBe(200)
+    expect(cleared.json()).toMatchObject({ muxedId: null, memo: null, dueAt: null, expiresAt: null })
+  })
+
+  it('amends a muxed id and an id memo', async () => {
+    const app = server(new MemoryStore())
+    const e = (await post(app, { reference: 'INV-M', account: A, amount: '1' })).json()
+    const res = await amend(app, e.id, { reason: 'n', muxedId: '42', memo: { type: 'id', value: '7' } })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toMatchObject({ muxedId: '42', memo: { type: 'id', value: '7' } })
+  })
+
+  it('maps amendment refusals to 400, 404, 409 and 422 with the right codes', async () => {
+    const app = server(new MemoryStore())
+    const one = (await post(app, { reference: 'ONE', account: A, amount: '10', muxedId: '10' })).json()
+    await post(app, { reference: 'TWO', account: A, amount: '10', muxedId: '20' })
+    expect((await amend(app, 'nope', { reason: 'n' })).json()).toMatchObject({ status: 404, code: 'not_found' })
+    expect((await amend(app, 'nope', { reason: 'n', amount: '1' })).json()).toMatchObject({ status: 404, code: 'not_found' })
+    for (const payload of [
+      {},
+      { reason: '' },
+      { reason: 1 },
+      { reason: 'n', amount: 1 },
+      { reason: 'n', muxedId: '-1' },
+      { reason: 'n', muxedId: 'issue' },
+      { reason: 'n', memo: { type: 'hash', value: 'aa' } },
+      { reason: 'n', dueAt: 'tomorrow' },
+      { reason: 'n', colour: 'red' },
+      { reason: 'n', payers: [1] },
+      { reason: 'n', metadata: { paid: true } },
+    ]) {
+      const bad = await amend(app, one.id, payload)
+      expect(bad.statusCode, JSON.stringify(payload)).toBe(400)
+      expect(bad.json()).toMatchObject({ code: 'invalid_request' })
+    }
+    for (const [payload, detail] of [
+      [{ reason: 'n' }, 'at least one field'],
+      [{ reason: 'n', amount: '0' }, 'must be positive'],
+      [{ reason: 'n', amount: '10.00000001' }, 'refusing to round'],
+      [{ reason: 'n', muxedId: '18446744073709551616' }, 'below 2^64'],
+      [{ reason: 'n', memo: { type: 'text', value: 'x'.repeat(29) } }, '28 bytes'],
+      [{ reason: 'n', memo: { type: 'id', value: 'seven' } }, 'whole number'],
+      [{ reason: 'a\u0000b' }, 'NUL'],
+    ] as const) {
+      const res = await amend(app, one.id, payload)
+      expect(res.statusCode, JSON.stringify(payload)).toBe(422)
+      expect(res.json()).toMatchObject({ code: 'invalid_expectation' })
+      expect(res.json().detail).toContain(detail)
+    }
+    expect((await amend(app, one.id, { reason: 'n', muxedId: '20' })).json()).toMatchObject({ status: 409, code: 'muxed_id_taken' })
+    const { app: paidApp, id: paidId } = await partlyPaid()
+    expect((await amend(paidApp, paidId, { reason: 'n', amount: '5' })).json()).toMatchObject({ status: 409, code: 'expectation_conflict' })
+    const raised = await amend(paidApp, paidId, { reason: 'n', amount: '25' })
+    expect(raised.statusCode).toBe(200)
+    expect(raised.json()).toMatchObject({ status: 'partially_paid', amount: '25.0000000' })
+    const lowered = await amend(paidApp, paidId, { reason: 'n', amount: '10' })
+    expect(lowered.statusCode).toBe(200)
+    expect(lowered.json()).toMatchObject({ status: 'settled', amount: '10.0000000' })
+    const cancelled = (await post(app, { reference: 'CANCEL', account: A, amount: '1' })).json()
+    await cancel(app, cancelled.id, { reason: 'n' })
+    expect((await amend(app, cancelled.id, { reason: 'n', amount: '2' })).json()).toMatchObject({ status: 409, code: 'expectation_conflict' })
+    expect((await amend(app, one.id, { reason: 'n', amount: '2' }, OTHER_KEY)).statusCode).toBe(404)
   })
 })
 

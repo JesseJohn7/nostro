@@ -11,6 +11,8 @@ export type ProblemCode =
   | 'resolution_refused'
   | 'not_found'
   | 'reference_taken'
+  | 'muxed_id_taken'
+  | 'expectation_conflict'
   | 'internal'
 
 export interface Problem {

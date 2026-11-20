@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest'
 import type { Candidate, Decision, Expectation, MatchStrategy, Movement } from '../src/index.js'
-import { Money, asset, combine, decide, normalizeReference } from '../src/index.js'
+import {
+  DEFAULT_STRATEGIES,
+  Money,
+  asset,
+  combine,
+  decide,
+  memoContainedStrategy,
+  memoNearMissStrategy,
+  normalizeReference,
+} from '../src/index.js'
 
 const ACCOUNT = `G${'A'.repeat(55)}`
 const PAYER = `G${'B'.repeat(55)}`
@@ -368,5 +377,111 @@ describe('decide: nothing to match', () => {
     const e = expectation({ payers: [PAYER] })
     const d = allocation(decide(movement(), [candidate(e)], { strategies: [payer, ...[]], threshold: 0.5 }))
     expect(d.strategy).toBe('known_payer')
+  })
+})
+
+describe('memo corroboration', () => {
+  const signalFor = (strategy: MatchStrategy, memo: string, reference: string, amount = '3') =>
+    strategy.evaluate(
+      movement({ amount: usdc(amount), memo: { type: 'text', value: memo } }),
+      candidate(expectation({ reference, amount: usdc('10') })),
+      [],
+    )
+
+  it('registers both strategies with corroborating scores below the threshold', () => {
+    expect(DEFAULT_STRATEGIES.map((s) => s.name)).toContain('memo_contained')
+    expect(DEFAULT_STRATEGIES.map((s) => s.name)).toContain('memo_near_miss')
+    expect(memoContainedStrategy.name).toBe('memo_contained')
+    expect(memoNearMissStrategy.name).toBe('memo_near_miss')
+    expect(memoContainedStrategy.family).toBe('identifier')
+    expect(memoNearMissStrategy.family).toBe('identifier')
+
+    const contained = signalFor(memoContainedStrategy, 'Payment INV-1234', 'INV-1234')
+    const near = signalFor(memoNearMissStrategy, 'INV-1O42', 'INV-1042')
+    expect(contained).toMatchObject({ strategy: 'memo_contained', family: 'identifier', score: 0.6 })
+    expect(near).toMatchObject({ strategy: 'memo_near_miss', family: 'identifier', score: 0.5 })
+    expect(contained!.score).toBeLessThan(0.7)
+    expect(near!.score).toBeLessThan(0.7)
+  })
+
+  it.each(['Payment INV-123', 'INV-123 ACME'])('finds the reference in the memo %j', (memo) => {
+    expect(signalFor(memoContainedStrategy, memo, 'INV-123')).toMatchObject({
+      strategy: 'memo_contained',
+      score: 0.6,
+    })
+  })
+
+  it('finds a one-character typo in a memo', () => {
+    expect(signalFor(memoNearMissStrategy, 'INV-1O42', 'INV-1042')).toMatchObject({
+      strategy: 'memo_near_miss',
+      score: 0.5,
+    })
+    expect(signalFor(memoNearMissStrategy, 'INV-10A2', 'INV-1042')).toMatchObject({
+      strategy: 'memo_near_miss',
+      score: 0.5,
+    })
+    expect(signalFor(memoNearMissStrategy, 'INV-1O4Z', 'INV-1042')).toBeNull()
+  })
+
+  it('ignores references shorter than four characters after normalisation', () => {
+    expect(signalFor(memoContainedStrategy, 'Payment AB1', 'AB1')).toBeNull()
+    expect(signalFor(memoNearMissStrategy, 'AB2', 'AB1')).toBeNull()
+    expect(signalFor(memoContainedStrategy, 'Payment REF-12', 'REF-12')).toBeNull()
+    expect(signalFor(memoNearMissStrategy, 'REF-13', 'REF-12')).toBeNull()
+  })
+
+  it('does not score an exact text memo again as a weaker identifier', () => {
+    expect(signalFor(memoContainedStrategy, 'INV-1234', 'INV-1234')).toBeNull()
+    expect(signalFor(memoNearMissStrategy, 'INV-1234', 'INV-1234')).toBeNull()
+    expect(signalFor(memoContainedStrategy, 'INV-1042', 'INV-1234')).toBeNull()
+  })
+
+  it('never settles on a contained reference alone, but lets exact amount corroborate it', () => {
+    const e = expectation({ reference: 'INV-1234' })
+    const partial = movement({ amount: usdc('3'), memo: { type: 'text', value: 'Payment INV-1234' } })
+    expect(exception(decide(partial, [candidate(e)]))).toMatchObject({
+      code: 'AMBIGUOUS_MATCH',
+      detail: expect.stringMatching(/best candidate scored 0.6/),
+    })
+
+    const exact = movement({ amount: usdc('10'), memo: { type: 'text', value: 'Payment INV-1234' } })
+    expect(allocation(decide(exact, [candidate(e)]))).toMatchObject({
+      expectationId: e.id,
+      strategy: 'memo_contained',
+      score: 0.84,
+    })
+  })
+
+  it('never settles on a near miss alone, and keeps exact amount as the strongest signal', () => {
+    const e = expectation({ reference: 'INV-1042' })
+    const partial = movement({ amount: usdc('3'), memo: { type: 'text', value: 'INV-1O42' } })
+    expect(exception(decide(partial, [candidate(e)]))).toMatchObject({
+      code: 'AMBIGUOUS_MATCH',
+      detail: expect.stringMatching(/best candidate scored 0.5/),
+    })
+
+    const exact = movement({ amount: usdc('10'), memo: { type: 'text', value: 'INV-1O42' } })
+    expect(allocation(decide(exact, [candidate(e)]))).toMatchObject({
+      expectationId: e.id,
+      strategy: 'exact_amount',
+      score: 0.8,
+    })
+    expect(JSON.stringify(decide(exact, [candidate(e)]))).toContain('memo_near_miss')
+  })
+
+  it('leaves two corroborating candidates to a person', () => {
+    const a = expectation({ reference: 'INV-1234' })
+    const b = expectation({ reference: 'INV-1235' })
+    const m = movement({ amount: usdc('3'), memo: { type: 'text', value: 'Payment INV-1234' } })
+    const d = exception(decide(m, [candidate(a), candidate(b)]))
+    expect(d.code).toBe('AMBIGUOUS_MATCH')
+    const listed = (d.evidence as {
+      candidates: { expectationId: string; score: number; signals: { strategy: string }[] }[]
+    }).candidates
+    expect(listed.map((c) => c.expectationId)).toEqual([a.id, b.id])
+    expect(listed.map((c) => c.score)).toEqual([0.6, 0.5])
+    expect(listed[0]!.score - listed[1]!.score).toBeLessThan(0.15)
+    expect(listed[0]!.signals.map((s) => s.strategy)).toContain('memo_contained')
+    expect(listed[1]!.signals.map((s) => s.strategy)).toContain('memo_near_miss')
   })
 })

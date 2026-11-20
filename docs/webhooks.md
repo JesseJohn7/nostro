@@ -26,8 +26,20 @@ from a saved position and picks up where it stopped.
 | `expectation.partially_paid` | an allocation part-paid an expectation | `expectation`, `allocation` |
 | `expectation.settled` | an allocation paid it in full | `expectation`, `allocation` |
 | `expectation.cancelled` | it was cancelled | `expectation`, `allocation: null` |
+| `expectation.amended` | its details were changed by a person | `expectation`, `previous`, `reason` |
 | `exception.opened` | something needs a person | `exception` |
 | `exception.resolved`, `exception.dismissed` | someone closed it | `exception` |
+
+`expectation.amended` carries both the new and the old record, so a consumer can see what changed;
+`reason` is the non-empty explanation required for the amendment. An amendment writes only this
+event, even when it changes the expectation's status as a side effect; allocations still write
+`expectation.partially_paid` or `expectation.settled`.
+
+`EXPECTATION_EXPIRED` is an exception code, not an event type. `sweepExpectations()` opens it against
+an unpaid expectation past its expiry, so it arrives as `exception.opened` with
+`data.exception.code` set to `EXPECTATION_EXPIRED`. The sweep is idempotent and does not itself change
+the expectation's status. It is independent of matching's `LATE_BEYOND_WINDOW`: a truly late, unpaid
+expectation can draw both, as two separate `exception.opened` events.
 
 Records use the same JSON as the HTTP API: amounts are exact decimal strings next to their asset,
 and ids and dates are strings.

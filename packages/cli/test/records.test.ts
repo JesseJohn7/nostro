@@ -78,6 +78,29 @@ describe('nostro expect', () => {
     expect(text.stdout).toBe(`Recorded PAYROLL-8: 1.0000000 XLM to pay from ${A}.\n`)
   })
 
+  it('issues sequential muxed ids for an account, scoped by tenant', async () => {
+    const cwd = await migrated()
+    const first = await nostro(cwd, ['expect', 'INV-1', '--account', A, '--amount', '10', '--issue-muxed-id'])
+    expect(first).toMatchObject({ code: 0, stdout: `Recorded INV-1: 10.0000000 XLM owed to ${A} (muxed id 1).\n` })
+    await nostro(cwd, ['expect', 'INV-2', '--account', A, '--amount', '10', '--muxed-id', '10'])
+    const second = await nostro(cwd, ['expect', 'INV-3', '--account', A, '--amount', '20', '--issue-muxed-id', '--json'])
+    expect(JSON.parse(second.stdout)).toMatchObject({ reference: 'INV-3', account: A, muxedId: '11', status: 'open' })
+    const other = await nostro(cwd, ['expect', 'INV-4', '--account', B, '--amount', '20', '--issue-muxed-id', '--json'])
+    expect(JSON.parse(other.stdout)).toMatchObject({ reference: 'INV-4', account: B, muxedId: '1' })
+    const elsewhere = await nostro(cwd, ['expect', 'INV-5', '--account', A, '--amount', '20', '--issue-muxed-id', '--tenant', 'acme', '--json'])
+    expect(JSON.parse(elsewhere.stdout)).toMatchObject({ reference: 'INV-5', muxedId: '1' })
+    const listed = await nostro(cwd, ['expectations', '--json'])
+    expect(JSON.parse(listed.stdout).map((e: { muxedId: string | null }) => e.muxedId)).toEqual(['1', '10', '11', '1'])
+  })
+
+  it('refuses to issue a muxed id past the uint64 range', async () => {
+    const cwd = await migrated()
+    await nostro(cwd, ['expect', 'MAX', '--account', A, '--amount', '1', '--muxed-id', '18446744073709551615'])
+    const run = await nostro(cwd, ['expect', 'NEXT', '--account', A, '--amount', '1', '--issue-muxed-id'])
+    expect(run.code).not.toBe(0)
+    expect(run.stderr).toContain('muxed id')
+  })
+
   it('records a hash memo asked for with --memo-hash', async () => {
     const cwd = await migrated()
     const hash = 'a'.repeat(64)
@@ -120,6 +143,7 @@ describe('nostro expect', () => {
       [['R', ...ok, '--memo-hash', 'g'.repeat(64)], '--memo-hash must be exactly 64 lowercase hex characters'],
       [['R', ...ok, '--memo-hash', 'a'.repeat(64), '--memo-id', '1'], '--memo-hash on its own'],
       [['R', ...ok, '--muxed-id=-1'], '--muxed-id must be a whole number below 2^64'],
+      [['R', ...ok, '--muxed-id', '1', '--issue-muxed-id'], 'Give --muxed-id or --issue-muxed-id, not both.'],
       [['R', ...ok, '--payer', 'GABC'], '--payer "GABC" is not a G... account id'],
       [['R', ...ok, '--due', 'tomorrow'], '--due must be a date'],
       [['R', ...ok, '--due', '2026-02-30'], '--due must be a date'],
@@ -137,6 +161,185 @@ describe('nostro expect', () => {
     for (const argv of [['--status', 'paid'], ['--account', 'GABC'], ['--limit', '0']]) {
       expect((await nostro(cwd, ['expectations', ...argv])).code).toBe(2)
     }
+  })
+})
+
+describe('nostro cancel', () => {
+  it('cancels an open expectation with a reason, in text or JSON', async () => {
+    const cwd = await migrated()
+    await nostro(cwd, ['expect', 'INV-1', '--account', A, '--amount', '10'])
+    expect(await nostro(cwd, ['cancel', 'INV-1', '--reason', 'customer changed their mind'])).toMatchObject({
+      code: 0,
+      stdout: 'Cancelled INV-1.\n',
+      stderr: '',
+    })
+    await nostro(cwd, ['expect', 'INV-2', '--account', A, '--amount', '20'])
+    const asJson = await nostro(cwd, ['cancel', 'INV-2', '--reason', 'duplicate', '--json'])
+    expect(asJson.code).toBe(0)
+    expect(JSON.parse(asJson.stdout)).toMatchObject({
+      reference: 'INV-2',
+      status: 'cancelled',
+      cancelReason: 'duplicate',
+      paid: '0.0000000',
+    })
+    const listed = await nostro(cwd, ['expectations', '--status', 'cancelled', '--json'])
+    expect(JSON.parse(listed.stdout).map((e: { reference: string }) => e.reference)).toEqual(['INV-1', 'INV-2'])
+  })
+
+  it('exits 2 on a bad command line and 1 on a reference it cannot cancel', async () => {
+    const cwd = await migrated()
+    await nostro(cwd, ['expect', 'INV-1', '--account', A, '--amount', '10'])
+    for (const [argv, message] of [
+      [[], 'Give the expectation reference'],
+      [['INV-1'], '--reason is required'],
+      [['INV-1', '--reason', ' '], '--reason is required'],
+      [['INV-1', '--reason', 'x', 'extra'], 'Unexpected argument "extra"'],
+    ] as const) {
+      const run = await nostro(cwd, ['cancel', ...argv])
+      expect(run.code, argv.join(' ')).toBe(2)
+      expect(run.stderr).toContain(message)
+    }
+    expect(await nostro(cwd, ['cancel', 'MISSING', '--reason', 'x'])).toMatchObject({
+      code: 1,
+      stderr: 'nostro: No expectation MISSING.\n',
+    })
+    expect((await nostro(cwd, ['cancel', 'INV-1', '--reason', 'x'])).code).toBe(0)
+    expect((await nostro(cwd, ['cancel', 'INV-1', '--reason', 'x'])).stderr).toContain('already cancelled')
+  })
+
+  it('refuses to cancel an expectation with allocations', async () => {
+    const cwd = await synced()
+    await nostro(cwd, ['expect', 'INV-1042', '--account', A, '--amount', '25'])
+    await nostro(cwd, ['reconcile'])
+    const run = await nostro(cwd, ['cancel', 'INV-1042', '--reason', 'paid already'])
+    expect(run.code).toBe(1)
+    expect(run.stderr).toContain('reverse its allocations before cancelling')
+    expect((await nostro(cwd, ['expectations', '--status', 'settled'])).stdout).toContain('INV-1042')
+  })
+})
+
+describe('nostro amend', () => {
+  const C = `G${'C'.repeat(55)}`
+
+  it('changes the mutable fields and prints the resulting status', async () => {
+    const cwd = await migrated()
+    await nostro(cwd, [
+      'expect', 'PAYROLL-7', '--account', A, '--amount', '1200.5',
+      '--muxed-id', '5', '--memo-text', 'old', '--payer', B,
+      '--due', '2026-11-01', '--expires', '2026-12-01', '--meta', 'po=1',
+    ])
+    const run = await nostro(cwd, [
+      'amend', 'PAYROLL-7', '--reason', 'invoice corrected', '--amount', '1300',
+      '--muxed-id', '6', '--memo-id', '42', '--payer', C,
+      '--due', '2026-11-15', '--expires', '2026-12-15', '--meta', 'po=2',
+    ])
+    expect(run).toMatchObject({ code: 0, stdout: 'Amended PAYROLL-7 (open).\n' })
+    const body = JSON.parse((await nostro(cwd, ['expectations', '--json'])).stdout)[0]
+    expect(body).toMatchObject({
+      reference: 'PAYROLL-7',
+      account: A,
+      direction: 'credit',
+      amount: '1300.0000000',
+      muxedId: '6',
+      memo: { type: 'id', value: '42' },
+      payers: [C],
+      dueAt: '2026-11-15T00:00:00.000Z',
+      expiresAt: '2026-12-15T00:00:00.000Z',
+      status: 'open',
+      metadata: { po: '2' },
+    })
+    const cleared = await nostro(cwd, [
+      'amend', 'PAYROLL-7', '--reason', 'drop the extras', '--muxed-id', 'none',
+      '--clear-memo', '--clear-due', '--clear-expires', '--json',
+    ])
+    expect(cleared.code).toBe(0)
+    expect(JSON.parse(cleared.stdout)).toMatchObject({
+      muxedId: null,
+      memo: null,
+      dueAt: null,
+      expiresAt: null,
+      payers: [C],
+      metadata: { po: '2' },
+      status: 'open',
+    })
+  })
+
+  it('recomputes status against allocations and reports what is paid', async () => {
+    const cwd = await synced()
+    await nostro(cwd, ['expect', 'INV-1042', '--account', A, '--amount', '40'])
+    await nostro(cwd, ['reconcile'])
+    expect(JSON.parse((await nostro(cwd, ['expectations', '--json'])).stdout)[0]).toMatchObject({
+      status: 'partially_paid',
+      paid: '25.0000000',
+    })
+    const lowered = await nostro(cwd, ['amend', 'INV-1042', '--reason', 'correct amount', '--amount', '30'])
+    expect(lowered).toMatchObject({ code: 0, stdout: 'Amended INV-1042 (partially_paid).\n' })
+    const again = await nostro(cwd, ['amend', 'INV-1042', '--reason', 'again', '--amount', '31', '--json'])
+    expect(JSON.parse(again.stdout)).toMatchObject({ amount: '31.0000000', status: 'partially_paid', paid: '25.0000000' })
+  })
+
+  it('refuses to amend a settled expectation', async () => {
+    const cwd = await synced()
+    await nostro(cwd, ['expect', 'INV-1042', '--account', A, '--amount', '25'])
+    await nostro(cwd, ['reconcile'])
+    const run = await nostro(cwd, ['amend', 'INV-1042', '--reason', 'late change', '--amount', '30'])
+    expect(run.code).toBe(1)
+    expect(run.stderr).toContain('is settled')
+  })
+
+  it('refuses to lower an amount below what is allocated', async () => {
+    const cwd = await synced()
+    await nostro(cwd, ['expect', 'INV-1042', '--account', A, '--amount', '40'])
+    await nostro(cwd, ['reconcile'])
+    const run = await nostro(cwd, ['amend', 'INV-1042', '--reason', 'down', '--amount', '24'])
+    expect(run.code).toBe(1)
+    expect(run.stderr).toContain('is below 25.0000000 already allocated')
+  })
+
+  it('maps not-found, constraint and validation failures to their exit codes', async () => {
+    const cwd = await migrated()
+    await nostro(cwd, ['expect', 'R', '--account', A, '--amount', '10', '--muxed-id', '5'])
+    await nostro(cwd, ['expect', 'OTHER', '--account', A, '--amount', '10', '--muxed-id', '6'])
+    expect(await nostro(cwd, ['amend', 'MISSING', '--reason', 'x', '--amount', '1'])).toMatchObject({
+      code: 1,
+      stderr: 'nostro: No expectation MISSING.\n',
+    })
+    const taken = await nostro(cwd, ['amend', 'R', '--reason', 'x', '--muxed-id', '6'])
+    expect(taken.code).toBe(1)
+    expect(taken.stderr).toContain('muxed id 6 is already used on account')
+    expect((await nostro(cwd, ['cancel', 'OTHER', '--reason', 'x'])).code).toBe(0)
+    const cancelled = await nostro(cwd, ['amend', 'OTHER', '--reason', 'x', '--amount', '1'])
+    expect(cancelled.code).toBe(1)
+    expect(cancelled.stderr).toContain('is cancelled')
+  })
+
+  it('exits 2, changing nothing, on anything it would have to guess at', async () => {
+    const cwd = await migrated()
+    await nostro(cwd, ['expect', 'R', '--account', A, '--amount', '10'])
+    for (const [argv, message] of [
+      [[], 'Give the expectation reference'],
+      [['R', '--amount', '11'], '--reason is required'],
+      [['R', '--reason', ' '], '--reason is required'],
+      [['R', '--reason', 'x'], 'changes: must include at least one field to change'],
+      [['R', '--reason', 'x', '--amount', 'ten'], '--amount: Invalid amount'],
+      [['R', '--reason', 'x', '--amount', '1.00000001'], 'refusing to round'],
+      [['R', '--reason', 'x', '--amount=-1'], 'amount: must be positive'],
+      [['R', '--reason', 'x', '--muxed-id', '18446744073709551616'], '--muxed-id must be a whole number below 2^64'],
+      [['R', '--reason', 'x', '--memo-text', 'x'.repeat(29)], '--memo-text must be 1 to 28 bytes'],
+      [['R', '--reason', 'x', '--memo-text', 'x', '--memo-id', '1'], 'not both'],
+      [['R', '--reason', 'x', '--clear-memo', '--memo-id', '1'], 'Use --clear-memo alone'],
+      [['R', '--reason', 'x', '--payer', 'GABC'], 'payers[0]: must be a G... account id'],
+      [['R', '--reason', 'x', '--due', 'tomorrow'], '--due must be a date'],
+      [['R', '--reason', 'x', '--expires', '2026-10-31T17:00'], '--expires must be a date'],
+      [['R', '--reason', 'x', '--meta', 'novalue'], '--meta must be key=value'],
+      [['R', '--reason', 'x', 'extra'], 'Unexpected argument "extra"'],
+    ] as const) {
+      const run = await nostro(cwd, ['amend', ...argv])
+      expect(run.code, argv.join(' ')).toBe(2)
+      expect(run.stderr).toContain(message)
+    }
+    const unchanged = JSON.parse((await nostro(cwd, ['expectations', '--json'])).stdout)[0]
+    expect(unchanged).toMatchObject({ reference: 'R', amount: '10.0000000', status: 'open' })
   })
 })
 

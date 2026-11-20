@@ -9,9 +9,10 @@ import { randomUUID } from 'node:crypto'
 import pg from 'pg'
 import { afterAll, describe, expect, it } from 'vitest'
 import type { StoreTx } from '@nostro-labs/nostro'
-import { Money, NATIVE } from '@nostro-labs/nostro'
+import { Money, NATIVE, doctor } from '@nostro-labs/nostro'
 import { describeStoreConformance, describeStoreProperties } from 'nostro-testkit'
 import { PostgresStore } from '../src/index.js'
+import { MIGRATIONS, quoteSchema } from '../src/schema.js'
 
 const url = process.env.NOSTRO_TEST_DATABASE_URL
 if (url === undefined && process.env.CI !== undefined) {
@@ -49,19 +50,75 @@ if (pool === undefined) {
       await Promise.all([1, 2, 3].map(() => freshStore({ schema })))
       await freshStore({ schema })
       const { rows } = await pool.query(`SELECT version FROM "${schema}".migrations ORDER BY version`)
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5])
+      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6])
     })
 
     it('reports the schema version without changing it', async () => {
       const schema = `nostro_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`
       schemas.push(schema)
       const store = new PostgresStore({ pool: pool!, schema })
-      expect(await store.schemaVersion()).toEqual({ current: 0, latest: 5 })
-      expect(await store.schemaVersion()).toEqual({ current: 0, latest: 5 })
+      expect(await store.schemaVersion()).toEqual({ current: 0, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: 0, latest: 6 })
       await store.migrate()
-      expect(await store.schemaVersion()).toEqual({ current: 5, latest: 5 })
+      expect(await store.schemaVersion()).toEqual({ current: 6, latest: 6 })
       await pool.query(`DELETE FROM "${schema}".migrations WHERE version >= 3`)
-      expect(await store.schemaVersion()).toEqual({ current: 2, latest: 5 })
+      expect(await store.schemaVersion()).toEqual({ current: 2, latest: 6 })
+    })
+
+    it('migrates a version 5 database with duplicate muxed ids and refuses later duplicates', async () => {
+      const schema = `nostro_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`
+      schemas.push(schema)
+      const s = quoteSchema(schema)
+      const account = `G${'A'.repeat(55)}`
+      const rawExpectation = (id: string, reference: string) =>
+        `INSERT INTO ${s}.expectations (id, tenant_id, reference, account, direction, asset, decimals, amount,
+           muxed_id, payers, status, metadata, created_at, updated_at)
+         VALUES ('${id}', 't', '${reference}', '${account}', 'credit', 'native', 7, '1', '7', '{}', 'open', '{}', now(), now())`
+
+      const client = await pool!.connect()
+      try {
+        await client.query(`CREATE SCHEMA ${s}`)
+        await client.query(
+          `CREATE TABLE ${s}.migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`,
+        )
+        await client.query('BEGIN')
+        for (const migration of MIGRATIONS.slice(0, 5)) await client.query(migration(s))
+        for (let version = 1; version <= 5; version++) {
+          await client.query(`INSERT INTO ${s}.migrations (version) VALUES ($1)`, [version])
+        }
+        await client.query(rawExpectation('e1', 'r1'))
+        await client.query(rawExpectation('e2', 'r2'))
+        await client.query('COMMIT')
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw err
+      } finally {
+        client.release()
+      }
+
+      const store = new PostgresStore({ pool: pool!, schema })
+      await store.migrate()
+      expect(await store.schemaVersion()).toEqual({ current: 6, latest: 6 })
+      expect((await doctor({ store, tenantId: 't' })).findings).toEqual([
+        expect.objectContaining({ code: 'muxed_id_duplicate' }),
+      ])
+      await store.transaction((tx) =>
+        tx.amendExpectation('t', 'e1', { memo: { type: 'text', value: 'still here' } }, 'legacy duplicate'),
+      )
+      await expect(pool!.query(rawExpectation('e3', 'r3'))).rejects.toThrow(/muxed id.*already used on account/)
+    })
+
+    it('gives two concurrent writers issuing muxed ids distinct ids', async () => {
+      const store = await freshStore()
+      const account = `G${'A'.repeat(55)}`
+      const issue = (reference: string) =>
+        store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: 't', reference, account, amount: Money.parse('1', NATIVE), muxedId: 'issue' }),
+        )
+      const [a, b] = await Promise.all([issue('r1'), issue('r2')])
+      expect(a.muxedId).not.toBeNull()
+      expect(b.muxedId).not.toBeNull()
+      expect(a.muxedId).not.toEqual(b.muxedId)
     })
 
     it('commits events in seq order, so a reader after a seq can never miss one', async () => {
