@@ -9,6 +9,7 @@
  */
 import type { JournalEntry } from '../model/index.js'
 import type { Store } from '../store/index.js'
+import { JournalRounder } from './round.js'
 
 export const JOURNAL_CSV_COLUMNS = [
   'entry_id',
@@ -41,6 +42,8 @@ export interface JournalCsvOptions {
   readonly pageSize?: number
   /** Internal upper bound used to keep a multi-pass export on one journal snapshot. */
   readonly throughSeq?: number
+  /** Target decimal places for exact, balanced rounding. Omit for unchanged output. */
+  readonly decimals?: number
   /** Metadata keys to read as dimensions. Each key becomes a column named after it. */
   readonly dimensions?: readonly string[]
 }
@@ -58,7 +61,7 @@ export function journalCsvCell(value: string | number | null, text = false): str
 export const journalCsvRow = (cells: readonly string[]) => `${cells.join(',')}\r\n`
 
 /** Read the matching journal entries in bounded pages. */
-export async function* journalEntries(options: JournalCsvOptions): AsyncGenerator<JournalEntry> {
+export async function* journalEntries(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry> {
   const { store, tenantId } = options
   const pageSize = options.pageSize ?? 500
   let afterSeq: number | undefined
@@ -67,7 +70,7 @@ export async function* journalEntries(options: JournalCsvOptions): AsyncGenerato
       tenantId,
       limit: pageSize,
       ...(afterSeq === undefined ? {} : { afterSeq }),
-      ...(options.from === undefined ? {} : { effectiveFrom: options.from }),
+      ...(includeBeforeFrom || options.from === undefined ? {} : { effectiveFrom: options.from }),
       ...(options.to === undefined ? {} : { effectiveBefore: options.to }),
     })
     for (const entry of page) {
@@ -98,8 +101,11 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
   yield journalCsvRow(allColumns.map((c) => c))
 
   const expectationMetadatas = new Map<string, Record<string, string | null>>()
+  const rounder = options.decimals === undefined ? null : new JournalRounder(options.decimals)
 
-  for await (const entry of journalEntries(options)) {
+  for await (const original of journalEntries(options, rounder !== null)) {
+    const entry = rounder === null ? original : rounder.round(original)
+    if (rounder !== null && options.from !== undefined && original.effectiveAt < options.from) continue
     if (entry.movementId !== null && !txHash.has(entry.movementId)) {
       txHash.set(entry.movementId, (await store.getMovement(tenantId, entry.movementId))?.txHash ?? null)
     }

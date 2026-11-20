@@ -235,7 +235,8 @@ export interface Store extends StoreReader {
   /**
    * Run `fn` in a transaction. Commits if it resolves, rolls back everything
    * it wrote if it throws, and rethrows. The `tx` handle is dead once `fn`
-   * settles. Do not nest transactions.
+   * settles. Do not nest transactions. A SQL store may rerun `fn` after a
+   * deadlock, so callbacks must not perform irreversible external effects.
    */
   transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>
   close(): Promise<void>
