@@ -920,6 +920,19 @@ export class PostgresStore extends PgReader implements MigratableStore {
   }
 
   async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await this.transactionOnce(fn)
+      } catch (error) {
+        if ((error as { code?: unknown })?.code !== '40P01' || attempt >= 3) throw error
+        // The complete transaction is replayed on a fresh connection. A short
+        // stagger prevents two writers from repeatedly colliding in lockstep.
+        await new Promise<void>((resolve) => setTimeout(resolve, 10 * (2 ** attempt) + Math.floor(Math.random() * 10)))
+      }
+    }
+  }
+
+  private async transactionOnce<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
     const client = await this.pool.connect()
     const tx = new PgTx(this.s, client, this.ids, this.now)
     let broken: Error | undefined

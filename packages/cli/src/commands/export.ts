@@ -10,7 +10,7 @@ import {
   journalQuickBooksRows,
   journalXeroRows,
 } from '@nostro-labs/nostro'
-import { COMMON, CliError, UsageError, date, flag, positionals, string, tenant } from '../args.js'
+import { COMMON, CliError, UsageError, date, flag, integer, positionals, string, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { withStore } from '../command.js'
 import { write } from '../io.js'
@@ -52,6 +52,7 @@ Beancount is ledger text. Spreadsheet exports guard text cells against formulas.
 
 Options:
   --format <format>   csv (default), quickbooks, xero or beancount
+  --decimals <n>     Round CSV amounts to n decimal places (0–38)
   --from <date>       Entries effective on or after this
   --to <date>         Entries effective before this
   --output <file>     Write to this file; it must not exist, unless --force
@@ -68,6 +69,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
   options: {
     ...options,
     format: { type: 'string' },
+    decimals: { type: 'string' },
     from: { type: 'string' },
     to: { type: 'string' },
     output: { type: 'string' },
@@ -84,6 +86,8 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const to = date(args, 'to')
     if (from !== undefined && to !== undefined && from >= to) throw new UsageError('--from must be before --to.')
     const format = string(args, 'format') ?? 'csv'
+    const decimals = string(args, 'decimals') === undefined ? undefined : integer(args, 'decimals', 7, 0, 38)
+    if (decimals !== undefined && format !== 'csv') throw new UsageError('--decimals only applies to CSV exports.')
     if (!['csv', 'quickbooks', 'xero', 'beancount'].includes(format)) {
       throw new UsageError('--format must be csv, quickbooks, xero or beancount.')
     }
@@ -130,7 +134,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
         if (commodityMap === undefined) throw new UsageError('--format beancount requires --commodity-map <file>.')
         rows = journalBeancountRows({ ...base, commodityMap })
       } else {
-        rows = journalCsvRows(base)
+        rows = journalCsvRows({ ...base, ...(decimals === undefined ? {} : { decimals }) })
       }
       if (output === undefined) {
         for await (const row of rows) await write(io.stdout, row)
