@@ -63,6 +63,34 @@ export interface EventQuery {
   readonly limit?: number
 }
 
+/** Thrown when a requested event position predates the tenant's retained log. */
+export class EventHistoryPrunedError extends Error {
+  constructor(
+    readonly tenantId: string,
+    readonly requestedAfter: number,
+    readonly prunedThrough: number,
+  ) {
+    super(`event history before sequence ${prunedThrough} has been pruned; request after a retained position`)
+    this.name = 'EventHistoryPrunedError'
+  }
+}
+
+export interface PruneEventsOptions {
+  readonly store: import('./store.js').Store
+  readonly tenantId: string
+  readonly olderThan: Date
+}
+
+export interface PruneEventsResult {
+  readonly deleted: number
+  readonly prunedThrough: number
+}
+
+/** Remove only the old event prefix that every persisted webhook cursor passed. */
+export async function pruneEvents(options: PruneEventsOptions): Promise<PruneEventsResult> {
+  return options.store.transaction((tx) => tx.pruneEventsBefore(options.tenantId, options.olderThan))
+}
+
 /**
  * Where a consumer of the log keeps its position: an ordinary cursor, in a
  * namespace no ingest source uses.

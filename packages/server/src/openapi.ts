@@ -172,7 +172,11 @@ export function buildOpenApi() {
           operationId: 'listEvents',
           summary: 'The event log, the same events webhooks deliver',
           parameters: parameters(query.events),
-          responses: { '200': ok('EventPage'), ...errors },
+          responses: {
+            '200': ok('EventPage'),
+            '410': problem('The requested `after` position was pruned; resume after the reported sequence (`event_history_pruned`).'),
+            ...errors,
+          },
         },
       },
       '/v1/journal': {

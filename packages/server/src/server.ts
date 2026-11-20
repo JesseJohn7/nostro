@@ -12,6 +12,7 @@ import type { FastifyError, FastifyInstance, FastifyServerOptions } from 'fastif
 import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, Memo, NewExpectation, Store } from '@nostro-labs/nostro'
 import {
   ConstraintError,
+  EventHistoryPrunedError,
   InvalidAssetError,
   Money,
   NATIVE,
@@ -336,9 +337,20 @@ export function createServer(options: ServerOptions): FastifyInstance {
           ),
       )
 
-      v1.get<{ Querystring: Paging }>('/events', { schema: { querystring: query.events } }, async ({ tenantId, query: q }) =>
-        page(await store.listEvents({ tenantId, limit: q.limit, ...after(q) }), q.limit, outboxEventJson),
-      )
+      v1.get<{ Querystring: Paging }>('/events', { schema: { querystring: query.events } }, async ({ tenantId, query: q }) => {
+        try {
+          return page(await store.listEvents({ tenantId, limit: q.limit, ...after(q) }), q.limit, outboxEventJson)
+        } catch (err) {
+          if (err instanceof EventHistoryPrunedError) {
+            throw new HttpProblem(
+              410,
+              'event_history_pruned',
+              `Event history through sequence ${err.prunedThrough} was pruned; resume after that sequence.`,
+            )
+          }
+          throw err
+        }
+      })
 
       v1.post<{ Params: { id: string }; Body: ExceptionDecision }>(
         '/exceptions/:id/resolve',

@@ -31,10 +31,12 @@ import type {
   NewMovement,
 } from '../model/index.js'
 import type { AssetId } from '../money/index.js'
-import type { EventQuery, OutboxEvent } from './events.js'
+import type { EventQuery, OutboxEvent, PruneEventsResult } from './events.js'
 
 export interface MovementQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no movements. */
+  readonly ids?: readonly string[]
   readonly disposition?: Disposition
   readonly account?: string
   /** Return movements with `seq` greater than this; for paging in ingest order. */
@@ -44,6 +46,8 @@ export interface MovementQuery {
 
 export interface ExpectationQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no expectations. */
+  readonly ids?: readonly string[]
   readonly account?: string
   readonly asset?: AssetId
   readonly direction?: Direction
@@ -57,15 +61,21 @@ export interface ExpectationQuery {
 export interface AllocationQuery {
   readonly tenantId: string
   readonly movementId?: string
+  readonly movementIds?: readonly string[]
   readonly expectationId?: string
+  readonly expectationIds?: readonly string[]
 }
 
 export interface ExceptionQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no exceptions. */
+  readonly ids?: readonly string[]
   readonly status?: ExceptionStatus
   readonly code?: ExceptionCode
   readonly movementId?: string
+  readonly movementIds?: readonly string[]
   readonly expectationId?: string
+  readonly expectationIds?: readonly string[]
   /** Return exceptions with `seq` greater than this; for paging in opening order. */
   readonly afterSeq?: number
   readonly limit?: number
@@ -126,6 +136,8 @@ export interface StoreReader extends JournalReader {
   getCursor(key: CursorKey): Promise<string | null>
   /** The event log, in `seq` order. Events are written by the store itself; see `events.ts`. */
   listEvents(query: EventQuery): Promise<OutboxEvent[]>
+  /** Highest event sequence intentionally removed for this tenant, or zero. */
+  getEventsPrunedThrough(tenantId: string): Promise<number>
 }
 
 /**
@@ -171,6 +183,9 @@ export interface StoreTx extends StoreReader, JournalTx {
 
   setCursor(key: CursorKey, value: string): Promise<void>
 
+  /** Prune an eligible old prefix and record its high-water mark atomically. */
+  pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult>
+
   /** Fails with `expectation_reference_unique` if the reference is taken in this tenant. */
   insertExpectation(expectation: NewExpectation): Promise<Expectation>
 
@@ -203,6 +218,8 @@ export interface StoreTx extends StoreReader, JournalTx {
 export interface JournalQuery {
   readonly tenantId: string
   readonly movementId?: string
+  /** Restrict to entries attached to any of these movements. */
+  readonly movementIds?: readonly string[]
   /** Filter lines to this account code (matches any entry that has at least one line on this account). */
   readonly account?: string
   /** Entries with `seq` greater than this, for paging in posting order. */

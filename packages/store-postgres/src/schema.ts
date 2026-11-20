@@ -388,4 +388,26 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       active       boolean NOT NULL DEFAULT false
     );
   `,
+
+  // 9: support batched exception lookups by expectation
+  (s) => `
+    CREATE INDEX IF NOT EXISTS exceptions_expectation
+      ON ${s}.exceptions (tenant_id, expectation_id) WHERE expectation_id IS NOT NULL;
+  `,
+
+  // 10: event retention watermark and guarded pruning
+  (s) => `
+    CREATE TABLE ${s}.event_prune_state (
+      tenant_id text PRIMARY KEY,
+      pruned_through bigint NOT NULL DEFAULT 0 CHECK (pruned_through >= 0)
+    );
+    CREATE OR REPLACE FUNCTION ${s}.events_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF current_setting('nostro.event_prune', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'the event log is append-only' USING ERRCODE = 'check_violation';
+      END IF;
+      IF TG_LEVEL = 'ROW' THEN RETURN OLD; END IF;
+      RETURN NULL;
+    END $$;
+  `,
 ]
