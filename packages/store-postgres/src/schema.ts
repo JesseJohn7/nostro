@@ -397,7 +397,7 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
 
   // 10: event retention watermark and guarded pruning
   (s) => `
-    CREATE TABLE ${s}.event_prune_state (
+    CREATE TABLE IF NOT EXISTS ${s}.event_prune_state (
       tenant_id text PRIMARY KEY,
       pruned_through bigint NOT NULL DEFAULT 0 CHECK (pruned_through >= 0)
     );
@@ -409,5 +409,39 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       IF TG_LEVEL = 'ROW' THEN RETURN OLD; END IF;
       RETURN NULL;
     END $$;
+  `,
+
+  // 11: webhook delivery observability and replay audit. A separate,
+  // prunable table; the append-only event trigger above is untouched.
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.webhook_delivery_attempts (
+      seq         bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
+      id          text PRIMARY KEY,
+      tenant_id   text NOT NULL,
+      consumer    text NOT NULL,
+      event_id    text NOT NULL,
+      event_seq   bigint NOT NULL CHECK (event_seq >= 0),
+      attempt_at  timestamptz NOT NULL,
+      http_status integer,
+      error       text,
+      duration_ms integer NOT NULL CHECK (duration_ms >= 0),
+      outcome     text NOT NULL CHECK (outcome IN ('success', 'failure')),
+      CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599)
+    );
+    CREATE INDEX IF NOT EXISTS webhook_attempts_consumer ON ${s}.webhook_delivery_attempts (tenant_id, consumer, seq DESC);
+    CREATE INDEX IF NOT EXISTS webhook_attempts_age ON ${s}.webhook_delivery_attempts (tenant_id, consumer, attempt_at);
+
+    CREATE TABLE IF NOT EXISTS ${s}.webhook_rewinds (
+      seq       bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
+      id        text PRIMARY KEY,
+      tenant_id text NOT NULL,
+      consumer  text NOT NULL,
+      from_seq  bigint NOT NULL CHECK (from_seq >= 0),
+      to_seq    bigint NOT NULL CHECK (to_seq >= 0),
+      actor     text NOT NULL,
+      at        timestamptz NOT NULL,
+      CHECK (to_seq < from_seq)
+    );
+    CREATE INDEX IF NOT EXISTS webhook_rewinds_consumer ON ${s}.webhook_rewinds (tenant_id, consumer, seq DESC);
   `,
 ]

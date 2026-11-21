@@ -116,10 +116,17 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const showBatches = flag(args, 'batches')
 
     return withStore(args, io, async (store) => {
-      const base = { store, tenantId, ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) }
+      let exportedAfterSeq: number | undefined
       if (destination) {
         const mark = await store.exportGetMark(tenantId, destination)
-        base.afterSeq = mark !== undefined ? Number(mark) : undefined
+        exportedAfterSeq = mark === null ? undefined : Number(mark)
+      }
+      const base = {
+        store,
+        tenantId,
+        ...(exportedAfterSeq === undefined ? {} : { afterSeq: exportedAfterSeq }),
+        ...(from === undefined ? {} : { from }),
+        ...(to === undefined ? {} : { to }),
       }
       const accountMap = accountMapPath === undefined ? undefined : await readMap(accountMapPath, io.cwd, 'account')
       const commodityMap = commodityMapPath === undefined ? undefined : await readMap(commodityMapPath, io.cwd, 'commodity')
@@ -179,7 +186,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
           tenantId,
           ...(from !== undefined ? { effectiveFrom: from } : {}),
           ...(to !== undefined ? { effectiveBefore: to } : {}),
-          ...(afterSeq !== undefined ? { afterSeq: Number(afterSeq) } : {}),
+          ...(exportedAfterSeq === undefined ? {} : { afterSeq: exportedAfterSeq }),
         })
         for (const entry of entries) {
           if (entry.seq > lastSeq) lastSeq = entry.seq

@@ -44,6 +44,13 @@ export const idParams = {
   properties: { id: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[^\\u0000]+$' } },
 } as const
 
+/** A webhook destination's name, e.g. `webhook` or an operator-named backup. */
+export const consumerParams = {
+  type: 'object',
+  required: ['consumer'],
+  properties: { consumer: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[^\\u0000]+$' } },
+} as const
+
 /** Querystring schemas, by route. */
 export const query = {
   movements: listQuery({
@@ -59,6 +66,15 @@ export const query = {
     code: { enum: [...EXCEPTION_CODES] },
   }),
   events: listQuery({}),
+  webhookAttempts: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      ...paging,
+      after: { ...paging.after, description: 'Return attempts older than this `seq`: the `next` of the previous page.' },
+      outcome: { enum: ['success', 'failure'] },
+    },
+  },
   journal: listQuery(range),
   journalCsv: { type: 'object', additionalProperties: false, properties: range },
 } as const
@@ -193,6 +209,18 @@ export const amendExpectationBody = {
   },
 } as const
 
+/** Replay is a compare-and-set: `expectedSeq` is the position the caller just read. */
+export const replayBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['expectedSeq', 'toSeq', 'actor'],
+  properties: {
+    expectedSeq: { type: 'integer', minimum: 0, description: 'The position in the status response; the compare fails if it moved.' },
+    toSeq: { type: 'integer', minimum: 0, description: 'The position to rewind to; events after it are sent again.' },
+    actor: { type: 'string', minLength: 1, maxLength: 200, description: 'Who asked, kept in the replay audit trail.' },
+  },
+} as const
+
 // Responses.
 
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` })
@@ -219,12 +247,15 @@ const PROBLEM_CODES: readonly ProblemCode[] = [
   'muxed_id_taken',
   'expectation_conflict',
   'event_history_pruned',
+  'consumer_position_conflict',
+  'invalid_replay',
   'internal',
 ]
 
 export const components = {
   CancelExpectationBody: cancelExpectationBody,
   AmendExpectationBody: amendExpectationBody,
+  ReplayBody: replayBody,
   Memo: record({ type: { enum: ['text', 'id', 'hash', 'return'] }, value: str }),
   Movement: record({
     id: str,
@@ -323,6 +354,38 @@ export const components = {
     createdAt: time,
     data: { type: 'object', description: 'The records the event is about, as they were; see docs/webhooks.md.' },
   }),
+  DeliveryAttempt: record({
+    id: str,
+    seq: int,
+    eventId: str,
+    eventSeq: int,
+    at: time,
+    httpStatus: nullable(int),
+    error: nullable(str),
+    durationMs: int,
+    outcome: { enum: ['success', 'failure'] },
+    reason: nullable(str),
+  }),
+  ConsumerStatus: record({
+    tenantId: str,
+    consumer: str,
+    position: int,
+    latestSeq: int,
+    lag: int,
+    lastAttempt: nullable(ref('DeliveryAttempt')),
+    lastSuccess: nullable(ref('DeliveryAttempt')),
+    lastFailure: nullable(ref('DeliveryAttempt')),
+  }),
+  Rewind: record({
+    id: str,
+    tenantId: str,
+    consumer: str,
+    fromSeq: int,
+    toSeq: int,
+    actor: str,
+    at: time,
+  }),
+  WebhookConsumerList: record({ data: { type: 'array', items: ref('ConsumerStatus') } }),
   MovementDetail: record({
     movement: ref('Movement'),
     allocations: { type: 'array', items: ref('Allocation') },
@@ -348,7 +411,7 @@ export const components = {
     detail: str,
   }),
   ...Object.fromEntries(
-    ['Movement', 'Expectation', 'Exception', 'JournalEntry', 'Event'].map((name) => [
+    ['Movement', 'Expectation', 'Exception', 'JournalEntry', 'Event', 'DeliveryAttempt'].map((name) => [
       `${name}Page`,
       record({ data: { type: 'array', items: ref(name) }, next: nullable(int) }),
     ]),

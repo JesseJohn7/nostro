@@ -3,6 +3,16 @@
 All five packages share a version. This project follows [Semantic Versioning](https://semver.org/);
 before 1.0, a minor version may change the API.
 
+## Unreleased
+
+- Webhook delivery is observable and replayable. Every POST is recorded in a bounded, prunable
+  attempt log, and consumers can be listed and inspected before their first delivery round.
+- `GET /v1/webhooks`, `GET /v1/webhooks/{consumer}/status`,
+  `GET /v1/webhooks/{consumer}/attempts` and `POST /v1/webhooks/{consumer}/replay` join the HTTP
+  API; replay is a compare-and-set on the consumer's position and is recorded with its actor.
+- The deliverer stops before a POST, as well as at its cursor compare, when a replay has moved the
+  consumer underneath it.
+
 ## 0.1.0 (2026-11-06)
 
 The first usable release: ingest a Stellar account, reconcile it against what you are owed, keep a

@@ -42,6 +42,8 @@ export interface JournalCsvOptions {
   readonly pageSize?: number
   /** Internal upper bound used to keep a multi-pass export on one journal snapshot. */
   readonly throughSeq?: number
+  /** Export entries with a journal sequence greater than this. */
+  readonly afterSeq?: number
   /** Target decimal places for exact, balanced rounding. Omit for unchanged output. */
   readonly decimals?: number
   /** Metadata keys to read as dimensions. Each key becomes a column named after it. */
@@ -63,7 +65,7 @@ export const journalCsvRow = (cells: readonly string[]) => `${cells.join(',')}\r
 async function* journalEntryPages(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry[]> {
   const { store, tenantId } = options
   const pageSize = options.pageSize ?? 500
-  let afterSeq: number | undefined
+  let afterSeq = options.afterSeq
   for (;;) {
     const page = await store.listJournalEntries({
       tenantId,
@@ -96,7 +98,6 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
   const allColumns = [...JOURNAL_CSV_COLUMNS, ...dimColumnNames]
   yield journalCsvRow(allColumns.map((c) => c))
 
-  const expectationMetadatas = new Map<string, Record<string, string | null>>()
   const rounder = options.decimals === undefined ? null : new JournalRounder(options.decimals)
 
   for await (const originalPage of journalEntryPages(options, rounder !== null)) {
@@ -119,11 +120,10 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
       const entry = rounder === null ? original : rounder.round(original)
       if (rounder !== null && options.from !== undefined && original.effectiveAt < options.from) continue
       for (const [i, line] of entry.lines.entries()) {
-        const expectationId = line.expectationId ?? null
         const amount = line.amount.toString()
         const dimCells: string[] = []
         for (const dim of dimColumnNames) {
-          const metadata = expectationMetadatas.get(expectationId) ?? {}
+          const metadata = line.expectationId === null ? {} : expectationMetadatas.get(line.expectationId) ?? {}
           const val = metadata[dim] ?? ''
           dimCells.push(journalCsvCell(val, true))
         }

@@ -63,7 +63,7 @@ export interface PostJournalOptions extends PostOptions {
 
 export interface PostJournalReport {
   readonly examined: number
-  readonly posted: Readonly<Record<JournalEntryKind, number>>
+  readonly posted: Readonly<Record<Exclude<JournalEntryKind, 'conversion'>, number>>
   /** The last movement `seq` examined, or `null` if there was nothing to examine. */
   readonly lastSeq: number | null
   readonly errors: readonly { readonly movementId: string; readonly error: Error }[]
@@ -76,13 +76,13 @@ export async function postJournal(options: PostJournalOptions): Promise<PostJour
     ...(options.afterSeq === undefined ? {} : { afterSeq: options.afterSeq }),
     limit: options.limit ?? 500,
   })
-  const posted: Record<JournalEntryKind, number> = { initial: 0, reclass: 0, correction: 0 }
+  const posted: Record<Exclude<JournalEntryKind, 'conversion'>, number> = { initial: 0, reclass: 0, correction: 0 }
   const errors: { movementId: string; error: Error }[] = []
   for (const m of movements) {
     if (m.disposition === 'pending') continue
     try {
       const entry = await store.transaction((tx) => postMovement(tx, tenantId, m.id, options))
-      if (entry !== null) posted[entry.kind] += 1
+      if (entry !== null && entry.kind !== 'conversion') posted[entry.kind] += 1
     } catch (err) {
       errors.push({ movementId: m.id, error: err instanceof Error ? err : new Error(String(err)) })
     }

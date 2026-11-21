@@ -79,13 +79,13 @@ describe('SqliteStore', () => {
   it('migrates idempotently and records the schema version', async () => {
     const filename = freshFile()
     const store = new SqliteStore({ filename })
-    expect(await store.schemaVersion()).toEqual({ current: 0, latest: 7 })
+    expect(await store.schemaVersion()).toEqual({ current: 0, latest: MIGRATIONS.length })
     await store.migrate()
     await store.migrate()
-    expect(await store.schemaVersion()).toEqual({ current: 7, latest: 7 })
+    expect(await store.schemaVersion()).toEqual({ current: MIGRATIONS.length, latest: MIGRATIONS.length })
     await store.close()
     const db = new Database(filename, { readonly: true })
-    expect(db.pragma('user_version', { simple: true })).toBe(7)
+    expect(db.pragma('user_version', { simple: true })).toBe(MIGRATIONS.length)
     expect(db.pragma('journal_mode', { simple: true })).toBe('wal')
     db.close()
   })
@@ -182,7 +182,7 @@ describe('SqliteStore', () => {
     v6.close()
 
     const store = await freshStore(filename)
-    expect(await store.schemaVersion()).toEqual({ current: 7, latest: 7 })
+    expect(await store.schemaVersion()).toEqual({ current: MIGRATIONS.length, latest: MIGRATIONS.length })
     expect((await doctor({ store, tenantId: 't' })).findings).toEqual([
       expect.objectContaining({ code: 'muxed_id_duplicate' }),
     ])
@@ -210,7 +210,7 @@ describe('SqliteStore', () => {
     )
     await store.close()
     const db = new Database(filename)
-    db.exec('DROP TABLE expectation_reference_index; PRAGMA user_version = 5')
+    db.exec('DROP TABLE expectation_reference_index; DROP TABLE event_prune_state; PRAGMA user_version = 5')
     db.close()
 
     const upgraded = await freshStore(filename)

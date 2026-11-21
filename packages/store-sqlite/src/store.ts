@@ -19,6 +19,8 @@ import type {
   Allocation,
   AllocationQuery,
   CursorKey,
+  DeliveryAttempt,
+  DeliveryAttemptQuery,
   Disposition,
   EventQuery,
   ExceptionQuery,
@@ -41,8 +43,12 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  NewDeliveryAttempt,
   NewOutboxEvent,
   OutboxEvent,
+  Rewind,
+  RewindInput,
+  RewindQuery,
   PruneEventsResult,
   Resolution,
   SchemaVersion,
@@ -59,6 +65,9 @@ import {
   assertValidNewExpectation,
   assertValidNewJournalEntry,
   assertValidNewMovement,
+  DELIVERY_ATTEMPT_LIMIT,
+  DELIVERY_ATTEMPT_TTL_MS,
+  eventCursorKey,
   amendExpectationRecord,
   checkAllocation,
   checkCancel,
@@ -230,6 +239,33 @@ const toEvent = (r: Row): OutboxEvent =>
     createdAt: date(r.created_at)!,
   })
 
+const toDeliveryAttempt = (r: Row): DeliveryAttempt =>
+  Object.freeze({
+    id: r.id as string,
+    seq: r.seq as number,
+    tenantId: r.tenant_id as string,
+    consumer: r.consumer as string,
+    eventId: r.event_id as string,
+    eventSeq: r.event_seq as number,
+    at: date(r.attempt_at)!,
+    httpStatus: r.http_status as number | null,
+    error: r.error as string | null,
+    durationMs: r.duration_ms as number,
+    outcome: r.outcome as DeliveryAttempt['outcome'],
+  })
+
+const toRewind = (r: Row): Rewind =>
+  Object.freeze({
+    id: r.id as string,
+    seq: r.seq as number,
+    tenantId: r.tenant_id as string,
+    consumer: r.consumer as string,
+    fromSeq: r.from_seq as number,
+    toSeq: r.to_seq as number,
+    actor: r.actor as string,
+    at: date(r.at)!,
+  })
+
 const toJournalEntry = (r: Row, lines: readonly Row[]): JournalEntry =>
   Object.freeze({
     id: r.id as string,
@@ -390,6 +426,39 @@ class SqliteReader implements StoreReader {
     return Number(row?.pruned_through ?? 0)
   }
 
+  async getLatestEventSeq(tenantId: string): Promise<number> {
+    const row = this.one('SELECT max(seq) AS seq FROM events WHERE tenant_id = ?', [tenantId])
+    return Number(row?.seq ?? 0)
+  }
+
+  async listDeliveryAttempts(q: DeliveryAttemptQuery): Promise<DeliveryAttempt[]> {
+    const w = new Where()
+      .add('tenant_id = ?', q.tenantId)
+      .add('consumer = ?', q.consumer)
+      .add('outcome = ?', q.outcome)
+      .add('seq < ?', q.beforeSeq)
+    return this.all(`SELECT * FROM webhook_delivery_attempts${w} ORDER BY seq DESC${w.limit(q.limit)}`, w.params).map(toDeliveryAttempt)
+  }
+
+  async listDeliveryConsumers(tenantId: string): Promise<string[]> {
+    const rows = this.all(
+      `SELECT account FROM cursors
+         WHERE tenant_id = ? AND network = 'nostro' AND source = 'outbox' AND value IS NOT NULL
+       UNION
+       SELECT DISTINCT consumer AS account FROM webhook_delivery_attempts WHERE tenant_id = ?
+       UNION
+       SELECT DISTINCT consumer AS account FROM webhook_rewinds WHERE tenant_id = ?
+       ORDER BY account`,
+      [tenantId, tenantId, tenantId],
+    )
+    return rows.map((r) => r.account as string)
+  }
+
+  async listRewinds(q: RewindQuery): Promise<Rewind[]> {
+    const w = new Where().add('tenant_id = ?', q.tenantId).add('consumer = ?', q.consumer)
+    return this.all(`SELECT * FROM webhook_rewinds${w} ORDER BY seq DESC${w.limit(q.limit ?? DELIVERY_ATTEMPT_LIMIT)}`, w.params).map(toRewind)
+  }
+
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
     const w = new Where()
       .add('tenant_id = ?', q.tenantId)
@@ -450,6 +519,34 @@ class SqliteTx extends SqliteReader implements StoreTx {
 
   close(): void {
     this.open = false
+  }
+
+  async accrualGetMode(tenantId: string): Promise<boolean> {
+    const row = this.one('SELECT active FROM accrual_modes WHERE tenant_id = ?', [tenantId])
+    return row !== undefined && row.active === 1
+  }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void> {
+    const expectation = this.one('SELECT asset, decimals FROM expectations WHERE tenant_id = ? AND id = ?', [tenantId, expectationId])
+    if (expectation === undefined) return
+    const at = this.now()
+    const entryId = this.ids()
+    const roles = isCredit
+      ? [['assets:receivable', 'receivable', 'debit'], ['income:uncategorized', 'uncategorized_income', 'credit']] as const
+      : [['expenses:uncategorized', 'uncategorized_expense', 'debit'], ['liabilities:payable', 'payable', 'credit']] as const
+
+    this.exec(
+      `INSERT INTO journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+       VALUES (?, ?, NULL, 1, 'initial', ?, ?, ?)`,
+      [entryId, tenantId, at.getTime(), at.getTime(), `Accrual for expectation ${reference}`],
+    )
+    for (const [index, [account, role, side]] of roles.entries()) {
+      this.exec(
+        `INSERT INTO journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+        [entryId, index + 1, tenantId, account, role, side, String(expectation.asset), Number(expectation.decimals), amount, expectationId],
+      )
+    }
   }
 
   async lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null> {
@@ -513,6 +610,41 @@ class SqliteTx extends SqliteReader implements StoreTx {
        ON CONFLICT (tenant_id, network, source, account) DO UPDATE SET value = excluded.value`,
       [k.tenantId, k.network, k.source, k.account, value],
     )
+  }
+
+  async recordDeliveryAttempt(attempt: NewDeliveryAttempt): Promise<DeliveryAttempt> {
+    const id = this.ids()
+    this.exec(
+      `INSERT INTO webhook_delivery_attempts
+         (id, tenant_id, consumer, event_id, event_seq, attempt_at, http_status, error, duration_ms, outcome)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, attempt.tenantId, attempt.consumer, attempt.eventId, attempt.eventSeq, attempt.at.getTime(), attempt.httpStatus, attempt.error, attempt.durationMs, attempt.outcome],
+    )
+    this.exec(
+      `DELETE FROM webhook_delivery_attempts
+         WHERE tenant_id = ? AND consumer = ? AND (
+           seq < (SELECT seq FROM webhook_delivery_attempts
+                  WHERE tenant_id = ? AND consumer = ?
+                  ORDER BY seq DESC LIMIT 1 OFFSET ?)
+           OR attempt_at < ?
+         )`,
+      [attempt.tenantId, attempt.consumer, attempt.tenantId, attempt.consumer, DELIVERY_ATTEMPT_LIMIT - 1, attempt.at.getTime() - DELIVERY_ATTEMPT_TTL_MS],
+    )
+    return toDeliveryAttempt(this.one('SELECT * FROM webhook_delivery_attempts WHERE id = ?', [id])!)
+  }
+
+  async rewindConsumer(input: RewindInput): Promise<Rewind | null> {
+    const key = eventCursorKey(input.tenantId, input.consumer)
+    const current = await this.getCursor(key)
+    if ((current === null ? 0 : Number(current)) !== input.expectedSeq) return null
+    await this.setCursor(key, String(input.toSeq))
+    const id = this.ids()
+    this.exec(
+      `INSERT INTO webhook_rewinds (id, tenant_id, consumer, from_seq, to_seq, actor, at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, input.tenantId, input.consumer, input.expectedSeq, input.toSeq, input.actor, input.at.getTime()],
+    )
+    return toRewind(this.one('SELECT * FROM webhook_rewinds WHERE id = ?', [id])!)
   }
 
   async pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult> {
@@ -895,56 +1027,21 @@ export class SqliteStore extends SqliteReader implements MigratableStore {
   }
 
   async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
-    this.exec(
+    this.writer.prepare(
       `INSERT INTO exports (tenant_id, destination, last_seq, last_exported_at, control_totals, checksum)
        VALUES (?, ?, ?, ?, '{}', '')
        ON CONFLICT (tenant_id, destination) DO UPDATE SET last_seq = ?, last_exported_at = CAST(strftime('%s', 'now') AS INTEGER)`,
-      [tenantId, destination, lastSeq, lastSeq, lastSeq],
-    )
+    ).run(tenantId, destination, lastSeq, lastSeq, lastSeq)
   }
 
   async accrualGetMode(tenantId: string): Promise<boolean> {
     const row = this.one('SELECT active FROM accrual_modes WHERE tenant_id = ?', [tenantId])
-    return row !== undefined ? row.active === 1 : false
+    return row !== undefined && row.active === 1
   }
 
-async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void> {
-    const now = new Date()
-
-    // For credit expectations: Dr receivable · Cr revenue
-    // For debit expectations: Dr expense · Cr payable
-    const isCredit = isCredit
-    const receivableAccount = 'Assets:Receivable'
-    const revenueAccount = isCredit ? 'Revenue' : 'Expense'
-
-    const ownSide = isCredit ? 'debit' : 'credit'
-    const otherSide = isCredit ? 'credit' : 'debit'
-
-    // Post the first journal entry: Dr receivable · Cr revenue/payable
-    await this.exec(
-      `INSERT INTO journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [this.ids(), tenantId, null, 1, 'initial', now, now, `Accrual for expectation ${reference}`],
-    )
-    await this.exec(
-      `INSERT INTO journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [1, 1, tenantId, receivableAccount, 'convention', ownSide, amount, 18, amount, expectationId, null],
-    )
-
-    // Post the second journal entry: Cr revenue/payable · Dr receivable
-    await this.exec(
-      `INSERT INTO journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [this.ids(), tenantId, null, 2, 'initial', now, now, `Reverse accrual for expectation ${reference}`],
-    )
-    await this.exec(
-      `INSERT INTO journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id)
-       VALUES (1, 1, tenantId, revenueAccount, 'convention', otherSide, amount, 18, amount, expectationId, null)`,
-    )
+  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void> {
+    await this.transaction((tx) => tx.postAccrualExpectation(expectationId, tenantId, isCredit, amount, reference))
   }
-
-  
 
   async exportListBatches(tenantId: string): Promise<readonly { readonly destination: string; readonly last_seq: number; readonly last_exported_at: number; readonly control_totals: string; readonly checksum: string }[]> {
     const rows = this.all(

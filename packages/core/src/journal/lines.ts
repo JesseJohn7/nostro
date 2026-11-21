@@ -14,6 +14,7 @@ import type {
   ExceptionRecord,
   JournalEntry,
   JournalEntryKind,
+  JournalLine,
   LineRole,
   Movement,
   NewJournalEntry,
@@ -93,7 +94,7 @@ export function desiredLines(
   return lines
 }
 
-const keyOf = (l: { role: LineRole; amount: Money; expectationId: string | null }) =>
+const keyOf = (l: { role: LineRole; amount: Money; expectationId?: string | null }) =>
   `${l.role}|${l.amount.asset}|${l.expectationId ?? ''}`
 
 /**
@@ -206,22 +207,15 @@ export function planPosting(
 
     // Look for a matching partner leg in existing entries
     let partnerLine: JournalLine | null = null
-    let partnerEntry: JournalEntry | null = null
     for (const entry of existing) {
-      for (const line of entry.lines) {
-        if (line.externalId === partnerExternalId) {
-          partnerLine = line
-          partnerEntry = entry
-          break
-        }
+      if (entry.description.includes(partnerExternalId)) {
+        partnerLine = entry.lines.find((line) => line.amount.asset !== movement.amount.asset) ?? entry.lines[0] ?? null
+        break
       }
-      if (partnerEntry !== null) break
     }
 
-    if (partnerEntry !== null && partnerLine !== null) {
+    if (partnerLine !== null) {
       // Conversion pair detected: create conversion entries
-      const soldAsset = movement.amount.asset
-      const boughtAsset = partnerLine.amount.asset
       const soldAmount = movement.amount
       const boughtAmount = partnerLine.amount
 

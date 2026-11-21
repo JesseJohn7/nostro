@@ -7,18 +7,25 @@
  * what notices when one of them doesn't.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { Disposition, NewException, NewMovement, Store, StoreTx } from '@nostro-labs/nostro'
+import type { Disposition, NewDeliveryAttempt, NewException, NewMovement, Store, StoreTx } from '@nostro-labs/nostro'
 import { describeJournalConformance } from './journal-conformance.js'
 import {
+  ConsumerPositionConflict,
   ConstraintError,
+  EventHistoryPrunedError,
+  InvalidRewindError,
   Money,
   NotFoundError,
   TransactionClosedError,
   ValidationError,
   asset,
   doctor,
+  eventCursorKey,
+  failureReason,
+  getConsumerStatus,
   normalizeReference,
   reconcile,
+  rewindConsumer,
   sweepExpectations,
 } from '@nostro-labs/nostro'
 
@@ -1094,6 +1101,110 @@ export function describeStoreConformance(name: string, makeStore: () => Store | 
         ])
         expect(first.expired + second.expired).toBe(1)
         expect(await store.listExceptions({ tenantId: T, expectationId: e.id, code: 'EXPECTATION_EXPIRED' })).toHaveLength(1)
+      })
+    })
+
+    describe('webhook delivery status and replay', () => {
+      const AT = new Date('2026-11-01T12:00:00Z')
+      const makeEvent = () =>
+        store.transaction((tx) =>
+          tx.openException({ tenantId: T, code: 'MEMO_MISSING', account: ACCOUNT, detail: `delivery-${++counter}` }),
+        )
+      const attempt = (over: Partial<NewDeliveryAttempt> = {}) =>
+        store.transaction((tx) =>
+          tx.recordDeliveryAttempt({
+            tenantId: T,
+            consumer: 'webhook',
+            eventId: 'event-1',
+            eventSeq: 1,
+            at: AT,
+            httpStatus: 200,
+            error: null,
+            durationMs: 12,
+            outcome: 'success',
+            ...over,
+          }),
+        )
+
+      it('keeps a bounded per-consumer attempt log, newest first, isolated by tenant', async () => {
+        const ok = await attempt()
+        const httpFailure = await attempt({ eventId: 'event-2', eventSeq: 2, httpStatus: 503, error: 'HTTP 503', outcome: 'failure' })
+        const transportFailure = await attempt({ eventId: 'event-2', eventSeq: 2, httpStatus: null, error: 'fetch failed', outcome: 'failure' })
+        await attempt({ tenantId: T2 })
+        await attempt({ consumer: 'backup' })
+
+        const all = await store.listDeliveryAttempts({ tenantId: T, consumer: 'webhook' })
+        expect(all.map((a) => a.id)).toEqual([transportFailure.id, httpFailure.id, ok.id])
+        expect(all.map((a) => [a.eventId, a.httpStatus, a.error, a.durationMs, a.outcome])).toEqual([
+          ['event-2', null, 'fetch failed', 12, 'failure'],
+          ['event-2', 503, 'HTTP 503', 12, 'failure'],
+          ['event-1', 200, null, 12, 'success'],
+        ])
+        expect(all[0]!.at.toISOString()).toBe(AT.toISOString())
+        expect((await store.listDeliveryAttempts({ tenantId: T, consumer: 'webhook', limit: 1 })).map((a) => a.id)).toEqual([transportFailure.id])
+        expect((await store.listDeliveryAttempts({ tenantId: T, consumer: 'webhook', outcome: 'success' })).map((a) => a.id)).toEqual([ok.id])
+        expect((await store.listDeliveryAttempts({ tenantId: T, consumer: 'webhook', beforeSeq: transportFailure.seq })).map((a) => a.id)).toEqual([
+          httpFailure.id,
+          ok.id,
+        ])
+        expect((await store.listDeliveryAttempts({ tenantId: T, consumer: 'webhook', beforeSeq: ok.seq })).map((a) => a.id)).toEqual([])
+        expect(await store.listDeliveryAttempts({ tenantId: T2, consumer: 'webhook' })).toHaveLength(1)
+        expect(await store.listDeliveryConsumers(T)).toEqual(['backup', 'webhook'])
+        expect(await store.listDeliveryConsumers(T2)).toEqual(['webhook'])
+      })
+
+      it('derives status from the cursor, the event tail and the attempt log', async () => {
+        await makeEvent()
+        await makeEvent()
+        const events = await store.listEvents({ tenantId: T })
+        await store.transaction((tx) => tx.setCursor(eventCursorKey(T, 'webhook'), String(events[0]!.seq)))
+        const ok = await attempt({ eventId: events[0]!.id, eventSeq: events[0]!.seq })
+        const failed = await attempt({ eventId: events[1]!.id, eventSeq: events[1]!.seq, httpStatus: 503, error: null, outcome: 'failure' })
+
+        const status = await getConsumerStatus(store, T, 'webhook')
+        expect([status.position, status.latestSeq, status.lag]).toEqual([events[0]!.seq, events[1]!.seq, 1])
+        expect(status.lastAttempt?.id).toBe(failed.id)
+        expect(status.lastSuccess?.id).toBe(ok.id)
+        expect(status.lastFailure?.id).toBe(failed.id)
+        expect(failureReason(status.lastFailure)).toBe('HTTP 503')
+      })
+
+      it('rewinds with compare-and-set and records who did it and when', async () => {
+        await makeEvent()
+        await makeEvent()
+        const events = await store.listEvents({ tenantId: T })
+        const from = events[1]!.seq
+        await store.transaction((tx) => tx.setCursor(eventCursorKey(T, 'webhook'), String(from)))
+
+        const rewind = await rewindConsumer(store, {
+          tenantId: T,
+          consumer: 'webhook',
+          expectedSeq: from,
+          toSeq: events[0]!.seq,
+          actor: 'operator@example.com',
+          at: AT,
+        })
+        expect([rewind.fromSeq, rewind.toSeq, rewind.actor, rewind.at.toISOString()]).toEqual([from, events[0]!.seq, 'operator@example.com', AT.toISOString()])
+        expect(await store.getCursor(eventCursorKey(T, 'webhook'))).toBe(String(events[0]!.seq))
+        expect((await store.listRewinds({ tenantId: T, consumer: 'webhook' })).map((r) => r.id)).toEqual([rewind.id])
+
+        await expect(
+          rewindConsumer(store, { tenantId: T, consumer: 'webhook', expectedSeq: from, toSeq: 0, actor: 'late', at: AT }),
+        ).rejects.toBeInstanceOf(ConsumerPositionConflict)
+        await expect(
+          rewindConsumer(store, { tenantId: T, consumer: 'webhook', expectedSeq: events[0]!.seq, toSeq: events[0]!.seq, actor: 'x', at: AT }),
+        ).rejects.toBeInstanceOf(InvalidRewindError)
+        expect(await store.getCursor(eventCursorKey(T, 'webhook'))).toBe(String(events[0]!.seq))
+      })
+
+      it('refuses to rewind into pruned history', async () => {
+        await makeEvent()
+        const events = await store.listEvents({ tenantId: T })
+        await store.transaction((tx) => tx.setCursor(eventCursorKey(T, 'webhook'), String(events[0]!.seq)))
+        await store.transaction((tx) => tx.pruneEventsBefore(T, new Date(Date.now() + 60_000)))
+        await expect(
+          rewindConsumer(store, { tenantId: T, consumer: 'webhook', expectedSeq: events[0]!.seq, toSeq: 0, actor: 'x', at: AT }),
+        ).rejects.toBeInstanceOf(EventHistoryPrunedError)
       })
     })
 

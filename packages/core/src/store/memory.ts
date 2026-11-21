@@ -19,7 +19,6 @@ import type {
   Allocation,
   CursorKey,
   Disposition,
-  ExportBatch,
   ExceptionRecord,
   Expectation,
   ExpectationChanges,
@@ -40,6 +39,7 @@ import {
 } from '../model/index.js'
 import type {
   AllocationQuery,
+  ExportBatch,
   ExceptionQuery,
   ExpectationQuery,
   InsertMovementsResult,
@@ -67,8 +67,17 @@ import {
   sameFacts,
 } from './rules.js'
 import { ConstraintError, NotFoundError, TransactionClosedError } from './store.js'
-import { EventHistoryPrunedError } from './events.js'
+import { EventHistoryPrunedError, eventCursorKey } from './events.js'
 import type { EventQuery, NewOutboxEvent, OutboxEvent, PruneEventsResult } from './events.js'
+import type {
+  DeliveryAttempt,
+  DeliveryAttemptQuery,
+  NewDeliveryAttempt,
+  Rewind,
+  RewindInput,
+  RewindQuery,
+} from './delivery.js'
+import { DELIVERY_ATTEMPT_LIMIT, DELIVERY_ATTEMPT_TTL_MS } from './delivery.js'
 import { exceptionChanged, expectationAmended, expectationChanged, movementDecided } from './events.js'
 import { expectationReferenceKeys } from '../matching/reference.js'
 
@@ -97,6 +106,10 @@ interface State {
   eventSeq: number
   readonly events: Map<string, OutboxEvent>
   readonly eventPrunedThrough: Map<string, number>
+  deliveryAttemptSeq: number
+  readonly deliveryAttempts: Map<string, DeliveryAttempt>
+  rewindSeq: number
+  readonly rewinds: Map<string, Rewind>
   /** Movement id → its entry ids in posting order. Arrays are replaced, never pushed to. */
   readonly journalByMovement: Map<string, readonly string[]>
   periodActions: readonly {
@@ -126,6 +139,10 @@ function emptyState(): State {
     eventSeq: 0,
     events: new Map(),
     eventPrunedThrough: new Map(),
+    deliveryAttemptSeq: 0,
+    deliveryAttempts: new Map(),
+    rewindSeq: 0,
+    rewinds: new Map(),
     periodActions: [],
   }
 }
@@ -148,6 +165,10 @@ function cloneState(s: State): State {
     eventSeq: s.eventSeq,
     events: new Map(s.events),
     eventPrunedThrough: new Map(s.eventPrunedThrough),
+    deliveryAttemptSeq: s.deliveryAttemptSeq,
+    deliveryAttempts: new Map(s.deliveryAttempts),
+    rewindSeq: s.rewindSeq,
+    rewinds: new Map(s.rewinds),
     periodActions: [...s.periodActions],
   }
 }
@@ -314,6 +335,54 @@ abstract class MemoryReader implements StoreReader {
     return this.snapshot().eventPrunedThrough.get(tenantId) ?? 0
   }
 
+  async getLatestEventSeq(tenantId: string): Promise<number> {
+    this.check()
+    let latest = 0
+    for (const event of this.snapshot().events.values()) {
+      if (event.tenantId === tenantId && event.seq > latest) latest = event.seq
+    }
+    return latest
+  }
+
+  async listDeliveryAttempts(q: DeliveryAttemptQuery): Promise<DeliveryAttempt[]> {
+    this.check()
+    const out = [...this.snapshot().deliveryAttempts.values()]
+      .filter((a) =>
+        a.tenantId === q.tenantId &&
+        a.consumer === q.consumer &&
+        (q.outcome === undefined || a.outcome === q.outcome) &&
+        (q.beforeSeq === undefined || a.seq < q.beforeSeq))
+      .sort((a, b) => b.seq - a.seq)
+    return q.limit === undefined ? out : out.slice(0, q.limit)
+  }
+
+  async listDeliveryConsumers(tenantId: string): Promise<string[]> {
+    this.check()
+    const state = this.snapshot()
+    const consumers = new Set<string>()
+    for (const [storedKey, value] of state.cursors) {
+      const [cursorTenant, network, source, account] = JSON.parse(storedKey) as string[]
+      if (cursorTenant === tenantId && network === 'nostro' && source === 'outbox' && value !== null && account !== undefined) {
+        consumers.add(account)
+      }
+    }
+    for (const a of state.deliveryAttempts.values()) {
+      if (a.tenantId === tenantId) consumers.add(a.consumer)
+    }
+    for (const r of state.rewinds.values()) {
+      if (r.tenantId === tenantId) consumers.add(r.consumer)
+    }
+    return [...consumers].sort()
+  }
+
+  async listRewinds(q: RewindQuery): Promise<Rewind[]> {
+    this.check()
+    return [...this.snapshot().rewinds.values()]
+      .filter((r) => r.tenantId === q.tenantId && (q.consumer === undefined || r.consumer === q.consumer))
+      .sort((a, b) => b.seq - a.seq)
+      .slice(0, q.limit ?? DELIVERY_ATTEMPT_LIMIT)
+  }
+
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
     this.check()
     if (q.movementIds?.length === 0) return []
@@ -382,6 +451,18 @@ class MemoryTx extends MemoryReader implements StoreTx {
   protected override check(): void {
     if (!this.open) throw new TransactionClosedError()
   }
+
+  async accrualGetMode(_tenantId: string): Promise<boolean> {
+    return false
+  }
+
+  async postAccrualExpectation(
+    _expectationId: string,
+    _tenantId: string,
+    _isCredit: boolean,
+    _amount: string,
+    _reference: string,
+  ): Promise<void> {}
 
   async lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null> {
     this.check()
@@ -516,6 +597,47 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.check()
     checkCursorValue(value)
     this.draft.cursors.set(cursorKey(k), value)
+  }
+
+  async recordDeliveryAttempt(attempt: NewDeliveryAttempt): Promise<DeliveryAttempt> {
+    this.check()
+    const record: DeliveryAttempt = Object.freeze({
+      ...attempt,
+      id: this.ids(),
+      seq: ++this.draft.deliveryAttemptSeq,
+      at: copyDate(attempt.at),
+    })
+    this.draft.deliveryAttempts.set(record.id, record)
+    const sameConsumer = [...this.draft.deliveryAttempts.values()]
+      .filter((a) => a.tenantId === attempt.tenantId && a.consumer === attempt.consumer)
+      .sort((a, b) => b.seq - a.seq)
+    const cutoff = attempt.at.getTime() - DELIVERY_ATTEMPT_TTL_MS
+    const keepFrom = sameConsumer.length > DELIVERY_ATTEMPT_LIMIT ? sameConsumer[DELIVERY_ATTEMPT_LIMIT - 1]!.seq : -Infinity
+    for (const old of sameConsumer) {
+      if (old.seq < keepFrom || old.at.getTime() < cutoff) this.draft.deliveryAttempts.delete(old.id)
+    }
+    return record
+  }
+
+  async rewindConsumer(input: RewindInput): Promise<Rewind | null> {
+    this.check()
+    const key = eventCursorKey(input.tenantId, input.consumer)
+    const current = this.draft.cursors.get(cursorKey(key))
+    if ((current === null || current === undefined ? 0 : Number(current)) !== input.expectedSeq) return null
+    checkCursorValue(String(input.toSeq))
+    this.draft.cursors.set(cursorKey(key), String(input.toSeq))
+    const record: Rewind = Object.freeze({
+      id: this.ids(),
+      seq: ++this.draft.rewindSeq,
+      tenantId: input.tenantId,
+      consumer: input.consumer,
+      fromSeq: input.expectedSeq,
+      toSeq: input.toSeq,
+      actor: input.actor,
+      at: copyDate(input.at),
+    })
+    this.draft.rewinds.set(record.id, record)
+    return record
   }
 
   async pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult> {
@@ -771,6 +893,20 @@ export class MemoryStore extends MemoryReader implements Store {
 
   async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
     // no-op for in-memory store
+  }
+
+  async accrualGetMode(tenantId: string): Promise<boolean> {
+    return false
+  }
+
+  async postAccrualExpectation(
+    expectationId: string,
+    tenantId: string,
+    isCredit: boolean,
+    amount: string,
+    reference: string,
+  ): Promise<void> {
+    // no journal in the in-memory store's export surface
   }
 
   async exportListBatches(tenantId: string): Promise<ExportBatch[]> {

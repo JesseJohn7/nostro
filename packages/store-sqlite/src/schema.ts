@@ -383,18 +383,55 @@ PRIMARY KEY (tenant_id, destination)
   `,
 
   // Support batched exception lookups by expectation.
-  () => `CREATE INDEX IF NOT EXISTS exceptions_expectation
-    ON exceptions (tenant_id, expectation_id) WHERE expectation_id IS NOT NULL;`,
+  `
+    CREATE INDEX IF NOT EXISTS exceptions_expectation
+      ON exceptions (tenant_id, expectation_id) WHERE expectation_id IS NOT NULL;
+  `,
 
   // Event retention watermark and guarded pruning.
-  () => `
-    CREATE TABLE event_prune_state (
+  `
+    CREATE TABLE IF NOT EXISTS event_prune_state (
       tenant_id TEXT PRIMARY KEY,
       pruned_through INTEGER NOT NULL DEFAULT 0 CHECK (pruned_through >= 0)
     );
-    DROP TRIGGER events_no_delete;
+    DROP TRIGGER IF EXISTS events_no_delete;
     CREATE TRIGGER events_no_delete BEFORE DELETE ON events
       WHEN nostro_event_prune_allowed() = 0
       BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+  `,
+
+  // Webhook delivery observability and replay audit. Separate from the
+  // append-only event log: attempts are bounded and pruned, rewinds are an
+  // audit trail of who moved a consumer back.
+  `
+    CREATE TABLE IF NOT EXISTS webhook_delivery_attempts (
+      seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+      id          TEXT NOT NULL UNIQUE,
+      tenant_id   TEXT NOT NULL,
+      consumer    TEXT NOT NULL,
+      event_id    TEXT NOT NULL,
+      event_seq   INTEGER NOT NULL CHECK (event_seq >= 0),
+      attempt_at  INTEGER NOT NULL,
+      http_status INTEGER,
+      error       TEXT,
+      duration_ms INTEGER NOT NULL CHECK (duration_ms >= 0),
+      outcome     TEXT NOT NULL CHECK (outcome IN ('success', 'failure')),
+      CHECK (http_status IS NULL OR http_status BETWEEN 100 AND 599)
+    );
+    CREATE INDEX IF NOT EXISTS webhook_attempts_consumer ON webhook_delivery_attempts (tenant_id, consumer, seq DESC);
+    CREATE INDEX IF NOT EXISTS webhook_attempts_age ON webhook_delivery_attempts (tenant_id, consumer, attempt_at);
+
+    CREATE TABLE IF NOT EXISTS webhook_rewinds (
+      seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+      id         TEXT NOT NULL UNIQUE,
+      tenant_id  TEXT NOT NULL,
+      consumer   TEXT NOT NULL,
+      from_seq   INTEGER NOT NULL CHECK (from_seq >= 0),
+      to_seq     INTEGER NOT NULL CHECK (to_seq >= 0),
+      actor      TEXT NOT NULL,
+      at         INTEGER NOT NULL,
+      CHECK (to_seq < from_seq)
+    );
+    CREATE INDEX IF NOT EXISTS webhook_rewinds_consumer ON webhook_rewinds (tenant_id, consumer, seq DESC);
   `,
 ]

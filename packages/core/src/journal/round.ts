@@ -78,7 +78,6 @@ export class JournalRounder {
         imbalance += adjustment
       }
       if (imbalance !== 0n) {
-        const original = source.find((item) => item.line.amount.asset === asset)!.line
         lines.push({
           account: ROUNDING_ACCOUNT,
           role: 'conversion',

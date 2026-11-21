@@ -50,19 +50,19 @@ if (pool === undefined) {
       await Promise.all([1, 2, 3].map(() => freshStore({ schema })))
       await freshStore({ schema })
       const { rows } = await pool.query(`SELECT version FROM "${schema}".migrations ORDER BY version`)
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6])
+      expect(rows.map((r) => r.version)).toEqual(Array.from({ length: MIGRATIONS.length }, (_, i) => i + 1))
     })
 
     it('reports the schema version without changing it', async () => {
       const schema = `nostro_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`
       schemas.push(schema)
       const store = new PostgresStore({ pool: pool!, schema })
-      expect(await store.schemaVersion()).toEqual({ current: 0, latest: 6 })
-      expect(await store.schemaVersion()).toEqual({ current: 0, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: 0, latest: MIGRATIONS.length })
+      expect(await store.schemaVersion()).toEqual({ current: 0, latest: MIGRATIONS.length })
       await store.migrate()
-      expect(await store.schemaVersion()).toEqual({ current: 6, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: MIGRATIONS.length, latest: MIGRATIONS.length })
       await pool.query(`DELETE FROM "${schema}".migrations WHERE version >= 3`)
-      expect(await store.schemaVersion()).toEqual({ current: 2, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: 2, latest: MIGRATIONS.length })
     })
 
     it('migrates a version 5 database with duplicate muxed ids and refuses later duplicates', async () => {
@@ -98,7 +98,7 @@ if (pool === undefined) {
 
       const store = new PostgresStore({ pool: pool!, schema })
       await store.migrate()
-      expect(await store.schemaVersion()).toEqual({ current: 6, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: MIGRATIONS.length, latest: MIGRATIONS.length })
       expect((await doctor({ store, tenantId: 't' })).findings).toEqual([
         expect.objectContaining({ code: 'muxed_id_duplicate' }),
       ])

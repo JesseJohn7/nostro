@@ -137,7 +137,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
           const e = await tx.insertExpectation(expectation)
           const accrualActive = await tx.accrualGetMode(tenant(args, io))
           if (accrualActive) {
-            await tx.postAccrualExpectation(e.id, tenant(args, io), e.direction, e.amount, e.reference)
+            await tx.postAccrualExpectation(e.id, tenant(args, io), e.direction === 'credit', e.amount.toString(), e.reference)
           }
           return e
         } catch (err) {

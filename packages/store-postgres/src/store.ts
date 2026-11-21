@@ -20,6 +20,8 @@ import type {
   Allocation,
   AllocationQuery,
   CursorKey,
+  DeliveryAttempt,
+  DeliveryAttemptQuery,
   Disposition,
   EventQuery,
   ExceptionQuery,
@@ -41,8 +43,12 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  NewDeliveryAttempt,
   NewOutboxEvent,
   OutboxEvent,
+  Rewind,
+  RewindInput,
+  RewindQuery,
   PruneEventsResult,
   Resolution,
   SchemaVersion,
@@ -58,6 +64,9 @@ import {
   assertValidNewExpectation,
   assertValidNewJournalEntry,
   assertValidNewMovement,
+  DELIVERY_ATTEMPT_LIMIT,
+  DELIVERY_ATTEMPT_TTL_MS,
+  eventCursorKey,
   amendExpectationRecord,
   checkAllocation,
   checkCancel,
@@ -77,14 +86,16 @@ import {
 } from '@nostro-labs/nostro'
 import type {
   AllocationRow,
+  DeliveryAttemptRow,
   EventRow,
   ExceptionRow,
   ExpectationRow,
   JournalEntryRow,
   JournalLineRow,
   MovementRow,
+  RewindRow,
 } from './rows.js'
-import { memoColumns, toAllocation, toEvent, toException, toExpectation, toJournalEntry, toMovement } from './rows.js'
+import { memoColumns, toAllocation, toDeliveryAttempt, toEvent, toException, toExpectation, toJournalEntry, toMovement, toRewind } from './rows.js'
 import { MIGRATIONS, quoteSchema } from './schema.js'
 
 export interface PostgresStoreOptions {
@@ -272,6 +283,50 @@ class PgReader implements StoreReader {
     return Number(row?.seq ?? 0)
   }
 
+  async getLatestEventSeq(tenantId: string): Promise<number> {
+    const [row] = await this.run<{ seq: string | number | null }>(
+      `SELECT max(seq) AS seq FROM ${this.s}.events WHERE tenant_id = $1`,
+      [tenantId],
+    )
+    return Number(row?.seq ?? 0)
+  }
+
+  async listDeliveryAttempts(q: DeliveryAttemptQuery): Promise<DeliveryAttempt[]> {
+    const w = new Where()
+      .add((p) => `tenant_id = ${p}`, q.tenantId)
+      .add((p) => `consumer = ${p}`, q.consumer)
+      .add((p) => `outcome = ${p}`, q.outcome)
+      .add((p) => `seq < ${p}`, q.beforeSeq)
+    const rows = await this.run<DeliveryAttemptRow>(
+      `SELECT * FROM ${this.s}.webhook_delivery_attempts${w} ORDER BY seq DESC${w.limit(q.limit)}`,
+      w.params,
+    )
+    return rows.map(toDeliveryAttempt)
+  }
+
+  async listDeliveryConsumers(tenantId: string): Promise<string[]> {
+    const rows = await this.run<{ account: string }>(
+      `SELECT account FROM ${this.s}.cursors
+         WHERE tenant_id = $1 AND network = 'nostro' AND source = 'outbox' AND value IS NOT NULL
+       UNION
+       SELECT DISTINCT consumer AS account FROM ${this.s}.webhook_delivery_attempts WHERE tenant_id = $2
+       UNION
+       SELECT DISTINCT consumer AS account FROM ${this.s}.webhook_rewinds WHERE tenant_id = $3
+       ORDER BY account`,
+      [tenantId, tenantId, tenantId],
+    )
+    return rows.map((r) => r.account)
+  }
+
+  async listRewinds(q: RewindQuery): Promise<Rewind[]> {
+    const w = new Where().add((p) => `tenant_id = ${p}`, q.tenantId).add((p) => `consumer = ${p}`, q.consumer)
+    const rows = await this.run<RewindRow>(
+      `SELECT * FROM ${this.s}.webhook_rewinds${w} ORDER BY seq DESC${w.limit(q.limit ?? DELIVERY_ATTEMPT_LIMIT)}`,
+      w.params,
+    )
+    return rows.map(toRewind)
+  }
+
   async getCursor(k: CursorKey): Promise<string | null> {
     const [row] = await this.run<{ value: string | null }>(
       `SELECT value FROM ${this.s}.cursors WHERE tenant_id = $1 AND network = $2 AND source = $3 AND account = $4`,
@@ -325,6 +380,40 @@ class PgTx extends PgReader implements StoreTx {
 
   close(): void {
     this.open = false
+  }
+
+  async accrualGetMode(tenantId: string): Promise<boolean> {
+    const [row] = await this.run<{ active: boolean }>(
+      `SELECT active FROM ${this.s}.accrual_modes WHERE tenant_id = $1`,
+      [tenantId],
+    )
+    return row?.active ?? false
+  }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void> {
+    const [expectation] = await this.run<{ asset: string; decimals: number }>(
+      `SELECT asset, decimals FROM ${this.s}.expectations WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, expectationId],
+    )
+    if (expectation === undefined) return
+    const at = this.now()
+    const entryId = this.ids()
+    const roles = isCredit
+      ? [['assets:receivable', 'receivable', 'debit'], ['income:uncategorized', 'uncategorized_income', 'credit']] as const
+      : [['expenses:uncategorized', 'uncategorized_expense', 'debit'], ['liabilities:payable', 'payable', 'credit']] as const
+
+    await this.run(
+      `INSERT INTO ${this.s}.journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+       VALUES ($1, $2, NULL, 1, 'initial', $3, $4, $5)`,
+      [entryId, tenantId, at, at, `Accrual for expectation ${reference}`],
+    )
+    for (const [index, [account, role, side]] of roles.entries()) {
+      await this.run(
+        `INSERT INTO ${this.s}.journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL)`,
+        [entryId, index + 1, tenantId, account, role, side, expectation.asset, expectation.decimals, amount, expectationId],
+      )
+    }
   }
 
   async lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null> {
@@ -416,6 +505,39 @@ class PgTx extends PgReader implements StoreTx {
        ON CONFLICT (tenant_id, network, source, account) DO UPDATE SET value = EXCLUDED.value`,
       [k.tenantId, k.network, k.source, k.account, value],
     )
+  }
+
+  async recordDeliveryAttempt(attempt: NewDeliveryAttempt): Promise<DeliveryAttempt> {
+    const [row] = await this.run<DeliveryAttemptRow>(
+      `INSERT INTO ${this.s}.webhook_delivery_attempts
+         (id, tenant_id, consumer, event_id, event_seq, attempt_at, http_status, error, duration_ms, outcome)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [this.ids(), attempt.tenantId, attempt.consumer, attempt.eventId, attempt.eventSeq, attempt.at, attempt.httpStatus, attempt.error, attempt.durationMs, attempt.outcome],
+    )
+    await this.run(
+      `DELETE FROM ${this.s}.webhook_delivery_attempts
+         WHERE tenant_id = $1 AND consumer = $2 AND (
+           seq < (SELECT seq FROM ${this.s}.webhook_delivery_attempts
+                  WHERE tenant_id = $3 AND consumer = $4
+                  ORDER BY seq DESC LIMIT 1 OFFSET $5)
+           OR attempt_at < $6
+         )`,
+      [attempt.tenantId, attempt.consumer, attempt.tenantId, attempt.consumer, DELIVERY_ATTEMPT_LIMIT - 1, new Date(attempt.at.getTime() - DELIVERY_ATTEMPT_TTL_MS)],
+    )
+    return toDeliveryAttempt(row!)
+  }
+
+  async rewindConsumer(input: RewindInput): Promise<Rewind | null> {
+    const key = eventCursorKey(input.tenantId, input.consumer)
+    const current = await this.getCursor(key)
+    if ((current === null ? 0 : Number(current)) !== input.expectedSeq) return null
+    await this.setCursor(key, String(input.toSeq))
+    const [row] = await this.run<RewindRow>(
+      `INSERT INTO ${this.s}.webhook_rewinds (id, tenant_id, consumer, from_seq, to_seq, actor, at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [this.ids(), input.tenantId, input.consumer, input.expectedSeq, input.toSeq, input.actor, input.at],
+    )
+    return toRewind(row!)
   }
 
   async pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult> {
@@ -909,48 +1031,8 @@ export class PostgresStore extends PgReader implements MigratableStore {
     return row?.active ?? false
   }
 
-  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amountRaw: string, reference: string): Promise<void> {
-    const now = new Date()
-    const amount = amountRaw
-
-    // For credit expectations: Dr receivable · Cr revenue
-    // For debit expectations: Dr expense · Cr payable
-    const isCredit = isCredit
-    const receivableAccount = 'Assets:Receivable'
-    const revenueAccount = isCredit ? 'Revenue' : 'Expense'
-    const payableAccount = isCredit ? 'Liabilities:Payable' : 'Expense'
-    const otherSide = isCredit ? 'credit' : 'debit'
-    const ownSide = isCredit ? 'debit' : 'credit'
-
-    // Post the first entry: Dr receivable/exception · Cr revenue/payable
-    const [entry1] = await this.run<JournalEntryRow>(
-      `INSERT INTO ${this.s}.journal_entries (
-         id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [this.ids(), tenantId, null, 1, 'initial', now, now, `Accrual for expectation ${reference}`],
-    )
-
-    const [line1] = await this.run<JournalLineRow>(
-      `INSERT INTO ${this.s}.journal_lines (
-         entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-      [entry1.id, 1, tenantId, receivableAccount, 'convention', ownSide, amount, 18, amount, expectationId, null],
-    )
-
-    // Post the second entry: Cr revenue/payable · Dr receivable
-    const [entry2] = await this.run<JournalEntryRow>(
-      `INSERT INTO ${this.s}.journal_entries (
-         id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [this.ids(), tenantId, null, 2, 'initial', now, now, `Reverse accrual for expectation ${reference}`],
-    )
-
-    const [line2] = await this.run<JournalLineRow>(
-      `INSERT INTO ${this.s}.journal_lines (
-         entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-      [entry2.id, 1, tenantId, revenueAccount, 'convention', otherSide, amount, 18, amount, expectationId, null],
-    )
+  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void> {
+    await this.transaction((tx) => tx.postAccrualExpectation(expectationId, tenantId, isCredit, amount, reference))
   }
 
   async exportListBatches(tenantId: string): Promise<readonly { readonly destination: string; readonly last_seq: number; readonly last_exported_at: number; readonly control_totals: string; readonly checksum: string }[]> {

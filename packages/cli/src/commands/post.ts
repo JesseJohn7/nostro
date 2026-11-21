@@ -21,14 +21,14 @@ ${COMMON_HELP}`,
   async run(args, io) {
     positionals(args, 0)
     const tenantId = tenant(args, io)
-    const posted: Record<JournalEntryKind, number> = { initial: 0, reclass: 0, correction: 0 }
+    const posted: Record<Exclude<JournalEntryKind, 'conversion'>, number> = { initial: 0, reclass: 0, correction: 0 }
     const errors = new Map<string, string>()
     let examined = 0
     await withStore(args, io, async (store) => {
       for (let afterSeq: number | undefined; ; ) {
         const report = await postJournal({ store, tenantId, ...(afterSeq === undefined ? {} : { afterSeq }) })
         examined += report.examined
-        for (const kind of Object.keys(posted) as JournalEntryKind[]) posted[kind] += report.posted[kind]
+        for (const kind of Object.keys(posted) as Exclude<JournalEntryKind, 'conversion'>[]) posted[kind] += report.posted[kind]
         for (const { movementId, error } of report.errors) errors.set(movementId, error.message)
         if (report.lastSeq === null) return
         afterSeq = report.lastSeq
