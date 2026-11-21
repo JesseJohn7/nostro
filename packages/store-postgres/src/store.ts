@@ -21,6 +21,7 @@ import type {
   AllocationQuery,
   CursorKey,
   Disposition,
+  Direction,
   EventQuery,
   ExceptionQuery,
   ExceptionRecord,
@@ -48,8 +49,13 @@ import type {
   SchemaVersion,
   StoreReader,
   StoreTx,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '@nostro-labs/nostro'
 import {
+  postAccrual,
+  Money,
   ConstraintError,
   NotFoundError,
   TransactionClosedError,
@@ -83,8 +89,9 @@ import type {
   JournalEntryRow,
   JournalLineRow,
   MovementRow,
+  MovementValuationRow,
 } from './rows.js'
-import { memoColumns, toAllocation, toEvent, toException, toExpectation, toJournalEntry, toMovement } from './rows.js'
+import { memoColumns, toAllocation, toEvent, toException, toExpectation, toJournalEntry, toMovement, toValuation } from './rows.js'
 import { MIGRATIONS, quoteSchema } from './schema.js'
 
 export interface PostgresStoreOptions {
@@ -298,6 +305,39 @@ class PgReader implements StoreReader {
       note: row.note,
       closedAt: row.created_at,
     })
+  }
+
+  async accrualGetMode(tenantId: string): Promise<boolean> {
+    const [row] = await this.run<{ active: boolean }>(
+      `SELECT active FROM ${this.s}.accrual_modes WHERE tenant_id = $1`,
+      [tenantId],
+    )
+    return row?.active ?? false
+  }
+
+  async getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null> {
+    const [row] = await this.run<MovementValuationRow>(
+      `SELECT * FROM ${this.s}.movement_valuations WHERE tenant_id = $1 AND movement_id = $2`,
+      [tenantId, movementId],
+    )
+    return row === undefined ? null : toValuation(row)
+  }
+
+  async listValuations(q: ValuationQuery): Promise<MovementValuation[]> {
+    let sql = `SELECT * FROM ${this.s}.movement_valuations WHERE tenant_id = $1`
+    const params: unknown[] = [q.tenantId]
+    let idx = 2
+    if (q.movementId !== undefined) {
+      sql += ` AND movement_id = $${idx++}`
+      params.push(q.movementId)
+    }
+    if (q.reportingAsset !== undefined) {
+      sql += ` AND reporting_asset = $${idx++}`
+      params.push(q.reportingAsset)
+    }
+    sql += ' ORDER BY price_timestamp ASC'
+    const rows = await this.run<MovementValuationRow>(sql, params)
+    return rows.map(toValuation)
   }
 }
 
@@ -881,6 +921,36 @@ class PgTx extends PgReader implements StoreTx {
     await this.emit(exceptionChanged(next))
     return next
   }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {
+    const now = this.now()
+    for (const n of batch) {
+      const m = await this.getMovement(n.tenantId, n.movementId)
+      if (m === null) throw new NotFoundError('movement', n.movementId)
+      await this.run(
+        `INSERT INTO ${this.s}.movement_valuations (
+           tenant_id, movement_id, reporting_asset, price_n, price_d, price_source, price_timestamp, decimals, value, valued_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (tenant_id, movement_id) DO NOTHING`,
+        [
+          n.tenantId,
+          n.movementId,
+          n.reportingAsset,
+          n.priceNumerator.toString(),
+          n.priceDenominator.toString(),
+          n.priceSource,
+          n.priceTimestamp,
+          n.value.decimals,
+          n.value.raw.toString(),
+          n.valuedAt ?? now,
+        ],
+      )
+    }
+  }
 }
 
 export class PostgresStore extends PgReader implements MigratableStore {
@@ -901,56 +971,10 @@ export class PostgresStore extends PgReader implements MigratableStore {
     )
   }
 
-  async accrualGetMode(tenantId: string): Promise<boolean> {
-    const [row] = await this.run<{ active: boolean }>(
-      `SELECT active FROM ${this.s}.accrual_modes WHERE tenant_id = $1`,
-      [tenantId],
-    )
-    return row?.active ?? false
-  }
 
-  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amountRaw: string, reference: string): Promise<void> {
-    const now = new Date()
-    const amount = amountRaw
 
-    // For credit expectations: Dr receivable · Cr revenue
-    // For debit expectations: Dr expense · Cr payable
-    const isCredit = isCredit
-    const receivableAccount = 'Assets:Receivable'
-    const revenueAccount = isCredit ? 'Revenue' : 'Expense'
-    const payableAccount = isCredit ? 'Liabilities:Payable' : 'Expense'
-    const otherSide = isCredit ? 'credit' : 'debit'
-    const ownSide = isCredit ? 'debit' : 'credit'
-
-    // Post the first entry: Dr receivable/exception · Cr revenue/payable
-    const [entry1] = await this.run<JournalEntryRow>(
-      `INSERT INTO ${this.s}.journal_entries (
-         id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [this.ids(), tenantId, null, 1, 'initial', now, now, `Accrual for expectation ${reference}`],
-    )
-
-    const [line1] = await this.run<JournalLineRow>(
-      `INSERT INTO ${this.s}.journal_lines (
-         entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-      [entry1.id, 1, tenantId, receivableAccount, 'convention', ownSide, amount, 18, amount, expectationId, null],
-    )
-
-    // Post the second entry: Cr revenue/payable · Dr receivable
-    const [entry2] = await this.run<JournalEntryRow>(
-      `INSERT INTO ${this.s}.journal_entries (
-         id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
-      [this.ids(), tenantId, null, 2, 'initial', now, now, `Reverse accrual for expectation ${reference}`],
-    )
-
-    const [line2] = await this.run<JournalLineRow>(
-      `INSERT INTO ${this.s}.journal_lines (
-         entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-      [entry2.id, 1, tenantId, revenueAccount, 'convention', otherSide, amount, 18, amount, expectationId, null],
-    )
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await this.transaction(tx => tx.postAccrualExpectation(expectationId, tenantId, direction, amount, reference))
   }
 
   async exportListBatches(tenantId: string): Promise<readonly { readonly destination: string; readonly last_seq: number; readonly last_exported_at: number; readonly control_totals: string; readonly checksum: string }[]> {

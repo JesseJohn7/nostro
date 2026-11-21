@@ -29,7 +29,11 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '../model/index.js'
+import type { Money } from '../money/index.js'
 import type { AssetId } from '../money/index.js'
 import type { EventQuery, OutboxEvent, PruneEventsResult } from './events.js'
 
@@ -116,6 +120,7 @@ export interface JournalPeriod {
 
 /** Read access. Every lookup is scoped by tenant; ids from another tenant read as absent. */
 export interface StoreReader extends JournalReader {
+  accrualGetMode(tenantId: string): Promise<boolean>
   getMovement(tenantId: string, id: string): Promise<Movement | null>
   listMovements(query: MovementQuery): Promise<Movement[]>
   getExpectation(tenantId: string, id: string): Promise<Expectation | null>
@@ -136,6 +141,8 @@ export interface StoreReader extends JournalReader {
   getCursor(key: CursorKey): Promise<string | null>
   /** The event log, in `seq` order. Events are written by the store itself; see `events.ts`. */
   listEvents(query: EventQuery): Promise<OutboxEvent[]>
+  getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null>
+  listValuations(query: ValuationQuery): Promise<MovementValuation[]>
   /** Highest event sequence intentionally removed for this tenant, or zero. */
   getEventsPrunedThrough(tenantId: string): Promise<number>
 }
@@ -152,6 +159,7 @@ export interface StoreReader extends JournalReader {
  * default isolation level.
  */
 export interface StoreTx extends StoreReader, JournalTx {
+  postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
   /** Lock the tenant's close state until this transaction ends, then return it. */
   lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null>
   /** Append a close action. The implementation acquires the tenant period lock. */
@@ -213,6 +221,7 @@ export interface StoreTx extends StoreReader, JournalTx {
   openException(exception: NewException): Promise<ExceptionRecord>
   /** Writes an `exception.resolved` or `exception.dismissed` event. */
   resolveException(tenantId: string, id: string, resolution: Resolution): Promise<ExceptionRecord>
+  insertValuations(batch: readonly NewMovementValuation[]): Promise<void>
 }
 
 export interface JournalQuery {
@@ -257,10 +266,11 @@ export interface Store extends StoreReader {
    */
   transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>
   close(): Promise<void>
+  exportListBatches(tenantId: string): Promise<readonly ExportBatch[]>
   exportGetMark(tenantId: string, destination: string): Promise<string | null>
   exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void>
   accrualGetMode(tenantId: string): Promise<boolean>
-  postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void>
+  postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
 }
 
 export interface ExportBatch {
@@ -307,12 +317,14 @@ export type ConstraintName =
   | 'disposition_unsupported'
   | 'movement_not_open'
   | 'exception_not_open'
+  | 'journal_manual_slot'
   | 'journal_unbalanced'
   | 'journal_posting_conflict'
   | 'journal_cash_mismatch'
   | 'journal_asset'
   | 'journal_period_closed'
   | 'journal_period_not_closed'
+  | 'journal_cash_without_movement'
 
 export class StoreError extends Error {
   constructor(

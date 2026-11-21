@@ -19,7 +19,7 @@ import type {
   Allocation,
   CursorKey,
   Disposition,
-  ExportBatch,
+  Direction,
   ExceptionRecord,
   Expectation,
   ExpectationChanges,
@@ -30,6 +30,9 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '../model/index.js'
 import {
   assertValidNewJournalEntry,
@@ -39,6 +42,7 @@ import {
   assertValidNewMovement,
 } from '../model/index.js'
 import type {
+  ExportBatch,
   AllocationQuery,
   ExceptionQuery,
   ExpectationQuery,
@@ -66,6 +70,8 @@ import {
   storedMemo,
   sameFacts,
 } from './rules.js'
+import { Money } from '../money/index.js'
+import { postAccrual } from './accrual.js'
 import { ConstraintError, NotFoundError, TransactionClosedError } from './store.js'
 import { EventHistoryPrunedError } from './events.js'
 import type { EventQuery, NewOutboxEvent, OutboxEvent, PruneEventsResult } from './events.js'
@@ -99,6 +105,7 @@ interface State {
   readonly eventPrunedThrough: Map<string, number>
   /** Movement id → its entry ids in posting order. Arrays are replaced, never pushed to. */
   readonly journalByMovement: Map<string, readonly string[]>
+  readonly valuations: Map<string, MovementValuation>
   periodActions: readonly {
     readonly tenantId: string
     readonly action: 'close' | 'reopen'
@@ -127,6 +134,7 @@ function emptyState(): State {
     events: new Map(),
     eventPrunedThrough: new Map(),
     periodActions: [],
+    valuations: new Map(),
   }
 }
 
@@ -149,6 +157,7 @@ function cloneState(s: State): State {
     events: new Map(s.events),
     eventPrunedThrough: new Map(s.eventPrunedThrough),
     periodActions: [...s.periodActions],
+    valuations: new Map(s.valuations),
   }
 }
 
@@ -180,6 +189,8 @@ abstract class MemoryReader implements StoreReader {
   protected abstract snapshot(): State
 
   protected check(): void {}
+
+  async accrualGetMode(_tenantId: string): Promise<boolean> { this.check(); return false }
 
   async getMovement(tenantId: string, id: string): Promise<Movement | null> {
     this.check()
@@ -357,6 +368,23 @@ abstract class MemoryReader implements StoreReader {
         : null
     }
     return null
+  }
+
+  async getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null> {
+    this.check()
+    return this.snapshot().valuations.get(`${tenantId}:${movementId}`) ?? null
+  }
+
+  async listValuations(q: ValuationQuery): Promise<MovementValuation[]> {
+    this.check()
+    const out: MovementValuation[] = []
+    for (const v of this.snapshot().valuations.values()) {
+      if (v.tenantId !== q.tenantId) continue
+      if (q.movementId !== undefined && v.movementId !== q.movementId) continue
+      if (q.reportingAsset !== undefined && v.reportingAsset !== q.reportingAsset) continue
+      out.push(v)
+    }
+    return out
   }
 }
 
@@ -751,6 +779,32 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.emit(exceptionChanged(next))
     return next
   }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {
+    this.check()
+    const now = this.now()
+    for (const n of batch) {
+      this.movement(n.tenantId, n.movementId)
+      const k = `${n.tenantId}:${n.movementId}`
+      if (this.draft.valuations.has(k)) continue
+      const v: MovementValuation = Object.freeze({
+        movementId: n.movementId,
+        tenantId: n.tenantId,
+        reportingAsset: n.reportingAsset,
+        priceNumerator: n.priceNumerator,
+        priceDenominator: n.priceDenominator,
+        priceSource: n.priceSource,
+        priceTimestamp: copyDate(n.priceTimestamp),
+        value: n.value,
+        valuedAt: n.valuedAt ? copyDate(n.valuedAt) : now,
+      })
+      this.draft.valuations.set(k, v)
+    }
+  }
 }
 
 export class MemoryStore extends MemoryReader implements Store {
@@ -765,16 +819,23 @@ export class MemoryStore extends MemoryReader implements Store {
     this.now = options.now ?? (() => new Date())
   }
 
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await this.transaction(tx => tx.postAccrualExpectation(expectationId, tenantId, direction, amount, reference))
+  }
+
+  private readonly exportMarks = new Map<string, ExportBatch>()
+
   async exportGetMark(tenantId: string, destination: string): Promise<string | null> {
-    return null
+    const mark = this.exportMarks.get(key(tenantId, destination))
+    return mark ? String(mark.last_seq) : null
   }
 
   async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
-    // no-op for in-memory store
+    this.exportMarks.set(key(tenantId, destination), { destination, last_seq: lastSeq, last_exported_at: this.now().getTime(), control_totals: '{}', checksum: '' })
   }
 
   async exportListBatches(tenantId: string): Promise<ExportBatch[]> {
-    return []
+    return [...this.exportMarks.entries()].filter(([k]) => JSON.parse(k)[0] === tenantId).map(([, v]) => ({ ...v }))
   }
 
   protected snapshot(): State {

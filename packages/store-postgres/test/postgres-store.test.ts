@@ -50,19 +50,19 @@ if (pool === undefined) {
       await Promise.all([1, 2, 3].map(() => freshStore({ schema })))
       await freshStore({ schema })
       const { rows } = await pool.query(`SELECT version FROM "${schema}".migrations ORDER BY version`)
-      expect(rows.map((r) => r.version)).toEqual([1, 2, 3, 4, 5, 6])
+      expect(rows.map((r) => r.version)).toEqual(Array.from({ length: MIGRATIONS.length }, (_, i) => i + 1))
     })
 
     it('reports the schema version without changing it', async () => {
       const schema = `nostro_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`
       schemas.push(schema)
       const store = new PostgresStore({ pool: pool!, schema })
-      expect(await store.schemaVersion()).toEqual({ current: 0, latest: 6 })
-      expect(await store.schemaVersion()).toEqual({ current: 0, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: 0, latest: MIGRATIONS.length })
+      expect(await store.schemaVersion()).toEqual({ current: 0, latest: MIGRATIONS.length })
       await store.migrate()
-      expect(await store.schemaVersion()).toEqual({ current: 6, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: MIGRATIONS.length, latest: MIGRATIONS.length })
       await pool.query(`DELETE FROM "${schema}".migrations WHERE version >= 3`)
-      expect(await store.schemaVersion()).toEqual({ current: 2, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: 2, latest: MIGRATIONS.length })
     })
 
     it('migrates a version 5 database with duplicate muxed ids and refuses later duplicates', async () => {
@@ -98,7 +98,7 @@ if (pool === undefined) {
 
       const store = new PostgresStore({ pool: pool!, schema })
       await store.migrate()
-      expect(await store.schemaVersion()).toEqual({ current: 6, latest: 6 })
+      expect(await store.schemaVersion()).toEqual({ current: MIGRATIONS.length, latest: MIGRATIONS.length })
       expect((await doctor({ store, tenantId: 't' })).findings).toEqual([
         expect.objectContaining({ code: 'muxed_id_duplicate' }),
       ])
@@ -288,7 +288,7 @@ if (pool === undefined) {
         const { store, s, movement } = await withMovement()
         // Put the schema back to version 1, keeping its data.
         await pool.query(
-          `DROP TABLE ${s}.expectation_reference_index, ${s}.journal_period_actions, ${s}.journal_lines, ${s}.journal_entries, ${s}.events`,
+          `DROP TABLE ${s}.movement_valuations, ${s}.event_prune_state, ${s}.exports, ${s}.accrual_modes, ${s}.expectation_reference_index, ${s}.journal_period_actions, ${s}.journal_lines, ${s}.journal_entries, ${s}.events`,
         )
         await pool.query(
           `DROP FUNCTION ${s}.journal_entry_balanced, ${s}.journal_line_balanced, ${s}.journal_check_entry, ${s}.journal_append_only, ${s}.events_append_only, ${s}.journal_period_actions_append_only`,
@@ -312,7 +312,7 @@ if (pool === undefined) {
             memo: { type: 'text', value: 'REF-8' },
           }),
         )
-        await pool.query(`DROP TABLE ${s}.expectation_reference_index`)
+        await pool.query(`DROP TABLE ${s}.movement_valuations, ${s}.event_prune_state, ${s}.exports, ${s}.accrual_modes, ${s}.expectation_reference_index`)
         await pool.query(`DELETE FROM ${s}.migrations WHERE version >= 5`)
         await store.migrate()
         const ids = async (key: string) =>

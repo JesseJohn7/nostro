@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { JournalQuery, Movement, NewJournalEntry, NewJournalLine, Store } from '@nostro-labs/nostro'
-import { Money, NotFoundError, ValidationError, asset, closePeriod, postMovement, reopenPeriod } from '@nostro-labs/nostro'
+import { agingReport, costBasis, valueMovements, MapPriceSource, reconcile, postManualEntry, Money, NotFoundError, ValidationError, asset, closePeriod, postMovement, reopenPeriod } from '@nostro-labs/nostro'
 
 const T = 'tenant-a'
 const T2 = 'tenant-b'
@@ -187,7 +187,7 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
         description: 'Write off suspense',
         lines: [
           { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: usdc('1') },
-          { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: usdc('1') },
+          { account: 'assets:suspense', role: 'other', side: 'credit', amount: usdc('1') },
         ],
       })
       expect(manual).toMatchObject({ movementId: null, postingNo: null })
@@ -204,7 +204,10 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
         kind: 'reclass',
         effectiveAt: through,
         description: 'Other tenant period remains open',
-        lines: lines(m.amount),
+        lines: [
+          { account: 'assets:suspense', role: 'other', side: 'debit', amount: m.amount },
+          { account: 'liabilities:unapplied-receipts', role: 'other', side: 'credit', amount: m.amount },
+        ],
       })
       expect(otherTenantEntry.tenantId).toBe(T2)
 
@@ -341,6 +344,104 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
       const rejected = results.find((r) => r.status === 'rejected') as PromiseRejectedResult
       expect(rejected.reason).toMatchObject(constraint('journal_posting_conflict'))
       expect(await store.listJournalEntries({ tenantId: T, movementId: m.id })).toHaveLength(1)
+    })
+
+    it('refuses a manual entry with a cash or issued line', async () => {
+      await expect(
+        store.transaction((tx) =>
+          tx.postJournalEntry({
+            tenantId: T,
+            kind: 'manual',
+            description: 'Manual cash test',
+            lines: [
+              { account: CASH, role: 'cash', side: 'debit', amount: usdc('10') },
+              { account: 'liabilities:unapplied-receipts', role: 'unapplied', side: 'credit', amount: usdc('10') },
+            ],
+          }),
+        ),
+      ).rejects.toMatchObject(constraint('journal_cash_without_movement'))
+
+      await expect(
+        store.transaction((tx) =>
+          tx.postJournalEntry({
+            tenantId: T,
+            kind: 'manual',
+            description: 'Manual issued test',
+            lines: [
+              { account: CASH, role: 'issued', side: 'debit', amount: usdc('10') },
+              { account: 'liabilities:unapplied-receipts', role: 'unapplied', side: 'credit', amount: usdc('10') },
+            ],
+          }),
+        ),
+      ).rejects.toMatchObject(constraint('journal_cash_without_movement'))
+    })
+
+    it('posts a manual entry without movement and reads it back', async () => {
+      const e = await store.transaction((tx) =>
+        tx.postJournalEntry({
+          tenantId: T,
+          kind: 'manual',
+          description: 'Write off suspense',
+          lines: [
+            { account: 'assets:suspense', role: 'other', side: 'credit', amount: usdc('10') },
+            { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: usdc('10') },
+          ],
+        }),
+      )
+      expect(e.kind).toBe('manual')
+      expect(e.movementId).toBeNull()
+      expect(e.postingNo).toBeNull()
+      const list = await store.listJournalEntries({ tenantId: T })
+      expect(list.some((entry) => entry.id === e.id && entry.kind === 'manual')).toBe(true)
+    })
+
+    it('inserts and lists movement valuations', async () => {
+      const m = await movement()
+      const val = {
+        tenantId: T,
+        movementId: m.id,
+        reportingAsset: USDC,
+        value: usdc('50'),
+        priceNumerator: 5n,
+        priceDenominator: 1n,
+        priceSource: 'manual',
+        priceTimestamp: new Date('2026-10-06T00:00:00Z'),
+        valuedAt: new Date('2026-10-06T00:00:00Z'),
+      }
+      await store.transaction((tx) => tx.insertValuations([val]))
+      const read = await store.getValuation(T, m.id)
+      expect(read).not.toBeNull()
+      expect(read?.movementId).toBe(m.id)
+      expect(read?.value.raw).toBe(usdc('50').raw)
+
+      const listed = await store.listValuations({ tenantId: T })
+      expect(listed).toHaveLength(1)
+      expect(listed[0]!.movementId).toBe(m.id)
+    })
+
+    it('values movements idempotently and reports aging and lots on the same records', async () => {
+      const m = await movement()
+      await reconcile({store, tenantId:T})
+      const options = {store, tenantId:T, reportingAsset:USDC, priceSource:new MapPriceSource([])}
+      expect((await valueMovements(options)).valued).toBe(1)
+      expect((await valueMovements(options)).valued).toBe(0)
+      const lots = await costBasis({store,tenantId:T,asset:USDC,account:ACCOUNT})
+      expect(lots.openLots[0]!.remainingCost.raw).toBe(m.amount.raw)
+      const aging = await agingReport({store,tenantId:T,asOf:new Date('2030-01-01')})
+      expect(aging.unexplainedMoney.items[0]!.amount.raw).toBe(m.amount.raw)
+    })
+
+    it('refuses movement balance adjustments even when racing reconciliation', async () => {
+      const m = await movement()
+      const [manual] = await Promise.allSettled([
+        postManualEntry({store,tenantId:T,description:'Invalid write-off',reason:'test',lines:[
+          {account:'liabilities:unapplied-receipts',role:'unapplied',side:'debit',amount:m.amount},
+          {account:'income:uncategorized',role:'uncategorized_income',side:'credit',amount:m.amount},
+        ]}),
+        reconcile({store,tenantId:T}),
+      ])
+      expect(manual.status).toBe('rejected')
+      expect(await store.listJournalEntries({tenantId:T,movementId:m.id})).toHaveLength(1)
     })
 
     it('refuses to post the same cash twice, even with the right posting number', async () => {

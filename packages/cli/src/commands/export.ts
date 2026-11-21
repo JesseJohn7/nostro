@@ -116,11 +116,25 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const showBatches = flag(args, 'batches')
 
     return withStore(args, io, async (store) => {
-      const base = { store, tenantId, ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) }
-      if (destination) {
-        const mark = await store.exportGetMark(tenantId, destination)
-        base.afterSeq = mark !== undefined ? Number(mark) : undefined
+      const mark = destination ? await store.exportGetMark(tenantId, destination) : null
+      const afterSeq = mark === null ? undefined : Number(mark)
+      let throughSeq = afterSeq ?? 0
+      let cursor = afterSeq
+      for (;;) {
+        const page = await store.listJournalEntries({ tenantId, limit: 500,
+          ...(cursor === undefined ? {} : { afterSeq: cursor }),
+          ...(from === undefined ? {} : { effectiveFrom: from }),
+          ...(to === undefined ? {} : { effectiveBefore: to }),
+        })
+        if (page.length === 0) break
+        throughSeq = page[page.length - 1]!.seq
+        cursor = throughSeq
+        if (page.length < 500) break
       }
+      const base = { store, tenantId, throughSeq,
+        ...(afterSeq === undefined ? {} : { afterSeq }),
+        ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) }
+
       const accountMap = accountMapPath === undefined ? undefined : await readMap(accountMapPath, io.cwd, 'account')
       const commodityMap = commodityMapPath === undefined ? undefined : await readMap(commodityMapPath, io.cwd, 'commodity')
       let rows: AsyncGenerator<string>
@@ -169,24 +183,8 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
         await write(io.stdout, message)
       }
 
-      // Update the high-water mark for the destination after export
-      if (destination) {
-        // Track the last seq exported by scanning the rows output
-        let lastSeq = 0
-        // Re-consume: if output went to stdout, we already wrote it; if to a file, re-read
-        // For simplicity, we'll query the store for the max seq in the range
-        const entries = await store.listJournalEntries({
-          tenantId,
-          ...(from !== undefined ? { effectiveFrom: from } : {}),
-          ...(to !== undefined ? { effectiveBefore: to } : {}),
-          ...(afterSeq !== undefined ? { afterSeq: Number(afterSeq) } : {}),
-        })
-        for (const entry of entries) {
-          if (entry.seq > lastSeq) lastSeq = entry.seq
-        }
-        if (entries.length > 0) {
-          await store.exportSetMark(tenantId, destination, lastSeq)
-        }
+      if (destination && throughSeq > (afterSeq ?? 0)) {
+        await store.exportSetMark(tenantId, destination, throughSeq)
       }
 
       // List batches if requested

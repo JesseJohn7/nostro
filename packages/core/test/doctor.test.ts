@@ -390,8 +390,8 @@ describe('doctor', () => {
         kind: 'initial',
         description: 'opening balance',
         lines: [
-          { account: 'assets:opening', role: 'unexplained', side: 'debit', amount: usdc('3') },
-          { account: 'equity:opening', role: 'unapplied', side: 'credit', amount: usdc('3') },
+          { account: 'assets:opening', role: 'other', side: 'debit', amount: usdc('3') },
+          { account: 'equity:opening', role: 'other', side: 'credit', amount: usdc('3') },
         ],
       }),
     )

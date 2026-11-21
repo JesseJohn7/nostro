@@ -12,7 +12,13 @@ import {
   balanceSheet,
   incomeStatement,
   trialBalance,
+  agingReport,
+  costBasis,
+  parseAsset,
+  journalCsvCell,
+  journalCsvRow,
 } from '@nostro-labs/nostro'
+import type { CostBasisMethod, AssetId } from '@nostro-labs/nostro'
 import { COMMON, UsageError, date, flag, positionals, string, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
@@ -37,8 +43,8 @@ function shortAsset(asset: string): string {
 
 export const report: Command = {
   name: 'report',
-  summary: 'Trial balance, account ledger, balance sheet and income statement',
-  usage: '<trial-balance|ledger|balance-sheet|income> [options]',
+  summary: 'Trial balance, account ledger, balance sheet, income statement, aging, and gains',
+  usage: '<trial-balance|ledger|balance-sheet|income|aging|gains> [options]',
   help: `Run accounting reports.
 
 Subcommands:
@@ -46,13 +52,18 @@ Subcommands:
   ledger               Account ledger with running balance; requires --account and --asset
   balance-sheet        Assets, liabilities, equity + current earnings as of --as-of
   income               Income and expense accounts for a period
+  aging                Aging of open expectations and unexplained money as of --as-of
+  gains                Realised gains and open lots for a period (--from and --to)
 
 Options:
-  --as-of <date>       Balance as of this instant (trial-balance, balance-sheet)
-  --account <code>     Account code for the ledger (ledger only)
-  --asset <id>         Asset id, e.g. "native" or "USDC:GA5Z..." (ledger only)
-  --from <date>        Period start, inclusive (ledger, income)
-  --to <date>          Period end, exclusive (ledger, income)
+  --as-of <date>       Balance as of this instant (trial-balance, balance-sheet, aging)
+  --account <code>     Account code (ledger, gains)
+  --asset <id>         Asset id, e.g. "native" or "USDC:GA5Z..." (ledger, gains)
+  --from <date>        Period start, inclusive (ledger, income, gains)
+  --to <date>          Period end, exclusive (ledger, income, gains)
+  --buckets <n,n,...>  Aging bucket boundaries, comma-separated (default 30,60,90)
+  --method <fifo|lifo> Cost basis lot matching method (default fifo)
+  --csv                Output aging report as CSV
 ${COMMON_HELP}`,
   options: {
     ...COMMON,
@@ -61,6 +72,9 @@ ${COMMON_HELP}`,
     asset: { type: 'string' },
     from: { type: 'string' },
     to: { type: 'string' },
+    buckets: { type: 'string' },
+    method: { type: 'string' },
+    csv: { type: 'boolean' },
   },
   async run(args, io) {
     const [sub] = positionals(args, 1)
@@ -213,6 +227,294 @@ ${COMMON_HELP}`,
       })
     }
 
-    throw new UsageError(`Unknown report type ${JSON.stringify(sub)}. Use trial-balance, ledger, balance-sheet or income.`)
+    if (sub === 'aging') {
+      const asOf = date(args, 'as-of')
+      const bucketsArg = string(args, 'buckets')
+      const buckets = bucketsArg !== undefined
+        ? bucketsArg.split(',').map((s) => { const n = parseInt(s.trim(), 10); if (isNaN(n)) throw new UsageError(`--buckets: ${s} is not an integer`); return n })
+        : undefined
+      const isCsv = flag(args, 'csv')
+      return withStore(args, io, async (store) => {
+        const report = await agingReport({
+          store,
+          tenantId,
+          ...(asOf !== undefined ? { asOf } : {}),
+          ...(buckets !== undefined ? { buckets } : {}),
+        })
+        if (isJson) {
+          await write(io.stdout, json({
+            tenantId: report.tenantId,
+            asOf: report.asOf.toISOString(),
+            buckets: [...report.buckets],
+            receivables: {
+              items: report.receivables.items.map((i) => ({
+                expectationId: i.expectationId,
+                reference: i.reference,
+                account: i.account,
+                direction: i.direction,
+                asset: i.asset,
+                originalAmount: i.originalAmount.toString(),
+                remainingAmount: i.remainingAmount.toString(),
+                dueAt: i.dueAt?.toISOString() ?? null,
+                daysPastDue: i.daysPastDue,
+                bucket: i.bucket,
+              })),
+              byAsset: report.receivables.byAsset.map((a) => ({
+                asset: a.asset,
+                totalRemaining: a.totalRemaining.toString(),
+                buckets: a.buckets.map((b) => ({ bucket: b.bucket, count: b.count, total: b.total.toString() })),
+              })),
+            },
+            payables: {
+              items: report.payables.items.map((i) => ({
+                expectationId: i.expectationId,
+                reference: i.reference,
+                account: i.account,
+                direction: i.direction,
+                asset: i.asset,
+                originalAmount: i.originalAmount.toString(),
+                remainingAmount: i.remainingAmount.toString(),
+                dueAt: i.dueAt?.toISOString() ?? null,
+                daysPastDue: i.daysPastDue,
+                bucket: i.bucket,
+              })),
+              byAsset: report.payables.byAsset.map((a) => ({
+                asset: a.asset,
+                totalRemaining: a.totalRemaining.toString(),
+                buckets: a.buckets.map((b) => ({ bucket: b.bucket, count: b.count, total: b.total.toString() })),
+              })),
+            },
+            unexplainedMoney: {
+              items: report.unexplainedMoney.items.map((i) => ({
+                movementId: i.movementId,
+                occurredAt: i.occurredAt.toISOString(),
+                account: i.account,
+                role: i.role,
+                asset: i.asset,
+                amount: i.amount.toString(),
+                daysSinceMovement: i.daysSinceMovement,
+                bucket: i.bucket,
+                exceptionCode: i.exceptionCode,
+              })),
+              byRoleAndAsset: report.unexplainedMoney.byRoleAndAsset.map((g) => ({
+                role: g.role,
+                asset: g.asset,
+                total: g.total.toString(),
+                buckets: g.buckets.map((b) => ({ bucket: b.bucket, count: b.count, total: b.total.toString() })),
+              })),
+            },
+          }))
+        } else if (isCsv) {
+          // CSV for unexplained money
+          const header = journalCsvRow([
+            journalCsvCell('type'),
+            journalCsvCell('expectation_id'),
+            journalCsvCell('reference'),
+            journalCsvCell('movement_id'),
+            journalCsvCell('account'),
+            journalCsvCell('direction_or_role'),
+            journalCsvCell('asset'),
+            journalCsvCell('original_amount'),
+            journalCsvCell('remaining_amount'),
+            journalCsvCell('due_at'),
+            journalCsvCell('days_past_due'),
+            journalCsvCell('bucket'),
+            journalCsvCell('exception_code'),
+          ])
+          await write(io.stdout, header)
+          for (const item of report.receivables.items) {
+            await write(io.stdout, journalCsvRow([
+              journalCsvCell('receivable'),
+              journalCsvCell(item.expectationId),
+              journalCsvCell(item.reference, true),
+              journalCsvCell(null),
+              journalCsvCell(item.account),
+              journalCsvCell(item.direction),
+              journalCsvCell(shortAsset(item.asset)),
+              journalCsvCell(fmt(item.originalAmount.raw, item.originalAmount.decimals)),
+              journalCsvCell(fmt(item.remainingAmount.raw, item.remainingAmount.decimals)),
+              journalCsvCell(item.dueAt?.toISOString().slice(0, 10) ?? null),
+              journalCsvCell(item.daysPastDue),
+              journalCsvCell(item.bucket),
+              journalCsvCell(null),
+            ]))
+          }
+          for (const item of report.payables.items) {
+            await write(io.stdout, journalCsvRow([
+              journalCsvCell('payable'),
+              journalCsvCell(item.expectationId),
+              journalCsvCell(item.reference, true),
+              journalCsvCell(null),
+              journalCsvCell(item.account),
+              journalCsvCell(item.direction),
+              journalCsvCell(shortAsset(item.asset)),
+              journalCsvCell(fmt(item.originalAmount.raw, item.originalAmount.decimals)),
+              journalCsvCell(fmt(item.remainingAmount.raw, item.remainingAmount.decimals)),
+              journalCsvCell(item.dueAt?.toISOString().slice(0, 10) ?? null),
+              journalCsvCell(item.daysPastDue),
+              journalCsvCell(item.bucket),
+              journalCsvCell(null),
+            ]))
+          }
+          for (const item of report.unexplainedMoney.items) {
+            await write(io.stdout, journalCsvRow([
+              journalCsvCell('unexplained'),
+              journalCsvCell(null),
+              journalCsvCell(null),
+              journalCsvCell(item.movementId),
+              journalCsvCell(item.account),
+              journalCsvCell(item.role),
+              journalCsvCell(shortAsset(item.asset)),
+              journalCsvCell(fmt(item.amount.raw, item.amount.decimals)),
+              journalCsvCell(fmt(item.amount.raw, item.amount.decimals)),
+              journalCsvCell(item.occurredAt.toISOString().slice(0, 10)),
+              journalCsvCell(item.daysSinceMovement),
+              journalCsvCell(item.bucket),
+              journalCsvCell(item.exceptionCode),
+            ]))
+          }
+        } else {
+          await write(io.stdout, `\nAging report as of ${report.asOf.toISOString().slice(0, 10)}\n`)
+          if (report.receivables.items.length > 0) {
+            await write(io.stdout, `\n=== RECEIVABLES ===\n`)
+            for (const a of report.receivables.byAsset) {
+              await write(io.stdout, `\n${shortAsset(a.asset)}  Total remaining: ${fmt(a.totalRemaining.raw, a.totalRemaining.decimals)}\n`)
+              const rows: string[][] = [['Bucket', 'Count', 'Total']]
+              for (const b of a.buckets) {
+                if (b.count > 0) rows.push([b.bucket, String(b.count), fmt(b.total.raw, b.total.decimals)])
+              }
+              await write(io.stdout, table(rows))
+            }
+          } else {
+            await write(io.stdout, '\nNo open receivables.\n')
+          }
+          if (report.payables.items.length > 0) {
+            await write(io.stdout, `\n=== PAYABLES ===\n`)
+            for (const a of report.payables.byAsset) {
+              await write(io.stdout, `\n${shortAsset(a.asset)}  Total remaining: ${fmt(a.totalRemaining.raw, a.totalRemaining.decimals)}\n`)
+              const rows: string[][] = [['Bucket', 'Count', 'Total']]
+              for (const b of a.buckets) {
+                if (b.count > 0) rows.push([b.bucket, String(b.count), fmt(b.total.raw, b.total.decimals)])
+              }
+              await write(io.stdout, table(rows))
+            }
+          } else {
+            await write(io.stdout, '\nNo open payables.\n')
+          }
+          if (report.unexplainedMoney.items.length > 0) {
+            await write(io.stdout, `\n=== UNEXPLAINED MONEY ===\n`)
+            const rows: string[][] = [['Role', 'Asset', 'Bucket', 'Count', 'Total']]
+            for (const g of report.unexplainedMoney.byRoleAndAsset) {
+              for (const b of g.buckets) {
+                if (b.count > 0) rows.push([g.role, shortAsset(g.asset), b.bucket, String(b.count), fmt(b.total.raw, b.total.decimals)])
+              }
+            }
+            await write(io.stdout, table(rows))
+          } else {
+            await write(io.stdout, '\nNo unexplained money.\n')
+          }
+        }
+        return 0
+      })
+    }
+
+    if (sub === 'gains') {
+      const assetIdStr = string(args, 'asset')
+      if (assetIdStr === undefined) throw new UsageError('gains requires --asset <id>.')
+      const assetId = parseAsset(assetIdStr) as AssetId
+      const account = string(args, 'account')
+      const from = date(args, 'from')
+      const to = date(args, 'to')
+      const methodArg = string(args, 'method')
+      const method = (methodArg === 'lifo' ? 'lifo' : 'fifo') as CostBasisMethod
+      return withStore(args, io, async (store) => {
+        const report = await costBasis({
+          store,
+          tenantId,
+          asset: assetId,
+          method,
+          ...(account !== undefined ? { account } : {}),
+          ...(from !== undefined ? { from } : {}),
+          ...(to !== undefined ? { to } : {}),
+        })
+        if (isJson) {
+          await write(io.stdout, json({
+            tenantId: report.tenantId,
+            asset: report.asset,
+            reportingAsset: report.reportingAsset,
+            method: report.method,
+            from: report.from?.toISOString() ?? null,
+            to: report.to?.toISOString() ?? null,
+            realizedGain: report.realizedGain?.toString() ?? null,
+            totalProceeds: report.totalProceeds?.toString() ?? null,
+            totalCost: report.totalCost.toString(),
+            unvaluedCredits: report.unvaluedCredits.length,
+            openLots: report.openLots.map((l) => ({
+              movementId: l.movementId,
+              occurredAt: l.occurredAt.toISOString(),
+              account: l.account,
+              remainingAmount: l.remainingAmount.toString(),
+              remainingCost: l.remainingCost.toString(),
+            })),
+            disposals: report.disposals.map((d) => ({
+              movementId: d.movementId,
+              occurredAt: d.occurredAt.toISOString(),
+              account: d.account,
+              amount: d.amount.toString(),
+              proceeds: d.proceeds?.toString() ?? null,
+              cost: d.cost.toString(),
+              gain: d.gain?.toString() ?? null,
+            })),
+          }))
+        } else {
+          await write(io.stdout, `\nRealised gains: ${shortAsset(report.asset)} (${report.method.toUpperCase()}) → ${shortAsset(report.reportingAsset)}\n`)
+          if (report.from || report.to) {
+            await write(io.stdout, `Period: ${report.from?.toISOString().slice(0, 10) ?? '(all)'} – ${report.to?.toISOString().slice(0, 10) ?? '(present)'}\n`)
+          }
+          if (report.disposals.length > 0) {
+            await write(io.stdout, `\n=== DISPOSALS ===\n`)
+            const rows: string[][] = [['Date', 'Movement', 'Amount', 'Proceeds', 'Cost', 'Gain/Loss']]
+            for (const d of report.disposals) {
+              rows.push([
+                d.occurredAt.toISOString().slice(0, 10),
+                d.movementId.slice(0, 8),
+                fmt(d.amount.raw, d.amount.decimals),
+                d.proceeds !== null ? fmt(d.proceeds.raw, d.proceeds.decimals) : '—',
+                fmt(d.cost.raw, d.cost.decimals),
+                d.gain !== null ? fmt(d.gain.raw, d.gain.decimals) : '—',
+              ])
+            }
+            await write(io.stdout, table(rows))
+            const { totalProceeds, totalCost, realizedGain } = report
+            await write(io.stdout, `\nTotal proceeds: ${totalProceeds !== null ? fmt(totalProceeds.raw, totalProceeds.decimals) : '—'}\n`)
+            await write(io.stdout, `Total cost:     ${fmt(totalCost.raw, totalCost.decimals)}\n`)
+            await write(io.stdout, `Realised gain:  ${realizedGain !== null ? fmt(realizedGain.raw, realizedGain.decimals) : '—'}\n`)
+          } else {
+            await write(io.stdout, '\nNo disposals in period.\n')
+          }
+          if (report.openLots.length > 0) {
+            await write(io.stdout, `\n=== OPEN LOTS ===\n`)
+            const rows: string[][] = [['Opened', 'Movement', 'Remaining', 'Cost']]
+            for (const l of report.openLots) {
+              rows.push([
+                l.occurredAt.toISOString().slice(0, 10),
+                l.movementId.slice(0, 8),
+                fmt(l.remainingAmount.raw, l.remainingAmount.decimals),
+                fmt(l.remainingCost.raw, l.remainingCost.decimals),
+              ])
+            }
+            await write(io.stdout, table(rows))
+          }
+          if (report.unvaluedCredits.length > 0) {
+            await write(io.stdout, `\nNote: ${report.unvaluedCredits.length} credit(s) had no valuation and could not open a lot.\n`)
+            await write(io.stdout, `Run "nostro value" to fetch prices, then re-run this report.\n`)
+          }
+          await write(io.stdout, `\nThis report is bookkeeping only — not tax advice. Local tax rules differ.\n`)
+        }
+        return 0
+      })
+    }
+
+    throw new UsageError(`Unknown report type ${JSON.stringify(sub)}. Use trial-balance, ledger, balance-sheet, income, aging or gains.`)
   },
 }

@@ -29,6 +29,7 @@ export const JOURNAL_CSV_COLUMNS = [
   'expectation_reference',
   'exception_id',
   'exception_code',
+  'value',
 ] as const
 
 export interface JournalCsvOptions {
@@ -41,6 +42,7 @@ export interface JournalCsvOptions {
   /** Entries read per page. Default 500. */
   readonly pageSize?: number
   /** Internal upper bound used to keep a multi-pass export on one journal snapshot. */
+  readonly afterSeq?: number
   readonly throughSeq?: number
   /** Target decimal places for exact, balanced rounding. Omit for unchanged output. */
   readonly decimals?: number
@@ -63,7 +65,7 @@ export const journalCsvRow = (cells: readonly string[]) => `${cells.join(',')}\r
 async function* journalEntryPages(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry[]> {
   const { store, tenantId } = options
   const pageSize = options.pageSize ?? 500
-  let afterSeq: number | undefined
+  let afterSeq = includeBeforeFrom ? undefined : options.afterSeq
   for (;;) {
     const page = await store.listJournalEntries({
       tenantId,
@@ -96,7 +98,6 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
   const allColumns = [...JOURNAL_CSV_COLUMNS, ...dimColumnNames]
   yield journalCsvRow(allColumns.map((c) => c))
 
-  const expectationMetadatas = new Map<string, Record<string, string | null>>()
   const rounder = options.decimals === undefined ? null : new JournalRounder(options.decimals)
 
   for await (const originalPage of journalEntryPages(options, rounder !== null)) {
@@ -113,17 +114,19 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
     const txHash = new Map(movements.map((movement) => [movement.id, movement.txHash]))
     const reference = new Map(expectations.map((expectation) => [expectation.id, expectation.reference]))
     const codes = new Map(exceptions.map((exception) => [exception.id, exception.code]))
+    const valuations = new Map(await Promise.all(movementIds.map(async (id) => [id, (await store.getValuation(tenantId, id))?.value.toString() ?? null] as const)))
     const expectationMetadatas = new Map(expectations.map((expectation) => [expectation.id, expectation.metadata]))
 
     for (const original of page) {
       const entry = rounder === null ? original : rounder.round(original)
+      if (options.afterSeq !== undefined && original.seq <= options.afterSeq) continue
       if (rounder !== null && options.from !== undefined && original.effectiveAt < options.from) continue
       for (const [i, line] of entry.lines.entries()) {
         const expectationId = line.expectationId ?? null
         const amount = line.amount.toString()
         const dimCells: string[] = []
         for (const dim of dimColumnNames) {
-          const metadata = expectationMetadatas.get(expectationId) ?? {}
+          const metadata = (expectationId === null ? undefined : expectationMetadatas.get(expectationId)) ?? {}
           const val = metadata[dim] ?? ''
           dimCells.push(journalCsvCell(val, true))
         }
@@ -143,9 +146,10 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
           journalCsvCell(entry.movementId),
           journalCsvCell(entry.movementId === null ? null : (txHash.get(entry.movementId) ?? null)),
           journalCsvCell(line.expectationId === null ? null : (reference.get(line.expectationId) ?? null), true),
-          ...dimCells,
           journalCsvCell(line.exceptionId),
           journalCsvCell(line.exceptionId === null ? null : (codes.get(line.exceptionId) ?? null)),
+          journalCsvCell(entry.movementId === null ? null : (valuations.get(entry.movementId) ?? null)),
+          ...dimCells,
         ])
       }
     }

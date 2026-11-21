@@ -349,6 +349,24 @@ export function checkJournalEntry(
       throw new ConstraintError('journal_unbalanced', `${key.split('/')[0]} is out by ${total} raw units`)
     }
   }
+  if (movement === null || entry.kind === 'manual') {
+    for (const line of entry.lines) {
+      if (BALANCE_ROLES.has(line.role)) {
+        throw new ConstraintError(
+          'journal_cash_without_movement',
+          `a manual entry cannot touch ${line.role}: cash only changes when money moves on the chain`,
+        )
+      }
+    }
+  }
+  if (entry.kind === 'manual' || movement === null) {
+    if (entry.kind === 'manual' && movement !== null) {
+      throw new ConstraintError('journal_manual_slot', 'manual entries cannot name a movement; use the movement resolution API')
+    }
+    if (entry.lines.some(line => ['unapplied', 'customer_credit', 'unexplained'].includes(line.role))) {
+      throw new ConstraintError('journal_manual_slot', 'movement balance roles require a movement; use other for independent adjustments')
+    }
+  }
   if (movement === null) return
 
   const expected = existing.length + 1
