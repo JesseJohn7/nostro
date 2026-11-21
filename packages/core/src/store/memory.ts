@@ -42,6 +42,8 @@ import {
   assertValidNewMovement,
 } from '../model/index.js'
 import type {
+  RefundLink,
+  RefundQuery,
   ExportBatch,
   AllocationQuery,
   ExceptionQuery,
@@ -71,6 +73,7 @@ import {
   sameFacts,
 } from './rules.js'
 import { Money } from '../money/index.js'
+import { refundParts, refundCoverage } from './refunds.js'
 import { postAccrual } from './accrual.js'
 import { ConstraintError, NotFoundError, TransactionClosedError } from './store.js'
 import { EventHistoryPrunedError } from './events.js'
@@ -105,6 +108,7 @@ interface State {
   readonly eventPrunedThrough: Map<string, number>
   /** Movement id → its entry ids in posting order. Arrays are replaced, never pushed to. */
   readonly journalByMovement: Map<string, readonly string[]>
+  readonly refunds: Map<string, RefundLink>
   readonly valuations: Map<string, MovementValuation>
   periodActions: readonly {
     readonly tenantId: string
@@ -134,6 +138,7 @@ function emptyState(): State {
     events: new Map(),
     eventPrunedThrough: new Map(),
     periodActions: [],
+    refunds: new Map(),
     valuations: new Map(),
   }
 }
@@ -157,6 +162,7 @@ function cloneState(s: State): State {
     events: new Map(s.events),
     eventPrunedThrough: new Map(s.eventPrunedThrough),
     periodActions: [...s.periodActions],
+    refunds: new Map(s.refunds),
     valuations: new Map(s.valuations),
   }
 }
@@ -190,6 +196,14 @@ abstract class MemoryReader implements StoreReader {
 
   protected check(): void {}
 
+  async listRefundLinks(q: RefundQuery): Promise<RefundLink[]> {
+    this.check()
+    return [...this.snapshot().refunds.values()].filter(link => link.tenantId === q.tenantId &&
+      (q.creditMovementId === undefined || link.creditMovementId === q.creditMovementId) &&
+      (q.refundMovementId === undefined || link.refundMovementId === q.refundMovementId) &&
+      (q.movementIds === undefined || q.movementIds.includes(link.creditMovementId) || q.movementIds.includes(link.refundMovementId)))
+  }
+
   async accrualGetMode(_tenantId: string): Promise<boolean> { this.check(); return false }
 
   async getMovement(tenantId: string, id: string): Promise<Movement | null> {
@@ -208,6 +222,7 @@ abstract class MemoryReader implements StoreReader {
       if (ids !== null && !ids.has(m.id)) continue
       if (q.disposition !== undefined && m.disposition !== q.disposition) continue
       if (q.account !== undefined && m.account !== q.account) continue
+      if (q.txHash !== undefined && m.txHash !== q.txHash) continue
       if (q.afterSeq !== undefined && m.seq <= q.afterSeq) continue
       out.push(m)
     }
@@ -529,6 +544,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       [...this.draft.exceptions.values()].filter((e) => e.movementId === m.id),
       disposition,
       reason,
+      refundCoverage(m, await this.listRefundLinks({tenantId,movementIds:[m.id]})),
     )
     const next: Movement = Object.freeze({
       ...m,
@@ -672,6 +688,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       e,
       this.allocationsOf('movementId', m.id),
       this.allocationsOf('expectationId', e.id),
+      refundCoverage(m, await this.listRefundLinks({tenantId:n.tenantId,movementIds:[m.id]})),
     )
 
     const now = this.now()
@@ -782,6 +799,19 @@ class MemoryTx extends MemoryReader implements StoreTx {
 
   async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
     await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink> {
+    this.check()
+    const [existing] = await this.listRefundLinks({tenantId,refundMovementId})
+    if (existing) {
+      if (existing.creditMovementId !== creditMovementId) throw new ConstraintError('refund_invalid','refund already linked to another credit')
+      return existing
+    }
+    const parts = await refundParts(this,tenantId,creditMovementId,refundMovementId)
+    const link = Object.freeze({id:this.ids(),...parts,createdAt:this.now()})
+    this.draft.refunds.set(link.id,link)
+    return link
   }
 
   async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {

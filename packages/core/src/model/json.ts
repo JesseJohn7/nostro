@@ -8,6 +8,7 @@
  * date is an ISO 8601 string. Nothing is a float, and nothing is rounded.
  * Tenant ids are left out: whoever is asking already knows which tenant.
  */
+import type { RefundLink } from '../store/store.js'
 import type { AssetId } from '../money/index.js'
 import type {
   Allocation,
@@ -237,4 +238,9 @@ export function journalEntryJson(j: JournalEntry): JournalEntryJson {
       exceptionId: l.exceptionId,
     })),
   }
+}
+
+export function refundLinkJson(link: RefundLink) {
+  return {id:link.id,creditMovementId:link.creditMovementId,refundMovementId:link.refundMovementId,
+    asset:link.amount.asset,amount:link.amount.toString(),residualAmount:link.residualAmount.toString(),createdAt:link.createdAt.toISOString()}
 }

@@ -746,3 +746,22 @@ describe('manual journal entries (issue #61)', () => {
     expect(noReason.statusCode).toBe(400)
   })
 })
+
+describe('refund movement details',()=>{
+  it('exposes exact refund links on both movements without exposing another tenant',async()=>{
+    const store=new MemoryStore()
+    const txHash='ab'.repeat(32)
+    const {inserted}=await store.transaction(tx=>tx.insertMovements([
+      {tenantId:'acme',account:A,network:'testnet',source:'fixture',externalId:'refund-credit',direction:'credit',kind:'transfer',amount:Money.parse('10',NATIVE),ledger:1,txHash,occurredAt:new Date('2026-10-01')},
+      {tenantId:'acme',account:A,network:'testnet',source:'fixture',externalId:'refund-debit',direction:'debit',kind:'transfer',amount:Money.parse('4',NATIVE),ledger:2,memo:{type:'return',value:txHash},occurredAt:new Date('2026-10-02')},
+    ]))
+    await reconcile({store,tenantId:'acme'})
+    const app=server(store)
+    for(const movement of inserted){
+      const response=await app.inject({url:`/v1/movements/${movement.id}`,headers:auth()})
+      expect(response.statusCode).toBe(200)
+      expect(response.json().refunds).toEqual([expect.objectContaining({creditMovementId:inserted[0]!.id,refundMovementId:inserted[1]!.id,amount:'4.0000000',residualAmount:'4.0000000',asset:'native'})])
+      expect((await app.inject({url:`/v1/movements/${movement.id}`,headers:auth(OTHER_KEY)})).statusCode).toBe(404)
+    }
+  })
+})

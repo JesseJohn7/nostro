@@ -45,6 +45,8 @@ import type {
   NewOutboxEvent,
   OutboxEvent,
   PruneEventsResult,
+  RefundLink,
+  RefundQuery,
   Resolution,
   SchemaVersion,
   StoreReader,
@@ -55,6 +57,9 @@ import type {
   ValuationQuery,
 } from '@nostro-labs/nostro'
 import {
+  refundParts,
+  refundCoverage,
+  refundLinkFromRow,
   postAccrual,
   ConstraintError,
   Money,
@@ -315,6 +320,7 @@ class SqliteReader implements StoreReader {
       .in('id', q.ids)
       .add('disposition = ?', q.disposition)
       .add('account = ?', q.account)
+      .add('tx_hash = ?', q.txHash)
       .add('seq > ?', q.afterSeq)
     return this.all(`SELECT * FROM movements${w} ORDER BY seq${w.limit(q.limit)}`, w.params).map(toMovement)
   }
@@ -436,6 +442,20 @@ class SqliteReader implements StoreReader {
       note: row.note as string | null,
       closedAt: new Date(row.created_at as number),
     })
+  }
+
+  async listRefundLinks(q: RefundQuery): Promise<RefundLink[]> {
+    if (q.movementIds?.length === 0) return []
+    const params: Param[] = [q.tenantId]
+    let sql = 'SELECT * FROM refund_links WHERE tenant_id = ?'
+    if (q.creditMovementId !== undefined) {sql += ' AND credit_movement_id = ?'; params.push(q.creditMovementId)}
+    if (q.refundMovementId !== undefined) {sql += ' AND refund_movement_id = ?'; params.push(q.refundMovementId)}
+    if (q.movementIds !== undefined) {
+      const slots=q.movementIds.map(()=>'?').join(',')
+      sql += ` AND (credit_movement_id IN (${slots}) OR refund_movement_id IN (${slots}))`
+      params.push(...q.movementIds,...q.movementIds)
+    }
+    return this.all(sql+' ORDER BY seq',params).map(refundLinkFromRow)
   }
 
   async accrualGetMode(tenantId: string): Promise<boolean> {
@@ -670,6 +690,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
       await this.listExceptions({ tenantId, movementId }),
       disposition,
       reason,
+      refundCoverage(m,await this.listRefundLinks({tenantId,movementIds:[m.id]})),
     )
     const next = toMovement(
       this.one('UPDATE movements SET disposition = ?, ignored_reason = ? WHERE id = ? RETURNING *', [
@@ -813,6 +834,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
       e,
       await this.listAllocations({ tenantId: n.tenantId, movementId: m.id }),
       await this.listAllocations({ tenantId: n.tenantId, expectationId: e.id }),
+      refundCoverage(m,await this.listRefundLinks({tenantId:n.tenantId,movementIds:[m.id]})),
     )
     const now = this.now().getTime()
     const row = this.one(
@@ -931,6 +953,18 @@ class SqliteTx extends SqliteReader implements StoreTx {
 
   async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
     await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink> {
+    const [existing]=await this.listRefundLinks({tenantId,refundMovementId})
+    if (existing) {
+      if (existing.creditMovementId !== creditMovementId) throw new ConstraintError('refund_invalid','refund already linked to another credit')
+      return existing
+    }
+    const parts=await refundParts(this,tenantId,creditMovementId,refundMovementId)
+    const row=this.one(`INSERT INTO refund_links(id,tenant_id,credit_movement_id,refund_movement_id,asset,decimals,amount,residual_amount,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?) RETURNING *`,[this.ids(),tenantId,creditMovementId,refundMovementId,parts.amount.asset,parts.amount.decimals,parts.amount.raw.toString(),parts.residualAmount.raw.toString(),this.now().getTime()])!
+    return refundLinkFromRow(row)
   }
 
   async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {

@@ -454,4 +454,27 @@ PRIMARY KEY (tenant_id, destination)
     );
     CREATE INDEX IF NOT EXISTS movement_valuations_reporting ON movement_valuations (tenant_id, reporting_asset);
   `,
+  `
+    CREATE TABLE refund_links (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL,
+      credit_movement_id TEXT NOT NULL REFERENCES movements(id), refund_movement_id TEXT NOT NULL UNIQUE REFERENCES movements(id),
+      asset TEXT NOT NULL, decimals INTEGER NOT NULL CHECK(decimals BETWEEN 0 AND 38),
+      amount TEXT NOT NULL ${positive('amount')}, residual_amount TEXT NOT NULL, created_at INTEGER NOT NULL
+    );
+    CREATE INDEX refund_credit ON refund_links(tenant_id,credit_movement_id,seq);
+    CREATE INDEX IF NOT EXISTS movements_transaction ON movements(tenant_id,account,tx_hash);
+    ${appendOnly('refund_links')}
+    CREATE TABLE journal_lines_refunds (
+      entry_id TEXT NOT NULL REFERENCES journal_entries(id), line_no INTEGER NOT NULL CHECK(line_no>=1),
+      tenant_id TEXT NOT NULL, account TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN (${LINE_ROLES},'other','refund_clearing')),
+      side TEXT NOT NULL CHECK(side IN ('debit','credit')), asset TEXT NOT NULL, decimals INTEGER NOT NULL CHECK(decimals BETWEEN 0 AND 38),
+      amount TEXT NOT NULL ${positive('amount')}, expectation_id TEXT REFERENCES expectations(id), exception_id TEXT REFERENCES exceptions(id),
+      PRIMARY KEY(entry_id,line_no)
+    );
+    INSERT INTO journal_lines_refunds SELECT * FROM journal_lines;
+    DROP TABLE journal_lines;
+    ALTER TABLE journal_lines_refunds RENAME TO journal_lines;
+    CREATE INDEX journal_lines_account ON journal_lines(tenant_id,account,asset);
+    ${appendOnly('journal_lines')}
+  `,
 ]

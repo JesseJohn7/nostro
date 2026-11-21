@@ -83,6 +83,7 @@ export function checkAllocation(
   expectation: Expectation,
   onMovement: readonly Allocation[],
   onExpectation: readonly Allocation[],
+  returned: Money = Money.zero(movement.amount.asset,movement.amount.decimals),
 ): ExpectationStatus {
   if (expectation.status === 'cancelled') {
     throw new ConstraintError('allocation_expectation_cancelled', `expectation ${expectation.id} is cancelled`)
@@ -119,7 +120,7 @@ export function checkAllocation(
       `movement ${movement.id} is already allocated to expectation ${expectation.id}`,
     )
   }
-  const movementTotal = sumAmounts(onMovement.map((a) => a.amount), movement.amount).add(allocation.amount)
+  const movementTotal = sumAmounts(onMovement.map((a) => a.amount), movement.amount).add(allocation.amount).add(returned)
   if (movementTotal.compare(movement.amount) > 0) {
     throw new ConstraintError(
       'allocation_over_movement',
@@ -145,8 +146,9 @@ export function checkDisposition(
   exceptions: readonly ExceptionRecord[],
   disposition: Disposition,
   reason?: string,
+  returned: Money = Money.zero(movement.amount.asset,movement.amount.decimals),
 ): void {
-  const allocated = sumAmounts(allocations.map((a) => a.amount), movement.amount)
+  const allocated = sumAmounts(allocations.map((a) => a.amount), movement.amount).add(returned)
   const refuse = (why: string): never => {
     throw new ConstraintError(
       'disposition_unsupported',

@@ -127,7 +127,7 @@ export async function agingReport(options: AgingReportOptions): Promise<AgingRep
       ...(afterSeqExp !== undefined ? { afterSeq: afterSeqExp } : {}),
     })
     for (const e of page) {
-      expectations.push(e)
+      if (e.createdAt <= asOf) expectations.push(e)
     }
     if (page.length < PAGE) break
     afterSeqExp = page[page.length - 1]!.seq
@@ -147,11 +147,6 @@ export async function agingReport(options: AgingReportOptions): Promise<AgingRep
   const payableItems: ExpectationAgingItem[] = []
 
   for (const exp of expectations) {
-    // If due after asOf, it is not yet due as of that date
-    if (exp.dueAt !== null && exp.dueAt > asOf) {
-      continue
-    }
-
     // If cancelled before or at asOf, skip
     if (exp.status === 'cancelled' && exp.updatedAt <= asOf) {
       continue

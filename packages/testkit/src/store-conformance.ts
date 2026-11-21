@@ -1,3 +1,4 @@
+import { describeRefundConformance } from './refund-conformance.js'
 /**
  * The `Store` contract, as executable tests.
  *
@@ -59,6 +60,7 @@ function movement(over: Partial<NewMovement> = {}): NewMovement {
 const constraint = (name: string) => ({ name: 'ConstraintError', constraint: name })
 
 export function describeStoreConformance(name: string, makeStore: () => Store | Promise<Store>): void {
+  describeRefundConformance(name, makeStore)
   describeJournalConformance(name, makeStore)
   describe(`Store conformance: ${name}`, () => {
     let store: Store

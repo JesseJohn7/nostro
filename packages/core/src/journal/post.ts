@@ -33,7 +33,7 @@ export async function postMovement(
     await tx.listAllocations({ tenantId, movementId }),
     await tx.listExceptions({ tenantId, movementId }),
     await tx.listJournalEntries({ tenantId, movementId }),
-    options,
+    {...options,refunds:await tx.listRefundLinks({tenantId,movementIds:[movementId]})},
   )
   if (plan === null) return null
   if (

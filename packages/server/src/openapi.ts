@@ -77,7 +77,7 @@ export function buildOpenApi() {
       '/v1/movements/{id}': {
         get: {
           operationId: 'getMovement',
-          summary: 'One movement, with its allocations, exceptions and journal entries',
+          summary: 'One movement, with its allocations, refunds, exceptions and journal entries',
           parameters: [idParam('movement')],
           responses: { '200': ok('MovementDetail'), '404': problem('No such movement in this tenant (`not_found`).'), ...errors },
         },

@@ -377,3 +377,21 @@ const report = await costBasis({ store, tenantId: 'acme', asset: NATIVE, method:
 - **Journal reconciliation:** Unexplained money totals equal the matching ledger balances in the journal.
 
 **CLI:** `nostro report aging [--as-of YYYY-MM-DD] [--buckets 30,60,90] [--json] [--csv]`
+
+
+## Refunds
+
+A return-memo debit is linked to its original credit in the same transaction as reconciliation.
+Returned unallocated money moves the original credit's `customer_credit` or `unapplied` slot to
+`refund_clearing`; the outgoing debit clears that role against cash. `refund_clearing` uses
+`liabilities:refund-clearing` by default and nets to zero when both movements are posted.
+
+Example: 15 XLM paid a 10 XLM invoice, then 7 XLM was returned. The original receipt remains
+Dr cash 15 / Cr receivable 10, with its remaining Cr customer credit 5 reclassified to
+Cr refund clearing 5. The return is Dr refund clearing 5 / Dr uncategorized expense 2 / Cr cash 7.
+The invoice stays settled. Partial returns clear only their exact portion; a larger return than the
+original credit permits becomes `REFUND_UNLINKED` and is left for a person.
+
+Links and journal entries are append-only. Repeated reconciliation and journal sweeps change
+nothing, I1 includes the recorded returned amount, I3 balances each entry per asset, and aging
+reports exclude the returned residual. [Matching policy](./matching.md#refunds-recorded-by-return-memo).

@@ -41,6 +41,7 @@ export interface MovementQuery {
   readonly tenantId: string
   /** Restrict to these ids; an empty list matches no movements. */
   readonly ids?: readonly string[]
+  readonly txHash?: string
   readonly disposition?: Disposition
   readonly account?: string
   /** Return movements with `seq` greater than this; for paging in ingest order. */
@@ -118,8 +119,27 @@ export interface JournalPeriod {
   readonly closedAt: Date
 }
 
+/** An immutable return of money to its original credit, in that credit's asset. */
+export interface RefundLink {
+  readonly id: string
+  readonly tenantId: string
+  readonly creditMovementId: string
+  readonly refundMovementId: string
+  readonly amount: Money
+  /** Part returning previously unallocated money; the remainder is a sales return expense. */
+  readonly residualAmount: Money
+  readonly createdAt: Date
+}
+export interface RefundQuery {
+  readonly tenantId: string
+  readonly creditMovementId?: string
+  readonly refundMovementId?: string
+  readonly movementIds?: readonly string[]
+}
+
 /** Read access. Every lookup is scoped by tenant; ids from another tenant read as absent. */
 export interface StoreReader extends JournalReader {
+  listRefundLinks(query: RefundQuery): Promise<RefundLink[]>
   accrualGetMode(tenantId: string): Promise<boolean>
   getMovement(tenantId: string, id: string): Promise<Movement | null>
   listMovements(query: MovementQuery): Promise<Movement[]>
@@ -159,6 +179,7 @@ export interface StoreReader extends JournalReader {
  * default isolation level.
  */
 export interface StoreTx extends StoreReader, JournalTx {
+  linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink>
   postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
   /** Lock the tenant's close state until this transaction ends, then return it. */
   lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null>
@@ -317,6 +338,8 @@ export type ConstraintName =
   | 'disposition_unsupported'
   | 'movement_not_open'
   | 'exception_not_open'
+  | 'refund_invalid'
+  | 'refund_over_credit'
   | 'journal_manual_slot'
   | 'journal_unbalanced'
   | 'journal_posting_conflict'

@@ -356,11 +356,13 @@ export const components = {
     createdAt: time,
     data: { type: 'object', description: 'The records the event is about, as they were; see docs/webhooks.md.' },
   }),
+  RefundLink: record({id:str,creditMovementId:str,refundMovementId:str,asset:str,amount:str,residualAmount:str,createdAt:{type:'string',format:'date-time'}}),
   MovementDetail: record({
     movement: ref('Movement'),
     allocations: { type: 'array', items: ref('Allocation') },
     exceptions: { type: 'array', items: ref('Exception') },
     journal: { type: 'array', items: ref('JournalEntry') },
+    refunds: { type: 'array', items: ref('RefundLink') },
   }),
   ExpectationDetail: record({
     expectation: ref('Expectation'),

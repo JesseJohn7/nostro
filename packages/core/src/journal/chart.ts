@@ -62,6 +62,7 @@ export interface ChartOfAccounts {
   readonly network_fees: string
   readonly uncategorized_income: string
   readonly conversion: string
+  readonly refund_clearing: string
   readonly other: string
   readonly uncategorized_expense: string
 }
@@ -79,6 +80,7 @@ export const DEFAULT_CHART: ChartOfAccounts = {
   uncategorized_expense: 'expenses:uncategorized',
   conversion: 'equity:conversion',
   other: 'equity:adjustments',
+  refund_clearing: 'liabilities:refund-clearing',
 }
 
 /** The account a role posts to for a movement on `account` in `network`. */

@@ -24,6 +24,7 @@
  * muxed address or quoted the reference again. Settled candidates have nothing
  * owing, which the engine already refuses; no engine change is needed.
  */
+import { recogniseRefund } from './refunds.js'
 import type { PostOptions } from '../journal/index.js'
 import { postMovement } from '../journal/index.js'
 import type { ExceptionCode, Expectation, Movement } from '../model/index.js'
@@ -105,15 +106,37 @@ async function reconcileOne(
   tenantId: string,
   id: string,
   options: ReconcileOptions,
-): Promise<{ outcome: Outcome; posted: boolean }> {
-  const outcome = await decideOne(tx, tenantId, id, options)
-  if (outcome === 'skipped') return { outcome, posted: false }
-  return { outcome, posted: (await postMovement(tx, tenantId, id, options)) !== null }
+): Promise<{ outcome: Outcome; posted: number }> {
+  let extraPostings = 0
+  const outcome = await decideOne(tx, tenantId, id, options, () => {
+    extraPostings++
+  })
+  if (outcome === 'skipped') return { outcome, posted: 0 }
+  return { outcome, posted: extraPostings + Number((await postMovement(tx, tenantId, id, options)) !== null) }
 }
 
-async function decideOne(tx: StoreTx, tenantId: string, id: string, options: DecideOptions): Promise<Outcome> {
+async function decideOne(
+  tx: StoreTx,
+  tenantId: string,
+  id: string,
+  options: ReconcileOptions,
+  onPost: () => void = () => {},
+): Promise<Outcome> {
   const movement = await tx.getMovement(tenantId, id)
   if (movement === null || movement.disposition !== 'pending') return 'skipped'
+
+  if (movement.direction === 'debit' && movement.kind === 'transfer' && movement.memo?.type === 'return') {
+    return recogniseRefund(
+      tx,
+      movement,
+      options,
+      async (creditId) => {
+        await decideOne(tx, tenantId, creditId, options, onPost)
+        if (await postMovement(tx, tenantId, creditId, options)) onPost()
+      },
+      onPost,
+    )
+  }
 
   const decision = decide(movement, await candidatesFor(tx, movement), options)
   switch (decision.outcome) {
@@ -153,7 +176,8 @@ async function decideOne(tx: StoreTx, tenantId: string, id: string, options: Dec
         expectationId: decision.expectationId,
         account: movement.account,
         amount: decision.residual,
-        detail: `Paid ${movement.amount.toString()}; ${decision.amount.toString()} settled the expectation, ` +
+        detail:
+          `Paid ${movement.amount.toString()}; ${decision.amount.toString()} settled the expectation, ` +
           `${decision.residual.toString()} is left over.`,
         evidence: decision.evidence,
       })
@@ -174,7 +198,7 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRep
   for (const { id } of pending) {
     try {
       const { outcome, posted } = await store.transaction((tx) => reconcileOne(tx, tenantId, id, options))
-      if (posted) journalEntries += 1
+      journalEntries += posted
       if (outcome in counts) counts[outcome as keyof typeof counts] += 1
       else exceptions[outcome as ExceptionCode] = (exceptions[outcome as ExceptionCode] ?? 0) + 1
     } catch (err) {

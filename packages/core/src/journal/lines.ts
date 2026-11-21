@@ -20,6 +20,8 @@ import type {
   NewJournalLine,
   Side,
 } from '../model/index.js'
+import type { RefundLink } from '../store/index.js'
+import { refundCoverage } from '../store/refunds.js'
 import { Money, issuerOf } from '../money/index.js'
 import type { ChartOfAccounts, PostingRule } from './chart.js'
 import { DEFAULT_CHART, accountFor, applyRules } from './chart.js'
@@ -50,6 +52,7 @@ export function desiredLines(
   movement: Movement,
   allocations: readonly Allocation[],
   exceptions: readonly ExceptionRecord[],
+  refunds: readonly RefundLink[] = [],
 ): DesiredLine[] | null {
   if (movement.disposition === 'pending') return null
 
@@ -68,7 +71,16 @@ export function desiredLines(
       exceptionId: null,
     },
   ]
-  let left = movement.amount
+  const refund = refunds.find(link => link.refundMovementId === movement.id)
+  if (refund) {
+    if (refund.residualAmount.isPositive()) lines.push({role:'refund_clearing',side:'debit',amount:refund.residualAmount,expectationId:null,exceptionId:null})
+    const expense=refund.amount.subtract(refund.residualAmount)
+    if (expense.isPositive()) lines.push({role:'uncategorized_expense',side:'debit',amount:expense,expectationId:null,exceptionId:null})
+    return lines
+  }
+  const returned=refundCoverage(movement,refunds)
+  if (returned.isPositive()) lines.push({role:'refund_clearing',side:other,amount:returned,expectationId:null,exceptionId:null})
+  let left = movement.amount.subtract(returned)
   for (const a of allocations) {
     lines.push({
       role: credit ? 'receivable' : 'payable',
@@ -163,6 +175,7 @@ function describe(kind: JournalEntryKind, movement: Movement): string {
 }
 
 export interface PostingPlanOptions {
+  readonly refunds?: readonly RefundLink[]
   readonly chart?: ChartOfAccounts
   /**
    * Ordered posting rules checked before the chart. The first matching rule
@@ -192,7 +205,7 @@ export function planPosting(
   existing: readonly JournalEntry[],
   options: PostingPlanOptions = {},
 ): NewJournalEntry | null {
-  const desired = desiredLines(movement, allocations, exceptions)
+  const desired = desiredLines(movement, allocations, exceptions, options.refunds)
   if (desired === null) return null
 
   const delta = diffLines(desired, existing)

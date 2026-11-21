@@ -58,6 +58,7 @@ async function recordsOf(reader: StoreReader, tenantId: string, movement: Moveme
   const movementId = movement.id
   return {
     movement,
+    refunds: await reader.listRefundLinks({tenantId,movementIds:[movementId]}),
     allocations: await reader.listAllocations({ tenantId, movementId }),
     exceptions: await reader.listExceptions({ tenantId, movementId }),
     entries: await reader.listJournalEntries({ tenantId, movementId }),
@@ -93,10 +94,11 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   for (let afterSeq: number | undefined; ; ) {
     const page = await store.listMovements({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
     const movementIds = page.map((movement) => movement.id)
-    const [pageAllocations, pageExceptions, pageEntries] = await Promise.all([
+    const [pageAllocations, pageExceptions, pageEntries, pageRefunds] = await Promise.all([
       store.listAllocations({ tenantId, movementIds }),
       store.listExceptions({ tenantId, movementIds }),
       store.listJournalEntries({ tenantId, movementIds }),
+      store.listRefundLinks({tenantId,movementIds}),
     ])
     const allocationsByMovement = new Map<string, typeof pageAllocations>()
     const exceptionsByMovement = new Map<string, typeof pageExceptions>()
@@ -129,6 +131,7 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
       }
       let found = checkMovement({
         movement: m,
+        refunds: pageRefunds.filter(link=>link.creditMovementId===m.id || link.refundMovementId===m.id),
         allocations: allocationsByMovement.get(m.id) ?? [],
         exceptions: exceptionsByMovement.get(m.id) ?? [],
         entries: entriesByMovement.get(m.id) ?? [],

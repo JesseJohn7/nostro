@@ -82,7 +82,7 @@ describe('bucketNameForDays', () => {
 // ---------------------------------------------------------------------------
 describe('agingReport', () => {
   async function storeWithExpectation() {
-    const store = new MemoryStore()
+    const store = new MemoryStore({now:()=>new Date('2026-09-01T00:00:00Z')})
     const exp: NewExpectation = {
       tenantId: T,
       reference: 'INV-001',
@@ -107,7 +107,7 @@ describe('agingReport', () => {
     expect(item.bucket).toBe('1-30')
   })
 
-  it('reports no receivables when asOf is before dueAt', async () => {
+  it('reports no receivables before the expectation was created', async () => {
     const store = await storeWithExpectation()
     const report = await agingReport({ store, tenantId: T, asOf: new Date('2026-08-01T00:00:00Z') })
     // The expectation was created on 2026-09-01; asOf is before that so no items
@@ -115,7 +115,7 @@ describe('agingReport', () => {
   })
 
   it('handles expectations with no due date in no_due_date bucket', async () => {
-    const store = new MemoryStore()
+    const store = new MemoryStore({now:()=>new Date('2026-09-01T00:00:00Z')})
     await store.transaction((tx) =>
       tx.insertExpectation({
         tenantId: T,
@@ -132,7 +132,8 @@ describe('agingReport', () => {
   })
 
   it('reports a partial payment correctly', async () => {
-    const store = new MemoryStore()
+    let clock=new Date('2026-09-01T00:00:00Z')
+    const store = new MemoryStore({now:()=>clock})
     await store.transaction((tx) =>
       tx.insertExpectation({
         tenantId: T,
@@ -148,6 +149,7 @@ describe('agingReport', () => {
     const mov = await store.transaction((tx) =>
       tx.insertMovements([newMovement({ amount: usdc('40') })]).then((r) => r.inserted[0]!),
     )
+    clock=new Date('2026-10-15T00:00:00Z')
     await store.transaction((tx) =>
       tx.allocate({ tenantId: T, movementId: mov.id, expectationId: exp.id, amount: usdc('40'), strategy: 'manual' }),
     )
@@ -162,7 +164,7 @@ describe('agingReport', () => {
   })
 
   it('byAsset totals match the sum of remaining amounts', async () => {
-    const store = new MemoryStore()
+    const store = new MemoryStore({now:()=>new Date('2026-09-01T00:00:00Z')})
     await store.transaction((tx) =>
       tx.insertExpectation({ tenantId: T, reference: 'A', account: ACCOUNT, direction: 'credit', amount: usdc('100'), dueAt: new Date('2026-09-01T00:00:00Z') }),
     )
@@ -175,7 +177,7 @@ describe('agingReport', () => {
   })
 
   it('reports payables separately from receivables', async () => {
-    const store = new MemoryStore()
+    const store = new MemoryStore({now:()=>new Date('2026-09-01T00:00:00Z')})
     await store.transaction((tx) =>
       tx.insertExpectation({ tenantId: T, reference: 'PAY-001', account: ACCOUNT, direction: 'debit', amount: usdc('50'), dueAt: null }),
     )
@@ -185,7 +187,7 @@ describe('agingReport', () => {
   })
 
   it('uses custom bucket boundaries', async () => {
-    const store = new MemoryStore()
+    const store = new MemoryStore({now:()=>new Date('2026-09-01T00:00:00Z')})
     await store.transaction((tx) =>
       tx.insertExpectation({ tenantId: T, reference: 'C', account: ACCOUNT, direction: 'credit', amount: usdc('10'), dueAt: new Date('2026-09-15T00:00:00Z') }),
     )

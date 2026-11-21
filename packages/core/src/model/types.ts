@@ -311,6 +311,7 @@ export type LineRole =
   | 'uncategorized_income'
   | 'uncategorized_expense'
   | 'conversion'
+  | 'refund_clearing'
   | 'other'
 
 export const LINE_ROLES: readonly LineRole[] = [
@@ -325,6 +326,7 @@ export const LINE_ROLES: readonly LineRole[] = [
   'uncategorized_income',
   'uncategorized_expense',
   'conversion',
+  'refund_clearing',
   'other',
 ]
 
@@ -444,4 +446,3 @@ export interface ValuationQuery {
   readonly movementId?: string
   readonly reportingAsset?: AssetId
 }
-

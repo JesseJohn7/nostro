@@ -45,6 +45,8 @@ import type {
   NewOutboxEvent,
   OutboxEvent,
   PruneEventsResult,
+  RefundLink,
+  RefundQuery,
   Resolution,
   SchemaVersion,
   StoreReader,
@@ -54,6 +56,9 @@ import type {
   ValuationQuery,
 } from '@nostro-labs/nostro'
 import {
+  refundParts,
+  refundCoverage,
+  refundLinkFromRow,
   postAccrual,
   Money,
   ConstraintError,
@@ -154,6 +159,7 @@ class PgReader implements StoreReader {
       .add((p) => `id = ANY(${p}::text[])`, q.ids === undefined ? undefined : [...q.ids])
       .add((p) => `disposition = ${p}`, q.disposition)
       .add((p) => `account = ${p}`, q.account)
+      .add((p) => `tx_hash = ${p}`, q.txHash)
       .add((p) => `seq > ${p}`, q.afterSeq)
     const sql = `SELECT * FROM ${this.s}.movements${w} ORDER BY seq${w.limit(q.limit)}`
     return (await this.run<MovementRow>(sql, w.params)).map(toMovement)
@@ -305,6 +311,15 @@ class PgReader implements StoreReader {
       note: row.note,
       closedAt: row.created_at,
     })
+  }
+
+  async listRefundLinks(q: RefundQuery): Promise<RefundLink[]> {
+    if (q.movementIds?.length === 0) return []
+    const w=new Where().add(p=>`tenant_id = ${p}`,q.tenantId)
+      .add(p=>`credit_movement_id = ${p}`,q.creditMovementId)
+      .add(p=>`refund_movement_id = ${p}`,q.refundMovementId)
+      .add(p=>`(credit_movement_id = ANY(${p}::text[]) OR refund_movement_id = ANY(${p}::text[]))`,q.movementIds===undefined?undefined:[...q.movementIds])
+    return (await this.run(`SELECT * FROM ${this.s}.refund_links${w} ORDER BY seq`,w.params)).map(refundLinkFromRow)
   }
 
   async accrualGetMode(tenantId: string): Promise<boolean> {
@@ -620,7 +635,7 @@ class PgTx extends PgReader implements StoreTx {
     const m = await this.lockMovement(tenantId, movementId)
     const allocations = await this.listAllocations({ tenantId, movementId })
     const exceptions = await this.listExceptions({ tenantId, movementId })
-    checkDisposition(m, allocations, exceptions, disposition, reason)
+    checkDisposition(m, allocations, exceptions, disposition, reason,refundCoverage(m,await this.listRefundLinks({tenantId,movementIds:[m.id]})))
     const [row] = await this.run<MovementRow>(
       `UPDATE ${this.s}.movements SET disposition = $3, ignored_reason = $4
        WHERE tenant_id = $1 AND id = $2 RETURNING *`,
@@ -779,6 +794,7 @@ class PgTx extends PgReader implements StoreTx {
       e,
       await this.listAllocations({ tenantId: n.tenantId, movementId: m.id }),
       await this.listAllocations({ tenantId: n.tenantId, expectationId: e.id }),
+      refundCoverage(m,await this.listRefundLinks({tenantId:n.tenantId,movementIds:[m.id]})),
     )
     const now = this.now()
     const [row] = await this.run<AllocationRow>(
@@ -924,6 +940,19 @@ class PgTx extends PgReader implements StoreTx {
 
   async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
     await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink> {
+    await this.getMovement(tenantId,creditMovementId)
+    const [existing]=await this.listRefundLinks({tenantId,refundMovementId})
+    if (existing) {
+      if (existing.creditMovementId !== creditMovementId) throw new ConstraintError('refund_invalid','refund already linked to another credit')
+      return existing
+    }
+    const parts=await refundParts(this,tenantId,creditMovementId,refundMovementId)
+    const [row]=await this.run(`INSERT INTO ${this.s}.refund_links(id,tenant_id,credit_movement_id,refund_movement_id,asset,decimals,amount,residual_amount,created_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[this.ids(),tenantId,creditMovementId,refundMovementId,parts.amount.asset,parts.amount.decimals,parts.amount.raw.toString(),parts.residualAmount.raw.toString(),this.now()])
+    return refundLinkFromRow(row!)
   }
 
   async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {

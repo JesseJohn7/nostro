@@ -2,7 +2,7 @@ import { expect, it } from 'vitest'
 import {
   MemoryStore, Money, NATIVE, asset, contractAsset, HorizonPriceSource,
   MapPriceSource, valueMovements, costBasis, reconcile, postManualEntry,
-  applyMovement,
+  applyMovement, agingReport,
 } from '../src/index.js'
 
 const tenantId = 'merge-review'
@@ -84,4 +84,12 @@ it('retains independent export marks and posts a balanced accrual only once', as
   expect(entries).toHaveLength(1)
   expect(entries[0]!.lines.map(l => l.role)).toEqual(['receivable', 'uncategorized_income'])
   await expect(store.postAccrualExpectation(e.id, tenantId, 'debit', amount, e.reference)).rejects.toThrow('accrual must match')
+})
+
+it('includes future-due receivables in the current aging bucket', async () => {
+  const store=new MemoryStore({now:()=>instant})
+  await store.transaction(tx=>tx.insertExpectation({tenantId,account,reference:'FUTURE',amount:Money.parse('10',NATIVE),dueAt:new Date('2026-10-02')}))
+  const report=await agingReport({store,tenantId,asOf:instant})
+  expect(report.receivables.items[0]).toMatchObject({bucket:'current'})
+  expect(report.receivables.items[0]!.remainingAmount.raw).toBe(100000000n)
 })

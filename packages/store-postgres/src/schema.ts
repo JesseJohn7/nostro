@@ -442,4 +442,21 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
     );
     CREATE INDEX IF NOT EXISTS movement_valuations_reporting ON ${s}.movement_valuations (tenant_id, reporting_asset);
   `,
+  (s) => `
+    CREATE TABLE ${s}.refund_links (
+      seq bigint GENERATED ALWAYS AS IDENTITY, id text PRIMARY KEY, tenant_id text NOT NULL,
+      credit_movement_id text NOT NULL REFERENCES ${s}.movements(id), refund_movement_id text NOT NULL UNIQUE REFERENCES ${s}.movements(id),
+      asset text NOT NULL, decimals smallint NOT NULL CHECK(decimals BETWEEN 0 AND 38),
+      amount numeric(40,0) NOT NULL CHECK(amount>0), residual_amount numeric(40,0) NOT NULL CHECK(residual_amount>=0 AND residual_amount<=amount),
+      created_at timestamptz NOT NULL
+    );
+    CREATE INDEX refund_credit ON ${s}.refund_links(tenant_id,credit_movement_id,seq);
+    CREATE INDEX IF NOT EXISTS movements_transaction ON ${s}.movements(tenant_id,account,tx_hash);
+    CREATE TRIGGER refund_links_no_update BEFORE UPDATE OR DELETE ON ${s}.refund_links
+      FOR EACH ROW EXECUTE FUNCTION ${s}.journal_append_only();
+    CREATE TRIGGER refund_links_no_truncate BEFORE TRUNCATE ON ${s}.refund_links
+      FOR EACH STATEMENT EXECUTE FUNCTION ${s}.journal_append_only();
+    ALTER TABLE ${s}.journal_lines DROP CONSTRAINT journal_lines_role_check;
+    ALTER TABLE ${s}.journal_lines ADD CONSTRAINT journal_lines_role_check CHECK(role IN (${LINE_ROLES},'other','refund_clearing'));
+  `,
 ]
