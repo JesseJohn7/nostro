@@ -32,12 +32,33 @@ randomness, and every decision records its reasons as evidence.
 | `memo_contained` | identifier | 0.60 | a text memo contains the reference as a token or inside a longer normalised run | a memo that merely quotes the reference |
 | `memo_truncated` | identifier | 0.60 | a 28-byte text memo is a proper prefix of the normalised reference | long references often share a prefix; corroboration only |
 | `memo_near_miss` | identifier | 0.50 | a text-memo token is one edit from the reference after normalisation | a different reference one character away |
+| `fingerprint_amount` | amount | 0.65 | amount matches a fingerprinted expectation (non-null `fingerprintSuffix`) exactly, inside its window | a payer who rounds off (sends 25 instead of 25.0000137) misses; a coincidental sub-unit match is very unlikely |
 | `exact_amount` | amount | 0.60 unique / 0.20 shared | exactly the amount still owed, same asset, inside the window | any two invoices for the same amount |
 | `known_payer` | payer | 0.40 | `counterparty` is an account listed in `payers` | accounts are shared and reused; corroboration only, never an identifier |
 
-**An amount alone never settles anything:** 0.60 is below the 0.70 threshold, so a unique-amount match
-without a memo becomes a suggestion in the exceptions queue. Lowering `threshold` changes that, and
-should be a deliberate decision.
+**An amount alone never settles anything:** 0.65 (`fingerprint_amount`) and 0.60 (`exact_amount`) are
+both below the 0.70 threshold. A fingerprinted amount match is strong evidence — the suffix is chosen
+to be unique across open expectations on the same account and asset — but not proof: a payer can round
+off, and a different payer could coincidentally send the same sub-unit amount. Combined with any
+second-family signal (e.g. `known_payer` at 0.40), the combined score crosses 0.70 and settles
+automatically. Lowering `threshold` changes that, and should be a deliberate decision.
+
+### Amount fingerprints
+
+An expectation can carry a `fingerprintSuffix`: a positive integer count of the asset's smallest
+unit, appended to the base invoice amount. An invoice for 25 USDC with suffix 137 (at 7 decimals) is
+invoiced as 25.0000137. The suffix is unique among open expectations on the same `(account, asset)`
+pair; the store enforces this with a partial unique index (SQL stores) or a trigger (SQLite), plus
+uniqueness checks in the memory store.
+
+To request a suffix, set `fingerprintSuffix: 'allocate'` on the new expectation. The store picks the
+lowest positive integer not already in use on that account/asset. You can also supply a specific
+`bigint` value. The suffix is released when the expectation leaves `open` status (settled, cancelled,
+or expired), so the value can be reused by later expectations.
+
+**Rounded-off payments:** a payer who sends 25 instead of 25.0000137 does not match
+`fingerprint_amount`. They score under `exact_amount` against the base amount (0.60), which stays
+below threshold, so the payment enters the exceptions queue for a person to resolve.
 
 ### Cross-type memo matching (`memo_cross_type`)
 
@@ -195,7 +216,6 @@ already carrying the exception or lost to a race with payment or cancellation.
 
 These are known gaps, each planned as its own self-contained piece of work:
 
-- **Amount fingerprints**, a unique sub-unit suffix per invoice for payers who cannot send memos.
 - **Claimable balances** as a two-step create-then-claim lifecycle.
 - **Several payments in one transaction** sharing a memo.
 - **Slippage tolerance** for path payments delivering slightly less than asked.

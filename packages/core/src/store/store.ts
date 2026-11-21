@@ -358,6 +358,7 @@ export type ConstraintName =
   | 'allocation_expectation_cancelled'
   | 'expectation_reference_unique'
   | 'expectation_muxed_id_unique'
+  | 'expectation_fingerprint_unique'
   | 'expectation_has_allocations'
   | 'expectation_not_open'
   | 'expectation_not_amendable'

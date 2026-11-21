@@ -759,6 +759,26 @@ class PgTx extends PgReader implements StoreTx {
 
     const [memoType, memoValue, memoText] = memoColumns(n.memo)
     const now = this.now()
+
+    // Resolve fingerprintSuffix: 'allocate' picks the lowest free value.
+    let fingerprintSuffix: bigint | null = null
+    if (n.fingerprintSuffix === 'allocate') {
+      await this.run('SELECT pg_advisory_xact_lock(hashtext($1))', [`nostro:fingerprint:${this.s}:${n.tenantId}:${n.account}:${n.amount.asset}`])
+      const rows = await this.run<{ fingerprint_suffix: string }>(
+        `SELECT fingerprint_suffix FROM ${this.s}.expectations
+          WHERE tenant_id = $1 AND account = $2 AND asset = $3
+            AND status = 'open' AND fingerprint_suffix IS NOT NULL
+          ORDER BY fingerprint_suffix::numeric`,
+        [n.tenantId, n.account, n.amount.asset],
+      )
+      const taken = new Set(rows.map((r) => BigInt(r.fingerprint_suffix)))
+      let candidate = 1n
+      while (taken.has(candidate)) candidate++
+      fingerprintSuffix = candidate
+    } else if (n.fingerprintSuffix != null) {
+      fingerprintSuffix = n.fingerprintSuffix
+    }
+
     const savepoint = `nostro_${++this.savepoints}`
     await this.run(`SAVEPOINT ${savepoint}`)
     try {
@@ -766,8 +786,8 @@ class PgTx extends PgReader implements StoreTx {
         `INSERT INTO ${this.s}.expectations (
            id, tenant_id, reference, account, direction, asset, decimals, amount, muxed_id,
            memo_type, memo_value, memo_text, payers, due_at, expires_at, status, metadata,
-           created_at, updated_at
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'open', $16, $17, $17)
+           fingerprint_suffix, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, 'open', $16, $17, $18, $18)
          RETURNING *`,
         [
           this.ids(),
@@ -786,6 +806,7 @@ class PgTx extends PgReader implements StoreTx {
           n.dueAt ?? null,
           n.expiresAt ?? null,
           JSON.stringify(n.metadata ?? {}),
+          fingerprintSuffix == null ? null : fingerprintSuffix.toString(),
           now,
         ],
       )
