@@ -72,6 +72,7 @@ Options:
   --asset <asset>     native (or XLM, the default) or CODE:ISSUER
   --debit             Money you will pay out, rather than money you are owed
   --muxed-id <n>      The muxed (M...) id you gave the payer for this
+  --issue-muxed-id    Issue the next free muxed id for this account
   --memo-text <text>  The text memo you asked the payer to send, if not the reference
   --memo-id <n>       The id memo you asked the payer to send
   --memo-hash <hex>   The 64 lowercase hex characters of the hash memo you asked for
@@ -89,6 +90,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     asset: { type: 'string' },
     debit: { type: 'boolean' },
     'muxed-id': { type: 'string' },
+    'issue-muxed-id': { type: 'boolean' },
     'memo-text': { type: 'string' },
     'memo-id': { type: 'string' },
     'memo-hash': { type: 'string' },
@@ -111,6 +113,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     } catch (err) {
       throw new UsageError(`--amount: ${(err as Error).message}`)
     }
+    if (flag(args, 'issue-muxed-id') && string(args, 'muxed-id') !== undefined) throw new UsageError('Give --muxed-id or --issue-muxed-id, not both.')
     for (const payer of strings(args, 'payer')) {
       if (!isAccountId(payer)) throw new UsageError(`--payer ${JSON.stringify(payer)} is not a G... account id.`)
     }
@@ -121,7 +124,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
       account,
       direction: flag(args, 'debit') ? 'debit' : 'credit',
       amount,
-      muxedId: uint64(args, 'muxed-id') ?? null,
+      muxedId: flag(args, 'issue-muxed-id') ? 'issue' : (uint64(args, 'muxed-id') ?? null),
       memo: memoOf(args),
       payers: strings(args, 'payer'),
       dueAt: date(args, 'due') ?? null,
@@ -131,11 +134,19 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const recorded = await withStore(args, io, (store) =>
       store.transaction(async (tx) => {
         try {
-          return await tx.insertExpectation(expectation)
+          const e = await tx.insertExpectation(expectation)
+          const accrualActive = await tx.accrualGetMode(tenant(args, io))
+          if (accrualActive) {
+            await tx.postAccrualExpectation(e.id, tenant(args, io), e.direction, e.amount, e.reference)
+          }
+          return e
         } catch (err) {
           if (err instanceof ValidationError) throw new UsageError(err.message)
           if (err instanceof ConstraintError && err.constraint === 'expectation_reference_unique') {
             throw new CliError(`${reference} is already recorded in this tenant; references are unique.`)
+          }
+          if (err instanceof ConstraintError && err.constraint === 'expectation_muxed_id_unique') {
+            throw new CliError(err.message)
           }
           throw err
         }
@@ -146,7 +157,8 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
       await write(io.stdout, json(expectationWithPaid(recorded, Money.zero(recorded.amount.asset, recorded.amount.decimals))))
     } else {
       const way = recorded.direction === 'credit' ? 'owed to' : 'to pay from'
-      await write(io.stdout, `Recorded ${clean(recorded.reference)}: ${money(recorded.amount)} ${way} ${recorded.account}.\n`)
+      const muxed = recorded.muxedId === null ? '' : ` (muxed id ${recorded.muxedId.toString()})`
+      await write(io.stdout, `Recorded ${clean(recorded.reference)}: ${money(recorded.amount)} ${way} ${recorded.account}${muxed}.\n`)
     }
     return 0
   },

@@ -3,7 +3,7 @@
  * server validates requests with. Served at `GET /v1/openapi.json`.
  */
 import { readFileSync } from 'node:fs'
-import { components, expectationBody, query, ref, resolveBody } from './schemas.js'
+import { components, expectationBody, postJournalBody, query, ref, resolveBody } from './schemas.js'
 
 /** This package's version, which is the API's. */
 const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version
@@ -77,7 +77,7 @@ export function buildOpenApi() {
       '/v1/movements/{id}': {
         get: {
           operationId: 'getMovement',
-          summary: 'One movement, with its allocations, exceptions and journal entries',
+          summary: 'One movement, with its allocations, refunds, exceptions and journal entries',
           parameters: [idParam('movement')],
           responses: { '200': ok('MovementDetail'), '404': problem('No such movement in this tenant (`not_found`).'), ...errors },
         },
@@ -98,7 +98,7 @@ export function buildOpenApi() {
               ...ok('Expectation', 'Recorded'),
               headers: { Location: { description: 'Where it can be read back.', schema: { type: 'string' } } },
             },
-            '409': problem('The reference is already used in this tenant (`reference_taken`).'),
+            '409': problem('The reference or muxed id is already used in this tenant (`reference_taken`, `muxed_id_taken`).'),
             '422': problem('Well formed but not recordable exactly, e.g. more decimals than the asset has (`invalid_expectation`).'),
             ...errors,
           },
@@ -110,6 +110,36 @@ export function buildOpenApi() {
           summary: 'One expectation, with what has been allocated to it',
           parameters: [idParam('expectation')],
           responses: { '200': ok('ExpectationDetail'), '404': problem('No such expectation in this tenant (`not_found`).'), ...errors },
+        },
+      },
+      '/v1/expectations/{id}/cancel': {
+        post: {
+          operationId: 'cancelExpectation',
+          summary: 'Cancel an open expectation with no allocations',
+          parameters: [idParam('expectation')],
+          requestBody: { required: true, content: { 'application/json': { schema: ref('CancelExpectationBody') } } },
+          responses: {
+            '200': ok('Expectation'),
+            '404': problem('No such expectation in this tenant (`not_found`).'),
+            '409': problem('Cannot be cancelled in its current state (`expectation_conflict`).'),
+            '422': problem('The cancellation is not valid (`invalid_expectation`).'),
+            ...errors,
+          },
+        },
+      },
+      '/v1/expectations/{id}/amend': {
+        post: {
+          operationId: 'amendExpectation',
+          summary: 'Change an open or part-paid expectation',
+          parameters: [idParam('expectation')],
+          requestBody: { required: true, content: { 'application/json': { schema: ref('AmendExpectationBody') } } },
+          responses: {
+            '200': ok('Expectation'),
+            '404': problem('No such expectation in this tenant (`not_found`).'),
+            '409': problem('The amendment is refused (`expectation_conflict` or `muxed_id_taken`).'),
+            '422': problem('The amendment is not valid (`invalid_expectation`).'),
+            ...errors,
+          },
         },
       },
       '/v1/exceptions': {
@@ -142,7 +172,11 @@ export function buildOpenApi() {
           operationId: 'listEvents',
           summary: 'The event log, the same events webhooks deliver',
           parameters: parameters(query.events),
-          responses: { '200': ok('EventPage'), ...errors },
+          responses: {
+            '200': ok('EventPage'),
+            '410': problem('The requested `after` position was pruned; resume after the reported sequence (`event_history_pruned`).'),
+            ...errors,
+          },
         },
       },
       '/v1/journal': {
@@ -151,6 +185,17 @@ export function buildOpenApi() {
           summary: 'Journal entries, in posting order',
           parameters: parameters(query.journal),
           responses: { '200': ok('JournalEntryPage'), ...errors },
+        },
+        post: {
+          operationId: 'postManualJournalEntry',
+          summary: 'Post a manual journal entry',
+          requestBody: { required: true, content: { 'application/json': { schema: postJournalBody } } },
+          responses: {
+            '201': ok('JournalEntry', 'Posted'),
+            '409': problem('The rules refuse it: period closed or posting conflict (`resolution_refused`).'),
+            '422': problem('The entry is not valid: unbalanced, touches cash without movement, or invalid asset/amount (`invalid_request`).'),
+            ...errors,
+          },
         },
       },
       '/v1/journal.csv': {

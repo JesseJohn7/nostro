@@ -38,13 +38,16 @@ const LINE_ROLES = list([
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
 ])
 const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
+const MANUAL_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual'])
 const EVENT_TYPES = list([
   'movement.decided',
   'expectation.partially_paid',
   'expectation.settled',
   'expectation.cancelled',
+  'expectation.amended',
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
@@ -57,6 +60,7 @@ const EXCEPTION_CODES = list([
   'DUPLICATE_PAYMENT',
   'PARTIAL_UNRESOLVED',
   'LATE_BEYOND_WINDOW',
+  'EXPECTATION_EXPIRED',
   'MEMO_MISSING',
   'MEMO_MALFORMED',
   'MEMO_TRUNCATED',
@@ -309,5 +313,150 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       PRIMARY KEY (tenant_id, normalized, expectation_id)
     );
     CREATE INDEX IF NOT EXISTS expectation_reference_keys ON ${s}.expectation_reference_index (tenant_id, normalized);
+  `,
+
+  (s) => `
+    DO $do$
+    DECLARE c text;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '${s}.exceptions'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%code%'
+      LOOP
+        EXECUTE format('ALTER TABLE ${s}.exceptions DROP CONSTRAINT %I', c);
+      END LOOP;
+    END $do$;
+    ALTER TABLE ${s}.exceptions ADD CONSTRAINT exceptions_code_check CHECK (code IN (${EXCEPTION_CODES}));
+
+    DO $do$
+    DECLARE c text;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '${s}.events'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%type%'
+      LOOP
+        EXECUTE format('ALTER TABLE ${s}.events DROP CONSTRAINT %I', c);
+      END LOOP;
+    END $do$;
+    ALTER TABLE ${s}.events ADD CONSTRAINT events_type_check CHECK (type IN (${EVENT_TYPES}));
+
+    DROP INDEX IF EXISTS ${s}.exceptions_expiry_once;
+    CREATE UNIQUE INDEX exceptions_expiry_once ON ${s}.exceptions (tenant_id, expectation_id)
+      WHERE code = 'EXPECTATION_EXPIRED' AND expectation_id IS NOT NULL;
+
+    CREATE OR REPLACE FUNCTION ${s}.expectations_muxed_id_unique() RETURNS trigger LANGUAGE plpgsql AS $fn$
+    BEGIN
+      IF TG_OP = 'UPDATE' THEN
+        IF NEW.muxed_id IS NOT DISTINCT FROM OLD.muxed_id THEN
+          RETURN NEW;
+        END IF;
+      END IF;
+      IF NEW.muxed_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM ${s}.expectations
+        WHERE tenant_id = NEW.tenant_id AND account = NEW.account
+          AND muxed_id = NEW.muxed_id AND id <> NEW.id
+      ) THEN
+        RAISE EXCEPTION 'muxed id % already used on account %', NEW.muxed_id, NEW.account
+          USING ERRCODE = 'unique_violation', CONSTRAINT = 'expectation_muxed_id_unique';
+      END IF;
+      RETURN NEW;
+    END $fn$;
+    DROP TRIGGER IF EXISTS expectations_muxed_id_insert_unique ON ${s}.expectations;
+    CREATE TRIGGER expectations_muxed_id_insert_unique BEFORE INSERT ON ${s}.expectations
+      FOR EACH ROW EXECUTE FUNCTION ${s}.expectations_muxed_id_unique();
+    DROP TRIGGER IF EXISTS expectations_muxed_id_update_unique ON ${s}.expectations;
+    CREATE TRIGGER expectations_muxed_id_update_unique BEFORE UPDATE ON ${s}.expectations
+      FOR EACH ROW EXECUTE FUNCTION ${s}.expectations_muxed_id_unique();
+  `,
+
+  // 7: export destination high-water marks
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.exports (
+      tenant_id     text NOT NULL,
+      destination   text NOT NULL,
+      last_seq      bigint NOT NULL DEFAULT 0,
+      last_exported_at timestamptz NOT NULL DEFAULT now(),
+      control_totals jsonb NOT NULL DEFAULT '{}',
+      checksum      text NOT NULL DEFAULT '',
+      PRIMARY KEY (tenant_id, destination)
+    );
+  `,
+
+  // 8: per-tenant accrual mode for expectations
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.accrual_modes (
+      tenant_id    text NOT NULL PRIMARY KEY,
+      active       boolean NOT NULL DEFAULT false
+    );
+  `,
+
+  // 9: support batched exception lookups by expectation
+  (s) => `
+    CREATE INDEX IF NOT EXISTS exceptions_expectation
+      ON ${s}.exceptions (tenant_id, expectation_id) WHERE expectation_id IS NOT NULL;
+  `,
+
+  // 10: event retention watermark and guarded pruning
+  (s) => `
+    CREATE TABLE ${s}.event_prune_state (
+      tenant_id text PRIMARY KEY,
+      pruned_through bigint NOT NULL DEFAULT 0 CHECK (pruned_through >= 0)
+    );
+    CREATE OR REPLACE FUNCTION ${s}.events_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF current_setting('nostro.event_prune', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'the event log is append-only' USING ERRCODE = 'check_violation';
+      END IF;
+      IF TG_LEVEL = 'ROW' THEN RETURN OLD; END IF;
+      RETURN NULL;
+    END $$;
+  `,
+  (s) => `
+    DO $do$
+    DECLARE c text;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '${s}.journal_entries'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%kind%'
+      LOOP
+        EXECUTE format('ALTER TABLE ${s}.journal_entries DROP CONSTRAINT %I', c);
+      END LOOP;
+    END $do$;
+    ALTER TABLE ${s}.journal_entries ADD CONSTRAINT journal_entries_kind_check CHECK (kind IN (${MANUAL_ENTRY_KINDS}));
+
+    ALTER TABLE ${s}.journal_lines DROP CONSTRAINT journal_lines_role_check;
+    ALTER TABLE ${s}.journal_lines ADD CONSTRAINT journal_lines_role_check CHECK (role IN (${LINE_ROLES}, 'other'));
+
+    CREATE TABLE IF NOT EXISTS ${s}.movement_valuations (
+      tenant_id        text NOT NULL,
+      movement_id      text NOT NULL REFERENCES ${s}.movements (id),
+      reporting_asset  text NOT NULL,
+      price_n          numeric(40, 0) NOT NULL,
+      price_d          numeric(40, 0) NOT NULL,
+      price_source     text NOT NULL,
+      price_timestamp  timestamptz NOT NULL,
+      decimals         smallint NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      value            numeric(40, 0) NOT NULL,
+      valued_at        timestamptz NOT NULL,
+      PRIMARY KEY (tenant_id, movement_id)
+    );
+    CREATE INDEX IF NOT EXISTS movement_valuations_reporting ON ${s}.movement_valuations (tenant_id, reporting_asset);
+  `,
+  (s) => `
+    CREATE TABLE ${s}.refund_links (
+      seq bigint GENERATED ALWAYS AS IDENTITY, id text PRIMARY KEY, tenant_id text NOT NULL,
+      credit_movement_id text NOT NULL REFERENCES ${s}.movements(id), refund_movement_id text NOT NULL UNIQUE REFERENCES ${s}.movements(id),
+      asset text NOT NULL, decimals smallint NOT NULL CHECK(decimals BETWEEN 0 AND 38),
+      amount numeric(40,0) NOT NULL CHECK(amount>0), residual_amount numeric(40,0) NOT NULL CHECK(residual_amount>=0 AND residual_amount<=amount),
+      created_at timestamptz NOT NULL
+    );
+    CREATE INDEX refund_credit ON ${s}.refund_links(tenant_id,credit_movement_id,seq);
+    CREATE INDEX IF NOT EXISTS movements_transaction ON ${s}.movements(tenant_id,account,tx_hash);
+    CREATE TRIGGER refund_links_no_update BEFORE UPDATE OR DELETE ON ${s}.refund_links
+      FOR EACH ROW EXECUTE FUNCTION ${s}.journal_append_only();
+    CREATE TRIGGER refund_links_no_truncate BEFORE TRUNCATE ON ${s}.refund_links
+      FOR EACH STATEMENT EXECUTE FUNCTION ${s}.journal_append_only();
+    ALTER TABLE ${s}.journal_lines DROP CONSTRAINT journal_lines_role_check;
+    ALTER TABLE ${s}.journal_lines ADD CONSTRAINT journal_lines_role_check CHECK(role IN (${LINE_ROLES},'other','refund_clearing'));
   `,
 ]

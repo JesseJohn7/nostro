@@ -14,15 +14,18 @@
  */
 import { randomUUID } from 'node:crypto'
 import Database from 'better-sqlite3'
+import { EventHistoryPrunedError } from '@nostro-labs/nostro'
 import type {
   Allocation,
   AllocationQuery,
   CursorKey,
   Disposition,
+  Direction,
   EventQuery,
   ExceptionQuery,
   ExceptionRecord,
   Expectation,
+  ExpectationChanges,
   ExpectationQuery,
   InsertMovementsResult,
   JournalEntry,
@@ -41,12 +44,23 @@ import type {
   NewMovement,
   NewOutboxEvent,
   OutboxEvent,
+  PruneEventsResult,
+  RefundLink,
+  RefundQuery,
   Resolution,
   SchemaVersion,
   StoreReader,
   StoreTx,
+  AssetId,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '@nostro-labs/nostro'
 import {
+  refundParts,
+  refundCoverage,
+  refundLinkFromRow,
+  postAccrual,
   ConstraintError,
   Money,
   NotFoundError,
@@ -56,6 +70,7 @@ import {
   assertValidNewExpectation,
   assertValidNewJournalEntry,
   assertValidNewMovement,
+  amendExpectationRecord,
   checkAllocation,
   checkCancel,
   checkCursorValue,
@@ -65,6 +80,8 @@ import {
   checkJournalPeriodReopen,
   checkResolution,
   exceptionChanged,
+  issueMuxedId,
+  expectationAmended,
   expectationChanged,
   expectationReferenceKeys,
   movementDecided,
@@ -300,8 +317,10 @@ class SqliteReader implements StoreReader {
   async listMovements(q: MovementQuery): Promise<Movement[]> {
     const w = new Where()
       .add('tenant_id = ?', q.tenantId)
+      .in('id', q.ids)
       .add('disposition = ?', q.disposition)
       .add('account = ?', q.account)
+      .add('tx_hash = ?', q.txHash)
       .add('seq > ?', q.afterSeq)
     return this.all(`SELECT * FROM movements${w} ORDER BY seq${w.limit(q.limit)}`, w.params).map(toMovement)
   }
@@ -330,6 +349,7 @@ class SqliteReader implements StoreReader {
   async listExpectations(q: ExpectationQuery): Promise<Expectation[]> {
     const w = new Where()
       .add('tenant_id = ?', q.tenantId)
+      .in('id', q.ids)
       .add('account = ?', q.account)
       .add('asset = ?', q.asset)
       .add('direction = ?', q.direction)
@@ -343,7 +363,9 @@ class SqliteReader implements StoreReader {
     const w = new Where()
       .add('tenant_id = ?', q.tenantId)
       .add('movement_id = ?', q.movementId)
+      .in('movement_id', q.movementIds)
       .add('expectation_id = ?', q.expectationId)
+      .in('expectation_id', q.expectationIds)
     return this.all(`SELECT * FROM allocations${w} ORDER BY seq`, w.params).map(toAllocation)
   }
 
@@ -355,23 +377,36 @@ class SqliteReader implements StoreReader {
   async listExceptions(q: ExceptionQuery): Promise<ExceptionRecord[]> {
     const w = new Where()
       .add('tenant_id = ?', q.tenantId)
+      .in('id', q.ids)
       .add('status = ?', q.status)
       .add('code = ?', q.code)
       .add('movement_id = ?', q.movementId)
+      .in('movement_id', q.movementIds)
       .add('expectation_id = ?', q.expectationId)
+      .in('expectation_id', q.expectationIds)
       .add('seq > ?', q.afterSeq)
     return this.all(`SELECT * FROM exceptions${w} ORDER BY seq${w.limit(q.limit)}`, w.params).map(toException)
   }
 
   async listEvents(q: EventQuery): Promise<OutboxEvent[]> {
+    const prunedThrough = await this.getEventsPrunedThrough(q.tenantId)
+    if (q.afterSeq !== undefined && q.afterSeq < prunedThrough) {
+      throw new EventHistoryPrunedError(q.tenantId, q.afterSeq, prunedThrough)
+    }
     const w = new Where().add('tenant_id = ?', q.tenantId).add('seq > ?', q.afterSeq)
     return this.all(`SELECT * FROM events${w} ORDER BY seq${w.limit(q.limit)}`, w.params).map(toEvent)
+  }
+
+  async getEventsPrunedThrough(tenantId: string): Promise<number> {
+    const row = this.one('SELECT pruned_through FROM event_prune_state WHERE tenant_id = ?', [tenantId])
+    return Number(row?.pruned_through ?? 0)
   }
 
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
     const w = new Where()
       .add('tenant_id = ?', q.tenantId)
       .add('movement_id = ?', q.movementId)
+      .in('movement_id', q.movementIds)
       .add('seq > ?', q.afterSeq)
       .add('effective_at >= ?', q.effectiveFrom?.getTime())
       .add('effective_at < ?', q.effectiveBefore?.getTime())
@@ -408,6 +443,60 @@ class SqliteReader implements StoreReader {
       closedAt: new Date(row.created_at as number),
     })
   }
+
+  async listRefundLinks(q: RefundQuery): Promise<RefundLink[]> {
+    if (q.movementIds?.length === 0) return []
+    const params: Param[] = [q.tenantId]
+    let sql = 'SELECT * FROM refund_links WHERE tenant_id = ?'
+    if (q.creditMovementId !== undefined) {sql += ' AND credit_movement_id = ?'; params.push(q.creditMovementId)}
+    if (q.refundMovementId !== undefined) {sql += ' AND refund_movement_id = ?'; params.push(q.refundMovementId)}
+    if (q.movementIds !== undefined) {
+      const slots=q.movementIds.map(()=>'?').join(',')
+      sql += ` AND (credit_movement_id IN (${slots}) OR refund_movement_id IN (${slots}))`
+      params.push(...q.movementIds,...q.movementIds)
+    }
+    return this.all(sql+' ORDER BY seq',params).map(refundLinkFromRow)
+  }
+
+  async accrualGetMode(tenantId: string): Promise<boolean> {
+    const row = this.one('SELECT active FROM accrual_modes WHERE tenant_id = ?', [tenantId])
+    return row !== undefined ? row.active === 1 : false
+  }
+
+  getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null> {
+    const row = this.one('SELECT * FROM movement_valuations WHERE tenant_id = ? AND movement_id = ?', [tenantId, movementId])
+    return Promise.resolve(row === undefined ? null : toValuation(row))
+  }
+
+  listValuations(q: ValuationQuery): Promise<MovementValuation[]> {
+    let sql = 'SELECT * FROM movement_valuations WHERE tenant_id = ?'
+    const params: Param[] = [q.tenantId]
+    if (q.movementId !== undefined) {
+      sql += ' AND movement_id = ?'
+      params.push(q.movementId)
+    }
+    if (q.reportingAsset !== undefined) {
+      sql += ' AND reporting_asset = ?'
+      params.push(q.reportingAsset)
+    }
+    sql += ' ORDER BY price_timestamp ASC'
+    const rows = this.all(sql, params)
+    return Promise.resolve(rows.map(toValuation))
+  }
+}
+
+function toValuation(row: Row): MovementValuation {
+  return Object.freeze({
+    movementId: row.movement_id as string,
+    tenantId: row.tenant_id as string,
+    reportingAsset: row.reporting_asset as AssetId,
+    priceNumerator: BigInt(row.price_n as string),
+    priceDenominator: BigInt(row.price_d as string),
+    priceSource: row.price_source as string,
+    priceTimestamp: new Date(row.price_timestamp as number),
+    value: Money.fromRaw(BigInt(row.value as string), row.reporting_asset as AssetId, row.decimals as number),
+    valuedAt: new Date(row.valued_at as number),
+  })
 }
 
 class SqliteTx extends SqliteReader implements StoreTx {
@@ -417,6 +506,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
     private readonly db: Database.Database,
     private readonly ids: () => string,
     private readonly now: () => Date,
+    private readonly authorizeEventPrune: (allowed: boolean) => void,
   ) {
     super(() => {
       if (!this.open) throw new TransactionClosedError()
@@ -491,6 +581,45 @@ class SqliteTx extends SqliteReader implements StoreTx {
     )
   }
 
+  async pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult> {
+    if (!Number.isFinite(olderThan.getTime())) throw new Error('olderThan must be a valid date')
+    const bounds = this.one(
+      `SELECT
+         coalesce(
+           (SELECT min(seq) - 1 FROM events WHERE tenant_id = ? AND created_at > ?),
+           (SELECT max(seq) FROM events WHERE tenant_id = ?),
+           0
+         ) AS prefix_through,
+         (SELECT min(CAST(value AS INTEGER)) FROM cursors
+           WHERE tenant_id = ? AND network = 'nostro' AND source = 'outbox') AS consumer_through`,
+      [tenantId, olderThan.getTime(), tenantId, tenantId],
+    )
+    const prefixThrough = Number(bounds?.prefix_through ?? 0)
+    const safeThrough = Math.min(
+      prefixThrough,
+      bounds?.consumer_through == null ? prefixThrough : Number(bounds.consumer_through),
+    )
+    this.authorizeEventPrune(true)
+    let removed: Row[] = []
+    try {
+      removed = this.all(
+        'DELETE FROM events WHERE tenant_id = ? AND seq <= ? AND created_at <= ? RETURNING seq',
+        [tenantId, safeThrough, olderThan.getTime()],
+      )
+    } finally {
+      this.authorizeEventPrune(false)
+    }
+    const lastRemoved = removed.reduce((max, row) => Math.max(max, Number(row.seq)), 0)
+    if (lastRemoved > 0) {
+      this.exec(
+        `INSERT INTO event_prune_state (tenant_id, pruned_through) VALUES (?, ?)
+         ON CONFLICT (tenant_id) DO UPDATE SET pruned_through = max(pruned_through, excluded.pruned_through)`,
+        [tenantId, lastRemoved],
+      )
+    }
+    return { deleted: removed.length, prunedThrough: Math.max(await this.getEventsPrunedThrough(tenantId), lastRemoved) }
+  }
+
   async insertMovements(batch: readonly NewMovement[]): Promise<InsertMovementsResult> {
     batch.forEach(assertValidNewMovement)
     const inserted: Movement[] = []
@@ -561,6 +690,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
       await this.listExceptions({ tenantId, movementId }),
       disposition,
       reason,
+      refundCoverage(m,await this.listRefundLinks({tenantId,movementIds:[m.id]})),
     )
     const next = toMovement(
       this.one('UPDATE movements SET disposition = ?, ignored_reason = ? WHERE id = ? RETURNING *', [
@@ -577,12 +707,29 @@ class SqliteTx extends SqliteReader implements StoreTx {
 
   async insertExpectation(n: NewExpectation): Promise<Expectation> {
     assertValidNewExpectation(n)
-    // Transactions are serialised, so nothing can take the reference between this check and the insert.
     if ((await this.getExpectationByReference(n.tenantId, n.reference)) !== null) {
       throw new ConstraintError(
         'expectation_reference_unique',
         `reference ${JSON.stringify(n.reference)} already exists in this tenant`,
       )
+    }
+    let muxedId: bigint | null
+    if (n.muxedId === 'issue') {
+      const rows = this.all('SELECT muxed_id FROM expectations WHERE tenant_id = ? AND account = ? AND muxed_id IS NOT NULL', [n.tenantId, n.account]) as Row[]
+      let max = 0n
+      for (const r of rows) {
+        const v = BigInt(r.muxed_id as string)
+        if (v > max) max = v
+      }
+      muxedId = issueMuxedId(max)
+    } else {
+      muxedId = n.muxedId ?? null
+    }
+    if (muxedId !== null) {
+      const taken = this.one('SELECT id FROM expectations WHERE tenant_id = ? AND account = ? AND muxed_id = ?', [n.tenantId, n.account, muxedId.toString()])
+      if (taken !== undefined) {
+        throw new ConstraintError('expectation_muxed_id_unique', `muxed id ${muxedId.toString()} is already used on account ${n.account}`)
+      }
     }
     const [memoType, memoValue, memoText] = memoColumns(n.memo)
     const now = this.now().getTime()
@@ -603,7 +750,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
         n.amount.asset,
         n.amount.decimals,
         n.amount.raw.toString(),
-        n.muxedId == null ? null : n.muxedId.toString(),
+        muxedId == null ? null : muxedId.toString(),
         memoType,
         memoValue,
         memoText,
@@ -635,6 +782,48 @@ class SqliteTx extends SqliteReader implements StoreTx {
     return next
   }
 
+  async amendExpectation(tenantId: string, id: string, changes: ExpectationChanges, reason: string): Promise<Expectation> {
+    const e = this.expectation(tenantId, id)
+    const allocations = await this.listAllocations({ tenantId, expectationId: id })
+    let muxedIdTaken = false
+    if (changes.muxedId !== undefined && changes.muxedId !== e.muxedId && changes.muxedId !== null) {
+      const taken = this.one('SELECT id FROM expectations WHERE tenant_id = ? AND account = ? AND muxed_id = ? AND id != ?', [tenantId, e.account, changes.muxedId.toString(), id])
+      muxedIdTaken = taken !== undefined
+    }
+    const next = amendExpectationRecord(e, allocations, changes, reason, this.now(), muxedIdTaken)
+    const [memoType, memoValue, memoText] = memoColumns(next.memo)
+    const saved = toExpectation(
+      this.one(
+        `UPDATE expectations SET amount = ?, decimals = ?, asset = ?, muxed_id = ?, memo_type = ?, memo_value = ?, memo_text = ?,
+           payers = ?, due_at = ?, expires_at = ?, status = ?, metadata = ?, updated_at = ?
+         WHERE id = ? RETURNING *`,
+        [
+          next.amount.raw.toString(),
+          next.amount.decimals,
+          next.amount.asset,
+          next.muxedId == null ? null : next.muxedId.toString(),
+          memoType,
+          memoValue,
+          memoText,
+          JSON.stringify([...next.payers]),
+          ms(next.dueAt),
+          ms(next.expiresAt),
+          next.status,
+          JSON.stringify({ ...next.metadata }),
+          next.updatedAt.getTime(),
+          e.id,
+        ],
+      )!,
+    )
+    this.db.prepare('DELETE FROM expectation_reference_index WHERE expectation_id = ?').run(e.id)
+    const index = this.db.prepare(
+      'INSERT OR IGNORE INTO expectation_reference_index (tenant_id, normalized, expectation_id) VALUES (?, ?, ?)',
+    )
+    for (const values of referenceIndexRows(saved.id, saved.tenantId, saved.reference, saved.memo)) index.run(...values)
+    this.emit(expectationAmended(saved, e, reason))
+    return saved
+  }
+
   async allocate(n: NewAllocation): Promise<Allocation> {
     assertValidNewAllocation(n)
     const m = this.movement(n.tenantId, n.movementId)
@@ -645,6 +834,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
       e,
       await this.listAllocations({ tenantId: n.tenantId, movementId: m.id }),
       await this.listAllocations({ tenantId: n.tenantId, expectationId: e.id }),
+      refundCoverage(m,await this.listRefundLinks({tenantId:n.tenantId,movementIds:[m.id]})),
     )
     const now = this.now().getTime()
     const row = this.one(
@@ -760,9 +950,80 @@ class SqliteTx extends SqliteReader implements StoreTx {
     this.emit(exceptionChanged(next))
     return next
   }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink> {
+    const [existing]=await this.listRefundLinks({tenantId,refundMovementId})
+    if (existing) {
+      if (existing.creditMovementId !== creditMovementId) throw new ConstraintError('refund_invalid','refund already linked to another credit')
+      return existing
+    }
+    const parts=await refundParts(this,tenantId,creditMovementId,refundMovementId)
+    const row=this.one(`INSERT INTO refund_links(id,tenant_id,credit_movement_id,refund_movement_id,asset,decimals,amount,residual_amount,created_at)
+      VALUES(?,?,?,?,?,?,?,?,?) RETURNING *`,[this.ids(),tenantId,creditMovementId,refundMovementId,parts.amount.asset,parts.amount.decimals,parts.amount.raw.toString(),parts.residualAmount.raw.toString(),this.now().getTime()])!
+    return refundLinkFromRow(row)
+  }
+
+  async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {
+    const now = this.now()
+    for (const n of batch) {
+      this.movement(n.tenantId, n.movementId)
+      this.exec(
+        `INSERT OR IGNORE INTO movement_valuations (
+           tenant_id, movement_id, reporting_asset, price_n, price_d, price_source, price_timestamp, decimals, value, valued_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          n.tenantId,
+          n.movementId,
+          n.reportingAsset,
+          n.priceNumerator.toString(),
+          n.priceDenominator.toString(),
+          n.priceSource,
+          n.priceTimestamp.getTime(),
+          n.value.decimals,
+          n.value.raw.toString(),
+          n.valuedAt ? n.valuedAt.getTime() : now.getTime(),
+        ],
+      )
+    }
+  }
 }
 
 export class SqliteStore extends SqliteReader implements MigratableStore {
+  private eventPruneAuthorized = false
+  async exportGetMark(tenantId: string, destination: string): Promise<string | null> {
+    const row = this.one(
+      'SELECT last_seq FROM exports WHERE tenant_id = ? AND destination = ?',
+      [tenantId, destination],
+    )
+    return row === undefined ? null : String(row.last_seq)
+  }
+
+  async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
+    await this.serial(async () => {
+      this.writer.prepare(`INSERT INTO exports (tenant_id,destination,last_seq,last_exported_at,control_totals,checksum)
+        VALUES (?, ?, ?, ?, '{}', '') ON CONFLICT(tenant_id,destination)
+        DO UPDATE SET last_seq=excluded.last_seq,last_exported_at=excluded.last_exported_at`)
+        .run(tenantId, destination, lastSeq, this.now().getTime())
+    })
+  }
+
+
+
+async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await this.transaction(tx => tx.postAccrualExpectation(expectationId, tenantId, direction, amount, reference))
+  }
+
+  async exportListBatches(tenantId: string): Promise<readonly { readonly destination: string; readonly last_seq: number; readonly last_exported_at: number; readonly control_totals: string; readonly checksum: string }[]> {
+    const rows = this.all(
+      'SELECT destination, last_seq, last_exported_at, control_totals, checksum FROM exports WHERE tenant_id = ?',
+      [tenantId],
+    ) as { destination: string; last_seq: number; last_exported_at: number; control_totals: string; checksum: string }[]
+    return rows
+  }
   private readonly writer: Database.Database
   private readonly reader: Database.Database
   private tail: Promise<unknown> = Promise.resolve()
@@ -780,6 +1041,7 @@ export class SqliteStore extends SqliteReader implements MigratableStore {
     // Durability over speed: this is a ledger.
     writer.pragma('synchronous = FULL')
     writer.pragma('foreign_keys = ON')
+    writer.function('nostro_event_prune_allowed', () => Number(this.eventPruneAuthorized))
     const reader = new Database(filename, { readonly: true, timeout: busy })
     super(() => reader)
     this.writer = writer
@@ -847,7 +1109,9 @@ export class SqliteStore extends SqliteReader implements MigratableStore {
 
   transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
     return this.serial(async () => {
-      const tx = new SqliteTx(this.writer, this.ids, this.now)
+      const tx = new SqliteTx(this.writer, this.ids, this.now, (allowed) => {
+        this.eventPruneAuthorized = allowed
+      })
       try {
         return await fn(tx)
       } finally {

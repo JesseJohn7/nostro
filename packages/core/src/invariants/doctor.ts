@@ -58,6 +58,7 @@ async function recordsOf(reader: StoreReader, tenantId: string, movement: Moveme
   const movementId = movement.id
   return {
     movement,
+    refunds: await reader.listRefundLinks({tenantId,movementIds:[movementId]}),
     allocations: await reader.listAllocations({ tenantId, movementId }),
     exceptions: await reader.listExceptions({ tenantId, movementId }),
     entries: await reader.listJournalEntries({ tenantId, movementId }),
@@ -92,13 +93,49 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
 
   for (let afterSeq: number | undefined; ; ) {
     const page = await store.listMovements({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
+    const movementIds = page.map((movement) => movement.id)
+    const [pageAllocations, pageExceptions, pageEntries, pageRefunds] = await Promise.all([
+      store.listAllocations({ tenantId, movementIds }),
+      store.listExceptions({ tenantId, movementIds }),
+      store.listJournalEntries({ tenantId, movementIds }),
+      store.listRefundLinks({tenantId,movementIds}),
+    ])
+    const allocationsByMovement = new Map<string, typeof pageAllocations>()
+    const exceptionsByMovement = new Map<string, typeof pageExceptions>()
+    const entriesByMovement = new Map<string, typeof pageEntries>()
+    for (const allocation of pageAllocations) {
+      allocationsByMovement.set(allocation.movementId, [
+        ...(allocationsByMovement.get(allocation.movementId) ?? []),
+        allocation,
+      ])
+    }
+    for (const exception of pageExceptions) {
+      if (exception.movementId === null) continue
+      exceptionsByMovement.set(exception.movementId, [
+        ...(exceptionsByMovement.get(exception.movementId) ?? []),
+        exception,
+      ])
+    }
+    for (const entry of pageEntries) {
+      if (entry.movementId === null) continue
+      entriesByMovement.set(entry.movementId, [
+        ...(entriesByMovement.get(entry.movementId) ?? []),
+        entry,
+      ])
+    }
     for (const m of page) {
       total += 1
       byDisposition[m.disposition] += 1
       if (m.disposition === 'pending' && (oldestPending === null || m.occurredAt < oldestPending)) {
         oldestPending = m.occurredAt
       }
-      let found = checkMovement(await recordsOf(store, tenantId, m))
+      let found = checkMovement({
+        movement: m,
+        refunds: pageRefunds.filter(link=>link.creditMovementId===m.id || link.refundMovementId===m.id),
+        allocations: allocationsByMovement.get(m.id) ?? [],
+        exceptions: exceptionsByMovement.get(m.id) ?? [],
+        entries: entriesByMovement.get(m.id) ?? [],
+      })
       if (found.length > 0) {
         found = await store.transaction(async (tx) => {
           const locked = await tx.getMovement(tenantId, m.id)
@@ -120,6 +157,22 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
     const page = await store.listJournalEntries({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
     for (const entry of page) {
       entries += 1
+      if (entry.movementId === null || entry.kind === 'manual') {
+        for (const line of entry.lines) {
+          if (line.role === 'cash' || line.role === 'issued') {
+            findings.push({
+              invariant: 'I2',
+              severity: 'error',
+              code: 'manual_entry_touches_cash',
+              detail: `entry ${entry.id} is a manual entry but touches ${line.role}`,
+              movementId: entry.movementId,
+              entryId: entry.id,
+              account: line.account,
+              asset: line.amount.asset,
+            })
+          }
+        }
+      }
       const unbalanced = tally(entry, sums)
       if (unbalanced.length > 0 && !reported.has(`journal_unbalanced ${entry.id}`)) {
         findings.push({
@@ -136,6 +189,33 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
     }
     if (page.length < limit) break
     afterSeq = page[page.length - 1]!.seq
+  }
+
+  const seenMuxed = new Map<string, string>()
+  let after: number | undefined
+  for (;;) {
+    const page = await store.listExpectations({ tenantId, limit, ...(after === undefined ? {} : { afterSeq: after }) })
+    if (page.length === 0) break
+    after = page[page.length - 1]!.seq
+    for (const e of page) {
+      if (e.muxedId === null) continue
+      const key = `${e.account}:${e.muxedId.toString()}`
+      const first = seenMuxed.get(key)
+      if (first === undefined) seenMuxed.set(key, e.id)
+      else {
+        findings.push({
+          invariant: 'I1',
+          severity: 'error',
+          code: 'muxed_id_duplicate',
+          detail: `muxed id ${e.muxedId.toString()} is used by expectations ${first} and ${e.id} on ${e.account}`,
+          movementId: null,
+          entryId: null,
+          account: e.account,
+          asset: null,
+        })
+      }
+    }
+    if (page.length < limit) break
   }
 
   return {

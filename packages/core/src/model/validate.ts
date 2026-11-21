@@ -204,7 +204,7 @@ export function assertValidNewExpectation(e: NewExpectation): void {
   account("account", e.account);
   if (e.direction !== undefined) direction("direction", e.direction);
   positive("amount", e.amount);
-  if (e.muxedId != null) uint64("muxedId", e.muxedId);
+  if (e.muxedId != null && e.muxedId !== 'issue') uint64("muxedId", e.muxedId);
   if (e.memo != null) assertValidMemo("memo", e.memo);
   e.payers?.forEach((p, i) => classicAccount(`payers[${i}]`, p));
   if (e.dueAt != null) date("dueAt", e.dueAt);
@@ -217,6 +217,25 @@ export function assertValidNewExpectation(e: NewExpectation): void {
       assertStorableText(`metadata.${k}`, v);
     }
   }
+}
+
+export function assertValidExpectationChanges(c: import('./types.js').ExpectationChanges): void {
+  let any = false
+  if (c.amount !== undefined) { any = true; positive('amount', c.amount) }
+  if (c.muxedId !== undefined) { any = true; if (c.muxedId != null) uint64('muxedId', c.muxedId) }
+  if (c.memo !== undefined) { any = true; if (c.memo != null) assertValidMemo('memo', c.memo) }
+  if (c.payers !== undefined) { any = true; c.payers.forEach((p, i) => classicAccount(`payers[${i}]`, p)) }
+  if (c.dueAt !== undefined) { any = true; if (c.dueAt != null) date('dueAt', c.dueAt) }
+  if (c.expiresAt !== undefined) { any = true; if (c.expiresAt != null) date('expiresAt', c.expiresAt) }
+  if (c.metadata !== undefined) {
+    any = true
+    for (const [k, v] of Object.entries(c.metadata)) {
+      if (typeof v !== 'string') throw new ValidationError(`metadata.${k}`, 'must be a string')
+      assertStorableText('metadata', k)
+      assertStorableText(`metadata.${k}`, v)
+    }
+  }
+  if (!any) throw new ValidationError('changes', 'must include at least one field to change')
 }
 
 export function assertValidNewAllocation(a: NewAllocation): void {

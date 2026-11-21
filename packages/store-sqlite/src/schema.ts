@@ -27,13 +27,16 @@ const LINE_ROLES = list([
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
 ])
 const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
+const MANUAL_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual'])
 const EVENT_TYPES = [
   'movement.decided',
   'expectation.partially_paid',
   'expectation.settled',
   'expectation.cancelled',
+  'expectation.amended',
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
@@ -51,6 +54,7 @@ const EXCEPTION_CODES = list([
   'DUPLICATE_PAYMENT',
   'PARTIAL_UNRESOLVED',
   'LATE_BEYOND_WINDOW',
+  'EXPECTATION_EXPIRED',
   'MEMO_MISSING',
   'MEMO_MALFORMED',
   'MEMO_TRUNCATED',
@@ -273,5 +277,204 @@ export const MIGRATIONS: readonly string[] = [
     ) WITHOUT ROWID;
     CREATE INDEX IF NOT EXISTS expectation_reference_keys
       ON expectation_reference_index (tenant_id, normalized);
+  `,
+  // 7: export destination high-water marks
+  `
+    CREATE TABLE IF NOT EXISTS exports (
+      tenant_id     TEXT NOT NULL,
+      destination   TEXT NOT NULL,
+      last_seq      INTEGER NOT NULL DEFAULT 0,
+      last_exported_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
+      control_totals TEXT NOT NULL DEFAULT '{}',
+      checksum      TEXT NOT NULL DEFAULT '',
+PRIMARY KEY (tenant_id, destination)
+    );
+  `,
+  // 8: per-tenant accrual mode for expectations
+  `
+    CREATE TABLE IF NOT EXISTS accrual_modes (
+      tenant_id     TEXT NOT NULL PRIMARY KEY,
+      active        INTEGER NOT NULL DEFAULT 0
+    );
+  `,
+`
+    CREATE TABLE exceptions_new (
+      seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+      id              TEXT NOT NULL UNIQUE,
+      tenant_id       TEXT NOT NULL,
+      code            TEXT NOT NULL CHECK (code IN (${EXCEPTION_CODES})),
+      status          TEXT NOT NULL CHECK (status IN (${EXCEPTION_STATUSES})),
+      movement_id     TEXT REFERENCES movements (id),
+      expectation_id  TEXT REFERENCES expectations (id),
+      account         TEXT,
+      asset           TEXT,
+      decimals        INTEGER,
+      amount          TEXT,
+      detail          TEXT NOT NULL,
+      evidence        TEXT NOT NULL,
+      opened_at       INTEGER NOT NULL,
+      resolved_at     INTEGER,
+      resolution_note TEXT,
+      CHECK (movement_id IS NOT NULL OR expectation_id IS NOT NULL OR account IS NOT NULL),
+      CHECK ((amount IS NULL) = (asset IS NULL) AND (asset IS NULL) = (decimals IS NULL))
+    );
+    INSERT INTO exceptions_new (seq,id,tenant_id,code,status,movement_id,expectation_id,account,asset,decimals,amount,detail,evidence,opened_at,resolved_at,resolution_note)
+      SELECT seq,id,tenant_id,code,status,movement_id,expectation_id,account,asset,decimals,amount,detail,evidence,opened_at,resolved_at,resolution_note FROM exceptions;
+
+    CREATE TABLE journal_lines_new (
+      entry_id       TEXT NOT NULL REFERENCES journal_entries (id),
+      line_no        INTEGER NOT NULL CHECK (line_no >= 1),
+      tenant_id      TEXT NOT NULL,
+      account        TEXT NOT NULL,
+      role           TEXT NOT NULL CHECK (role IN (${LINE_ROLES})),
+      side           TEXT NOT NULL CHECK (side IN ('debit', 'credit')),
+      asset          TEXT NOT NULL,
+      decimals       INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount         TEXT NOT NULL ${positive('amount')},
+      expectation_id TEXT REFERENCES expectations (id),
+      exception_id   TEXT REFERENCES exceptions_new (id),
+      PRIMARY KEY (entry_id, line_no)
+    );
+    INSERT INTO journal_lines_new (entry_id,line_no,tenant_id,account,role,side,asset,decimals,amount,expectation_id,exception_id)
+      SELECT entry_id,line_no,tenant_id,account,role,side,asset,decimals,amount,expectation_id,exception_id FROM journal_lines;
+    DROP TABLE journal_lines;
+    DROP TABLE exceptions;
+    ALTER TABLE exceptions_new RENAME TO exceptions;
+    ALTER TABLE journal_lines_new RENAME TO journal_lines;
+    CREATE INDEX exceptions_queue ON exceptions (tenant_id, status, code);
+    CREATE INDEX exceptions_movement ON exceptions (movement_id) WHERE movement_id IS NOT NULL;
+    CREATE UNIQUE INDEX exceptions_expiry_once ON exceptions (tenant_id, expectation_id)
+      WHERE code = 'EXPECTATION_EXPIRED' AND expectation_id IS NOT NULL;
+    CREATE INDEX journal_lines_account ON journal_lines (tenant_id, account, asset);
+    ${appendOnly('journal_lines')}
+
+    CREATE TABLE events_new (
+      seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+      id         TEXT NOT NULL UNIQUE,
+      tenant_id  TEXT NOT NULL,
+      type       TEXT NOT NULL CHECK (type IN (${list(EVENT_TYPES)})),
+      subject_id TEXT NOT NULL,
+      payload    TEXT NOT NULL CHECK (json_valid(payload)),
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO events_new (seq,id,tenant_id,type,subject_id,payload,created_at)
+      SELECT seq,id,tenant_id,type,subject_id,payload,created_at FROM events;
+    DROP TABLE events;
+    ALTER TABLE events_new RENAME TO events;
+    CREATE INDEX events_tenant ON events (tenant_id, seq);
+    CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+    CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+
+    DROP TRIGGER IF EXISTS expectations_muxed_id_insert_unique;
+    DROP TRIGGER IF EXISTS expectations_muxed_id_update_unique;
+    CREATE TRIGGER expectations_muxed_id_insert_unique BEFORE INSERT ON expectations
+      WHEN NEW.muxed_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM expectations
+        WHERE tenant_id = NEW.tenant_id AND account = NEW.account AND muxed_id = NEW.muxed_id
+      )
+      BEGIN SELECT RAISE(ABORT, 'muxed id already used on account'); END;
+    CREATE TRIGGER expectations_muxed_id_update_unique BEFORE UPDATE ON expectations
+      WHEN NEW.muxed_id IS NOT NULL AND NEW.muxed_id IS NOT OLD.muxed_id AND EXISTS (
+        SELECT 1 FROM expectations
+        WHERE tenant_id = NEW.tenant_id AND account = NEW.account AND muxed_id = NEW.muxed_id AND id <> NEW.id
+      )
+      BEGIN SELECT RAISE(ABORT, 'muxed id already used on account'); END;
+  `,
+
+  // Support batched exception lookups by expectation.
+  `CREATE INDEX IF NOT EXISTS exceptions_expectation
+    ON exceptions (tenant_id, expectation_id) WHERE expectation_id IS NOT NULL;`,
+
+  // Event retention watermark and guarded pruning.
+  `
+    CREATE TABLE event_prune_state (
+      tenant_id TEXT PRIMARY KEY,
+      pruned_through INTEGER NOT NULL DEFAULT 0 CHECK (pruned_through >= 0)
+    );
+    DROP TRIGGER events_no_delete;
+    CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+      WHEN nostro_event_prune_allowed() = 0
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+  `,
+  // 12: manual journal entry kind, and movement valuations
+  `
+    CREATE TEMP TABLE saved_journal_lines AS SELECT * FROM journal_lines;
+    DROP TABLE journal_lines;
+    DROP TABLE IF EXISTS journal_entries_new;
+    CREATE TABLE journal_entries_new (
+      seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+      id           TEXT NOT NULL UNIQUE,
+      tenant_id    TEXT NOT NULL,
+      movement_id  TEXT REFERENCES movements (id),
+      posting_no   INTEGER CHECK (posting_no >= 1),
+      kind         TEXT NOT NULL CHECK (kind IN (${MANUAL_ENTRY_KINDS})),
+      effective_at INTEGER NOT NULL,
+      posted_at    INTEGER NOT NULL,
+      description  TEXT NOT NULL,
+      CHECK ((movement_id IS NULL) = (posting_no IS NULL)),
+      UNIQUE (movement_id, posting_no)
+    );
+    INSERT INTO journal_entries_new (seq, id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+      SELECT seq, id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description FROM journal_entries;
+    DROP TABLE journal_entries;
+    ALTER TABLE journal_entries_new RENAME TO journal_entries;
+    CREATE INDEX journal_entries_effective ON journal_entries (tenant_id, effective_at);
+    CREATE INDEX journal_entries_movement ON journal_entries (tenant_id, movement_id, seq);
+    ${appendOnly('journal_entries')}
+    CREATE TABLE journal_lines (
+      entry_id TEXT NOT NULL REFERENCES journal_entries(id),
+      line_no INTEGER NOT NULL CHECK (line_no >= 1), tenant_id TEXT NOT NULL,
+      account TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN (${LINE_ROLES}, 'other')),
+      side TEXT NOT NULL CHECK (side IN ('debit','credit')),
+      asset TEXT NOT NULL, decimals INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount TEXT NOT NULL ${positive('amount')},
+      expectation_id TEXT REFERENCES expectations(id), exception_id TEXT REFERENCES exceptions(id),
+      PRIMARY KEY(entry_id,line_no)
+    );
+    INSERT INTO journal_lines SELECT * FROM saved_journal_lines;
+    DROP TABLE saved_journal_lines;
+    CREATE INDEX journal_lines_account ON journal_lines(tenant_id,account,asset);
+    ${appendOnly('journal_lines')}
+
+    CREATE TABLE IF NOT EXISTS movement_valuations (
+      tenant_id        TEXT NOT NULL,
+      movement_id      TEXT NOT NULL REFERENCES movements (id),
+      reporting_asset  TEXT NOT NULL,
+      price_n          TEXT NOT NULL,
+      price_d          TEXT NOT NULL,
+      price_source     TEXT NOT NULL,
+      price_timestamp  INTEGER NOT NULL,
+      decimals         INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      value            TEXT NOT NULL,
+      valued_at        INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, movement_id)
+    );
+    CREATE INDEX IF NOT EXISTS movement_valuations_reporting ON movement_valuations (tenant_id, reporting_asset);
+  `,
+  `
+    CREATE TABLE refund_links (
+      seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT NOT NULL UNIQUE, tenant_id TEXT NOT NULL,
+      credit_movement_id TEXT NOT NULL REFERENCES movements(id), refund_movement_id TEXT NOT NULL UNIQUE REFERENCES movements(id),
+      asset TEXT NOT NULL, decimals INTEGER NOT NULL CHECK(decimals BETWEEN 0 AND 38),
+      amount TEXT NOT NULL ${positive('amount')}, residual_amount TEXT NOT NULL, created_at INTEGER NOT NULL
+    );
+    CREATE INDEX refund_credit ON refund_links(tenant_id,credit_movement_id,seq);
+    CREATE INDEX IF NOT EXISTS movements_transaction ON movements(tenant_id,account,tx_hash);
+    ${appendOnly('refund_links')}
+    CREATE TABLE journal_lines_refunds (
+      entry_id TEXT NOT NULL REFERENCES journal_entries(id), line_no INTEGER NOT NULL CHECK(line_no>=1),
+      tenant_id TEXT NOT NULL, account TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN (${LINE_ROLES},'other','refund_clearing')),
+      side TEXT NOT NULL CHECK(side IN ('debit','credit')), asset TEXT NOT NULL, decimals INTEGER NOT NULL CHECK(decimals BETWEEN 0 AND 38),
+      amount TEXT NOT NULL ${positive('amount')}, expectation_id TEXT REFERENCES expectations(id), exception_id TEXT REFERENCES exceptions(id),
+      PRIMARY KEY(entry_id,line_no)
+    );
+    INSERT INTO journal_lines_refunds SELECT * FROM journal_lines;
+    DROP TABLE journal_lines;
+    ALTER TABLE journal_lines_refunds RENAME TO journal_lines;
+    CREATE INDEX journal_lines_account ON journal_lines(tenant_id,account,asset);
+    ${appendOnly('journal_lines')}
   `,
 ]

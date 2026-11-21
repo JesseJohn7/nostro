@@ -19,8 +19,10 @@ import type {
   Allocation,
   CursorKey,
   Disposition,
+  Direction,
   ExceptionRecord,
   Expectation,
+  ExpectationChanges,
   JournalEntry,
   Movement,
   NewAllocation,
@@ -28,6 +30,9 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '../model/index.js'
 import {
   assertValidNewJournalEntry,
@@ -37,6 +42,9 @@ import {
   assertValidNewMovement,
 } from '../model/index.js'
 import type {
+  RefundLink,
+  RefundQuery,
+  ExportBatch,
   AllocationQuery,
   ExceptionQuery,
   ExpectationQuery,
@@ -51,6 +59,7 @@ import type {
   StoreTx,
 } from './store.js'
 import {
+  amendExpectationRecord,
   checkAllocation,
   checkCancel,
   checkCursorValue,
@@ -59,12 +68,17 @@ import {
   checkJournalPeriodClose,
   checkJournalPeriodReopen,
   checkResolution,
+  issueMuxedId,
   storedMemo,
   sameFacts,
 } from './rules.js'
+import { Money } from '../money/index.js'
+import { refundParts, refundCoverage } from './refunds.js'
+import { postAccrual } from './accrual.js'
 import { ConstraintError, NotFoundError, TransactionClosedError } from './store.js'
-import type { EventQuery, NewOutboxEvent, OutboxEvent } from './events.js'
-import { exceptionChanged, expectationChanged, movementDecided } from './events.js'
+import { EventHistoryPrunedError } from './events.js'
+import type { EventQuery, NewOutboxEvent, OutboxEvent, PruneEventsResult } from './events.js'
+import { exceptionChanged, expectationAmended, expectationChanged, movementDecided } from './events.js'
 import { expectationReferenceKeys } from '../matching/reference.js'
 
 export interface MemoryStoreOptions {
@@ -91,8 +105,11 @@ interface State {
   readonly journal: Map<string, JournalEntry>
   eventSeq: number
   readonly events: Map<string, OutboxEvent>
+  readonly eventPrunedThrough: Map<string, number>
   /** Movement id → its entry ids in posting order. Arrays are replaced, never pushed to. */
   readonly journalByMovement: Map<string, readonly string[]>
+  readonly refunds: Map<string, RefundLink>
+  readonly valuations: Map<string, MovementValuation>
   periodActions: readonly {
     readonly tenantId: string
     readonly action: 'close' | 'reopen'
@@ -119,7 +136,10 @@ function emptyState(): State {
     journalByMovement: new Map(),
     eventSeq: 0,
     events: new Map(),
+    eventPrunedThrough: new Map(),
     periodActions: [],
+    refunds: new Map(),
+    valuations: new Map(),
   }
 }
 
@@ -140,7 +160,10 @@ function cloneState(s: State): State {
     journalByMovement: new Map(s.journalByMovement),
     eventSeq: s.eventSeq,
     events: new Map(s.events),
+    eventPrunedThrough: new Map(s.eventPrunedThrough),
     periodActions: [...s.periodActions],
+    refunds: new Map(s.refunds),
+    valuations: new Map(s.valuations),
   }
 }
 
@@ -150,11 +173,38 @@ const movementKey = (m: { tenantId: string; network: string; source: string; ext
 const cursorKey = (k: CursorKey) => key(k.tenantId, k.network, k.source, k.account)
 const copyDate = (d: Date): Date => new Date(d.getTime())
 
+const addReferenceKeys = (state: State, e: Expectation): void => {
+  for (const normalized of expectationReferenceKeys(e.reference, e.memo)) {
+    const indexKey = key(e.tenantId, normalized)
+    const ids = state.expectationKeys.get(indexKey) ?? []
+    if (!ids.includes(e.id)) state.expectationKeys.set(indexKey, [...ids, e.id])
+  }
+}
+
+const removeReferenceKeys = (state: State, e: Expectation): void => {
+  for (const normalized of expectationReferenceKeys(e.reference, e.memo)) {
+    const indexKey = key(e.tenantId, normalized)
+    const ids = (state.expectationKeys.get(indexKey) ?? []).filter((id) => id !== e.id)
+    if (ids.length === 0) state.expectationKeys.delete(indexKey)
+    else state.expectationKeys.set(indexKey, ids)
+  }
+}
+
 abstract class MemoryReader implements StoreReader {
   /** The state reads run against: committed state, or a transaction's draft. */
   protected abstract snapshot(): State
 
   protected check(): void {}
+
+  async listRefundLinks(q: RefundQuery): Promise<RefundLink[]> {
+    this.check()
+    return [...this.snapshot().refunds.values()].filter(link => link.tenantId === q.tenantId &&
+      (q.creditMovementId === undefined || link.creditMovementId === q.creditMovementId) &&
+      (q.refundMovementId === undefined || link.refundMovementId === q.refundMovementId) &&
+      (q.movementIds === undefined || q.movementIds.includes(link.creditMovementId) || q.movementIds.includes(link.refundMovementId)))
+  }
+
+  async accrualGetMode(_tenantId: string): Promise<boolean> { this.check(); return false }
 
   async getMovement(tenantId: string, id: string): Promise<Movement | null> {
     this.check()
@@ -164,11 +214,15 @@ abstract class MemoryReader implements StoreReader {
 
   async listMovements(q: MovementQuery): Promise<Movement[]> {
     this.check()
+    if (q.ids?.length === 0) return []
+    const ids = q.ids === undefined ? null : new Set(q.ids)
     const out: Movement[] = []
     for (const m of this.snapshot().movements.values()) {
       if (m.tenantId !== q.tenantId) continue
+      if (ids !== null && !ids.has(m.id)) continue
       if (q.disposition !== undefined && m.disposition !== q.disposition) continue
       if (q.account !== undefined && m.account !== q.account) continue
+      if (q.txHash !== undefined && m.txHash !== q.txHash) continue
       if (q.afterSeq !== undefined && m.seq <= q.afterSeq) continue
       out.push(m)
     }
@@ -201,9 +255,12 @@ abstract class MemoryReader implements StoreReader {
 
   async listExpectations(q: ExpectationQuery): Promise<Expectation[]> {
     this.check()
+    if (q.ids?.length === 0) return []
+    const ids = q.ids === undefined ? null : new Set(q.ids)
     const out: Expectation[] = []
     for (const e of this.snapshot().expectations.values()) {
       if (e.tenantId !== q.tenantId) continue
+      if (ids !== null && !ids.has(e.id)) continue
       if (q.account !== undefined && e.account !== q.account) continue
       if (q.asset !== undefined && e.amount.asset !== q.asset) continue
       if (q.direction !== undefined && e.direction !== q.direction) continue
@@ -218,11 +275,16 @@ abstract class MemoryReader implements StoreReader {
 
   async listAllocations(q: AllocationQuery): Promise<Allocation[]> {
     this.check()
+    if (q.movementIds?.length === 0 || q.expectationIds?.length === 0) return []
+    const movementIds = q.movementIds === undefined ? null : new Set(q.movementIds)
+    const expectationIds = q.expectationIds === undefined ? null : new Set(q.expectationIds)
     const out: Allocation[] = []
     for (const a of this.snapshot().allocations.values()) {
       if (a.tenantId !== q.tenantId) continue
       if (q.movementId !== undefined && a.movementId !== q.movementId) continue
+      if (movementIds !== null && !movementIds.has(a.movementId)) continue
       if (q.expectationId !== undefined && a.expectationId !== q.expectationId) continue
+      if (expectationIds !== null && !expectationIds.has(a.expectationId)) continue
       out.push(a)
     }
     return out
@@ -236,13 +298,20 @@ abstract class MemoryReader implements StoreReader {
 
   async listExceptions(q: ExceptionQuery): Promise<ExceptionRecord[]> {
     this.check()
+    if (q.ids?.length === 0 || q.movementIds?.length === 0 || q.expectationIds?.length === 0) return []
+    const ids = q.ids === undefined ? null : new Set(q.ids)
+    const movementIds = q.movementIds === undefined ? null : new Set(q.movementIds)
+    const expectationIds = q.expectationIds === undefined ? null : new Set(q.expectationIds)
     const out: ExceptionRecord[] = []
     for (const e of this.snapshot().exceptions.values()) {
       if (e.tenantId !== q.tenantId) continue
+      if (ids !== null && !ids.has(e.id)) continue
       if (q.status !== undefined && e.status !== q.status) continue
       if (q.code !== undefined && e.code !== q.code) continue
       if (q.movementId !== undefined && e.movementId !== q.movementId) continue
+      if (movementIds !== null && (e.movementId === null || !movementIds.has(e.movementId))) continue
       if (q.expectationId !== undefined && e.expectationId !== q.expectationId) continue
+      if (expectationIds !== null && (e.expectationId === null || !expectationIds.has(e.expectationId))) continue
       if (q.afterSeq !== undefined && e.seq <= q.afterSeq) continue
       out.push(e)
       if (q.limit !== undefined && out.length >= q.limit) break
@@ -252,6 +321,10 @@ abstract class MemoryReader implements StoreReader {
 
   async listEvents(q: EventQuery): Promise<OutboxEvent[]> {
     this.check()
+    const prunedThrough = this.snapshot().eventPrunedThrough.get(q.tenantId) ?? 0
+    if (q.afterSeq !== undefined && q.afterSeq < prunedThrough) {
+      throw new EventHistoryPrunedError(q.tenantId, q.afterSeq, prunedThrough)
+    }
     const out: OutboxEvent[] = []
     for (const e of this.snapshot().events.values()) {
       if (e.tenantId !== q.tenantId) continue
@@ -262,15 +335,23 @@ abstract class MemoryReader implements StoreReader {
     return out
   }
 
+  async getEventsPrunedThrough(tenantId: string): Promise<number> {
+    this.check()
+    return this.snapshot().eventPrunedThrough.get(tenantId) ?? 0
+  }
+
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
     this.check()
+    if (q.movementIds?.length === 0) return []
     const state = this.snapshot()
     const ids =
       q.movementId === undefined ? [...state.journal.keys()] : (state.journalByMovement.get(q.movementId) ?? [])
+    const movementIds = q.movementIds === undefined ? null : new Set(q.movementIds)
     const out: JournalEntry[] = []
     for (const id of ids) {
       const e = state.journal.get(id)!
       if (e.tenantId !== q.tenantId) continue
+      if (movementIds !== null && (e.movementId === null || !movementIds.has(e.movementId))) continue
       if (q.afterSeq !== undefined && e.seq <= q.afterSeq) continue
       if (q.effectiveFrom !== undefined && e.effectiveAt.getTime() < q.effectiveFrom.getTime()) continue
       if (q.effectiveBefore !== undefined && e.effectiveAt.getTime() >= q.effectiveBefore.getTime()) continue
@@ -302,6 +383,23 @@ abstract class MemoryReader implements StoreReader {
         : null
     }
     return null
+  }
+
+  async getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null> {
+    this.check()
+    return this.snapshot().valuations.get(`${tenantId}:${movementId}`) ?? null
+  }
+
+  async listValuations(q: ValuationQuery): Promise<MovementValuation[]> {
+    this.check()
+    const out: MovementValuation[] = []
+    for (const v of this.snapshot().valuations.values()) {
+      if (v.tenantId !== q.tenantId) continue
+      if (q.movementId !== undefined && v.movementId !== q.movementId) continue
+      if (q.reportingAsset !== undefined && v.reportingAsset !== q.reportingAsset) continue
+      out.push(v)
+    }
+    return out
   }
 }
 
@@ -446,6 +544,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       [...this.draft.exceptions.values()].filter((e) => e.movementId === m.id),
       disposition,
       reason,
+      refundCoverage(m, await this.listRefundLinks({tenantId,movementIds:[m.id]})),
     )
     const next: Movement = Object.freeze({
       ...m,
@@ -463,6 +562,28 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.draft.cursors.set(cursorKey(k), value)
   }
 
+  async pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult> {
+    this.check()
+    if (!Number.isFinite(olderThan.getTime())) throw new Error('olderThan must be a valid date')
+    const events = [...this.draft.events.values()]
+      .filter((event) => event.tenantId === tenantId)
+      .sort((a, b) => a.seq - b.seq)
+    const firstRecent = events.find((event) => event.createdAt > olderThan)
+    const prefixThrough = firstRecent?.seq === undefined
+      ? events.at(-1)?.seq ?? 0
+      : firstRecent.seq - 1
+    const consumerPositions = [...this.draft.cursors.entries()].flatMap(([storedKey, value]) => {
+      const [cursorTenant, network, source] = JSON.parse(storedKey) as string[]
+      return cursorTenant === tenantId && network === 'nostro' && source === 'outbox' ? [Number(value)] : []
+    })
+    const safeThrough = Math.min(prefixThrough, consumerPositions.length === 0 ? prefixThrough : Math.min(...consumerPositions))
+    const removed = events.filter((event) => event.seq <= safeThrough && event.createdAt <= olderThan)
+    for (const event of removed) this.draft.events.delete(event.id)
+    const prunedThrough = Math.max(this.draft.eventPrunedThrough.get(tenantId) ?? 0, removed.at(-1)?.seq ?? 0)
+    if (prunedThrough > 0) this.draft.eventPrunedThrough.set(tenantId, prunedThrough)
+    return { deleted: removed.length, prunedThrough }
+  }
+
   async insertExpectation(n: NewExpectation): Promise<Expectation> {
     this.check()
     assertValidNewExpectation(n)
@@ -473,6 +594,26 @@ class MemoryTx extends MemoryReader implements StoreTx {
         `reference ${JSON.stringify(n.reference)} already exists in this tenant`,
       )
     }
+    let muxedId: bigint | null
+    if (n.muxedId === 'issue') {
+      let max = 0n
+      for (const e of this.draft.expectations.values()) {
+        if (e.tenantId === n.tenantId && e.account === n.account && e.muxedId !== null && e.muxedId > max) max = e.muxedId
+      }
+      muxedId = issueMuxedId(max)
+    } else {
+      muxedId = n.muxedId ?? null
+    }
+    if (muxedId !== null) {
+      for (const e of this.draft.expectations.values()) {
+        if (e.tenantId === n.tenantId && e.account === n.account && e.muxedId === muxedId) {
+          throw new ConstraintError(
+            'expectation_muxed_id_unique',
+            `muxed id ${muxedId.toString()} is already used on account ${n.account}`,
+          )
+        }
+      }
+    }
     const now = this.now()
     const expectation: Expectation = Object.freeze({
       id: this.ids(),
@@ -482,7 +623,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       account: n.account,
       direction: n.direction ?? 'credit',
       amount: n.amount,
-      muxedId: n.muxedId ?? null,
+      muxedId,
       memo: n.memo == null ? null : Object.freeze(storedMemo(n.memo)),
       payers: Object.freeze([...(n.payers ?? [])]),
       dueAt: n.dueAt == null ? null : copyDate(n.dueAt),
@@ -495,11 +636,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
     })
     this.draft.expectations.set(expectation.id, expectation)
     this.draft.expectationRefs.set(refKey, expectation.id)
-    for (const normalized of expectationReferenceKeys(n.reference, expectation.memo)) {
-      const indexKey = key(n.tenantId, normalized)
-      const ids = this.draft.expectationKeys.get(indexKey) ?? []
-      this.draft.expectationKeys.set(indexKey, [...ids, expectation.id])
-    }
+    addReferenceKeys(this.draft, expectation)
     return expectation
   }
 
@@ -518,6 +655,27 @@ class MemoryTx extends MemoryReader implements StoreTx {
     return next
   }
 
+  async amendExpectation(tenantId: string, id: string, changes: ExpectationChanges, reason: string): Promise<Expectation> {
+    this.check()
+    const e = this.expectation(tenantId, id)
+    const allocations = this.allocationsOf('expectationId', e.id)
+    let muxedIdTaken = false
+    if (changes.muxedId !== undefined && changes.muxedId !== e.muxedId && changes.muxedId !== null) {
+      for (const other of this.draft.expectations.values()) {
+        if (other.id !== e.id && other.tenantId === tenantId && other.account === e.account && other.muxedId === changes.muxedId) {
+          muxedIdTaken = true
+          break
+        }
+      }
+    }
+    const next = amendExpectationRecord(e, allocations, changes, reason, this.now(), muxedIdTaken)
+    this.draft.expectations.set(id, next)
+    removeReferenceKeys(this.draft, e)
+    addReferenceKeys(this.draft, next)
+    this.emit(expectationAmended(next, e, reason))
+    return next
+  }
+
   async allocate(n: NewAllocation): Promise<Allocation> {
     this.check()
     assertValidNewAllocation(n)
@@ -530,6 +688,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       e,
       this.allocationsOf('movementId', m.id),
       this.allocationsOf('expectationId', e.id),
+      refundCoverage(m, await this.listRefundLinks({tenantId:n.tenantId,movementIds:[m.id]})),
     )
 
     const now = this.now()
@@ -637,6 +796,45 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.emit(exceptionChanged(next))
     return next
   }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink> {
+    this.check()
+    const [existing] = await this.listRefundLinks({tenantId,refundMovementId})
+    if (existing) {
+      if (existing.creditMovementId !== creditMovementId) throw new ConstraintError('refund_invalid','refund already linked to another credit')
+      return existing
+    }
+    const parts = await refundParts(this,tenantId,creditMovementId,refundMovementId)
+    const link = Object.freeze({id:this.ids(),...parts,createdAt:this.now()})
+    this.draft.refunds.set(link.id,link)
+    return link
+  }
+
+  async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {
+    this.check()
+    const now = this.now()
+    for (const n of batch) {
+      this.movement(n.tenantId, n.movementId)
+      const k = `${n.tenantId}:${n.movementId}`
+      if (this.draft.valuations.has(k)) continue
+      const v: MovementValuation = Object.freeze({
+        movementId: n.movementId,
+        tenantId: n.tenantId,
+        reportingAsset: n.reportingAsset,
+        priceNumerator: n.priceNumerator,
+        priceDenominator: n.priceDenominator,
+        priceSource: n.priceSource,
+        priceTimestamp: copyDate(n.priceTimestamp),
+        value: n.value,
+        valuedAt: n.valuedAt ? copyDate(n.valuedAt) : now,
+      })
+      this.draft.valuations.set(k, v)
+    }
+  }
 }
 
 export class MemoryStore extends MemoryReader implements Store {
@@ -649,6 +847,25 @@ export class MemoryStore extends MemoryReader implements Store {
     super()
     this.ids = options.ids ?? (() => globalThis.crypto.randomUUID())
     this.now = options.now ?? (() => new Date())
+  }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await this.transaction(tx => tx.postAccrualExpectation(expectationId, tenantId, direction, amount, reference))
+  }
+
+  private readonly exportMarks = new Map<string, ExportBatch>()
+
+  async exportGetMark(tenantId: string, destination: string): Promise<string | null> {
+    const mark = this.exportMarks.get(key(tenantId, destination))
+    return mark ? String(mark.last_seq) : null
+  }
+
+  async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
+    this.exportMarks.set(key(tenantId, destination), { destination, last_seq: lastSeq, last_exported_at: this.now().getTime(), control_totals: '{}', checksum: '' })
+  }
+
+  async exportListBatches(tenantId: string): Promise<ExportBatch[]> {
+    return [...this.exportMarks.entries()].filter(([k]) => JSON.parse(k)[0] === tenantId).map(([, v]) => ({ ...v }))
   }
 
   protected snapshot(): State {

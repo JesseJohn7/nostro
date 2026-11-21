@@ -11,9 +11,13 @@ import { doctor } from './commands/doctor.js'
 import { exceptions } from './commands/exceptions.js'
 import { expect } from './commands/expect.js'
 import { expectations } from './commands/expectations.js'
+import { cancel } from './commands/cancel.js'
+import { amend } from './commands/amend.js'
 import { exportJournal } from './commands/export.js'
+import { journalCommand } from './commands/journal.js'
 import { migrate } from './commands/migrate.js'
 import { post } from './commands/post.js'
+import { pruneEventsCommand } from './commands/prune-events.js'
 import { period } from './commands/period.js'
 import { reconcile } from './commands/reconcile.js'
 import { report } from './commands/report.js'
@@ -28,6 +32,8 @@ export const COMMANDS: readonly Command[] = [
   sync,
   expect,
   expectations,
+  cancel,
+  amend,
   reconcile,
   exceptions,
   resolve,
@@ -37,6 +43,8 @@ export const COMMANDS: readonly Command[] = [
   report,
   doctor,
   exportJournal,
+  journalCommand,
+  pruneEventsCommand,
   serve,
 ]
 

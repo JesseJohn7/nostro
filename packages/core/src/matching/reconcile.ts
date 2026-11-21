@@ -23,12 +23,8 @@
  * a second payment is caught as DUPLICATE_PAYMENT whether the payer used the
  * muxed address or quoted the reference again. Settled candidates have nothing
  * owing, which the engine already refuses; no engine change is needed.
- *
- * Refunds: a debit whose `MEMO_RETURN` equals the transaction hash of a
- * recorded credit on the same account is a refund of that credit. It is linked
- * to the credit's refund-able allocations (see `refundLinkFor`) rather than
- * raised as UNEXPECTED_DEBIT. Design is pending review on the issue.
  */
+import { recogniseRefund } from './refunds.js'
 import type { PostOptions } from '../journal/index.js'
 import { postMovement } from '../journal/index.js'
 import type { ExceptionCode, Expectation, Movement } from '../model/index.js'
@@ -80,11 +76,22 @@ async function candidatesFor(tx: StoreTx, movement: Movement): Promise<Candidate
     if (normalized !== '') add(await tx.getExpectationsByNormalizedReference(tenantId, normalized))
   }
 
+  const allocations = await tx.listAllocations({
+    tenantId,
+    expectationIds: [...found.keys()],
+  })
+  const allocationsByExpectation = new Map<string, typeof allocations>()
+  for (const allocation of allocations) {
+    allocationsByExpectation.set(allocation.expectationId, [
+      ...(allocationsByExpectation.get(allocation.expectationId) ?? []),
+      allocation,
+    ])
+  }
+
   const candidates: Candidate[] = []
   for (const expectation of found.values()) {
-    const allocations = await tx.listAllocations({ tenantId, expectationId: expectation.id })
     const paid = sumAmounts(
-      allocations.map((a) => a.amount),
+      (allocationsByExpectation.get(expectation.id) ?? []).map((a) => a.amount),
       expectation.amount,
     )
     candidates.push({ expectation, remaining: expectation.amount.subtract(paid) })
@@ -92,43 +99,43 @@ async function candidatesFor(tx: StoreTx, movement: Movement): Promise<Candidate
   return candidates
 }
 
-type Outcome = 'allocated' | 'partial' | 'ignored' | 'skipped' | 'refunded' | ExceptionCode
-
-/**
- * Find the recorded credit a debit refunds: a credit on the same account whose
- * transaction hash equals the debit's return memo. Returns null when the memo
- * names no known credit (the caller then falls through to the ordinary path).
- */
-async function refundedCreditFor(tx: StoreTx, movement: Movement): Promise<Movement | null> {
-  if (movement.direction !== 'out' || movement.memo?.type !== 'return') return null
-  const hash = movement.memo.value
-  const credits = await tx.listMovements({
-    tenantId: movement.tenantId,
-    account: movement.account,
-    direction: 'in',
-  })
-  return credits.find((c) => c.txHash === hash) ?? null
-}
+type Outcome = 'allocated' | 'partial' | 'ignored' | 'skipped' | ExceptionCode
 
 async function reconcileOne(
   tx: StoreTx,
   tenantId: string,
   id: string,
   options: ReconcileOptions,
-): Promise<{ outcome: Outcome; posted: boolean }> {
-  const outcome = await decideOne(tx, tenantId, id, options)
-  if (outcome === 'skipped') return { outcome, posted: false }
-  return { outcome, posted: (await postMovement(tx, tenantId, id, options)) !== null }
+): Promise<{ outcome: Outcome; posted: number }> {
+  let extraPostings = 0
+  const outcome = await decideOne(tx, tenantId, id, options, () => {
+    extraPostings++
+  })
+  if (outcome === 'skipped') return { outcome, posted: 0 }
+  return { outcome, posted: extraPostings + Number((await postMovement(tx, tenantId, id, options)) !== null) }
 }
 
-async function decideOne(tx: StoreTx, tenantId: string, id: string, options: DecideOptions): Promise<Outcome> {
+async function decideOne(
+  tx: StoreTx,
+  tenantId: string,
+  id: string,
+  options: ReconcileOptions,
+  onPost: () => void = () => {},
+): Promise<Outcome> {
   const movement = await tx.getMovement(tenantId, id)
   if (movement === null || movement.disposition !== 'pending') return 'skipped'
 
-  const credit = await refundedCreditFor(tx, movement)
-  if (credit !== null) {
-    await tx.setDisposition(tenantId, id, 'allocated')
-    return 'refunded'
+  if (movement.direction === 'debit' && movement.kind === 'transfer' && movement.memo?.type === 'return') {
+    return recogniseRefund(
+      tx,
+      movement,
+      options,
+      async (creditId) => {
+        await decideOne(tx, tenantId, creditId, options, onPost)
+        if (await postMovement(tx, tenantId, creditId, options)) onPost()
+      },
+      onPost,
+    )
   }
 
   const decision = decide(movement, await candidatesFor(tx, movement), options)
@@ -169,7 +176,8 @@ async function decideOne(tx: StoreTx, tenantId: string, id: string, options: Dec
         expectationId: decision.expectationId,
         account: movement.account,
         amount: decision.residual,
-        detail: `Paid ${movement.amount.toString()}; ${decision.amount.toString()} settled the expectation, ` +
+        detail:
+          `Paid ${movement.amount.toString()}; ${decision.amount.toString()} settled the expectation, ` +
           `${decision.residual.toString()} is left over.`,
         evidence: decision.evidence,
       })
@@ -190,7 +198,7 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRep
   for (const { id } of pending) {
     try {
       const { outcome, posted } = await store.transaction((tx) => reconcileOne(tx, tenantId, id, options))
-      if (posted) journalEntries += 1
+      journalEntries += posted
       if (outcome in counts) counts[outcome as keyof typeof counts] += 1
       else exceptions[outcome as ExceptionCode] = (exceptions[outcome as ExceptionCode] ?? 0) + 1
     } catch (err) {

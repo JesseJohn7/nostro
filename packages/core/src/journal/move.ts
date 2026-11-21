@@ -147,8 +147,8 @@ export async function moveAccount(options: MoveAccountOptions): Promise<MoveAcco
       const amount = Money.fromRaw(absRaw, bal.asset, bal.decimals)
 
       const lines: NewJournalLine[] = [
-        { account: from, role: 'unexplained', side: fromSide, amount, expectationId: null, exceptionId: null },
-        { account: to, role: 'unexplained', side: toSide, amount, expectationId: null, exceptionId: null },
+        { account: from, role: 'other', side: fromSide, amount, expectationId: null, exceptionId: null },
+        { account: to, role: 'other', side: toSide, amount, expectationId: null, exceptionId: null },
       ]
 
       await tx.postJournalEntry({

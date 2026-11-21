@@ -25,29 +25,34 @@ import type {
   Movement,
   NewAllocation,
   NewException,
+  ExpectationChanges,
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '../model/index.js'
+import type { Money } from '../money/index.js'
 import type { AssetId } from '../money/index.js'
-import type { EventQuery, OutboxEvent } from './events.js'
+import type { EventQuery, OutboxEvent, PruneEventsResult } from './events.js'
 
 export interface MovementQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no movements. */
+  readonly ids?: readonly string[]
+  readonly txHash?: string
   readonly disposition?: Disposition
   readonly account?: string
   /** Return movements with `seq` greater than this; for paging in ingest order. */
   readonly afterSeq?: number
   readonly limit?: number
-  /**
-   * Movements whose `txHash` equals this value (case-insensitive hex).
-   * Used to find the credit a refund's `MEMO_RETURN` points at.
-   */
-  readonly txHash?: string
 }
 
 export interface ExpectationQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no expectations. */
+  readonly ids?: readonly string[]
   readonly account?: string
   readonly asset?: AssetId
   readonly direction?: Direction
@@ -61,15 +66,21 @@ export interface ExpectationQuery {
 export interface AllocationQuery {
   readonly tenantId: string
   readonly movementId?: string
+  readonly movementIds?: readonly string[]
   readonly expectationId?: string
+  readonly expectationIds?: readonly string[]
 }
 
 export interface ExceptionQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no exceptions. */
+  readonly ids?: readonly string[]
   readonly status?: ExceptionStatus
   readonly code?: ExceptionCode
   readonly movementId?: string
+  readonly movementIds?: readonly string[]
   readonly expectationId?: string
+  readonly expectationIds?: readonly string[]
   /** Return exceptions with `seq` greater than this; for paging in opening order. */
   readonly afterSeq?: number
   readonly limit?: number
@@ -108,28 +119,28 @@ export interface JournalPeriod {
   readonly closedAt: Date
 }
 
-/**
- * A recorded link from a refund debit to the credit it returns.
- *
- * A refund is an allocation-like fact between two movements rather than
- * between a movement and an expectation, so it gets its own record. Amounts
- * are in the credit's asset; `amount` is the part of the original credit
- * returned by this debit. The sum of `amount` across all links for one credit
- * never exceeds that credit's amount.
- */
+/** An immutable return of money to its original credit, in that credit's asset. */
 export interface RefundLink {
   readonly id: string
   readonly tenantId: string
-  /** The original inbound credit being refunded. */
   readonly creditMovementId: string
-  /** The outbound debit that returns money to the sender. */
   readonly refundMovementId: string
-  readonly amount: bigint
+  readonly amount: Money
+  /** Part returning previously unallocated money; the remainder is a sales return expense. */
+  readonly residualAmount: Money
   readonly createdAt: Date
+}
+export interface RefundQuery {
+  readonly tenantId: string
+  readonly creditMovementId?: string
+  readonly refundMovementId?: string
+  readonly movementIds?: readonly string[]
 }
 
 /** Read access. Every lookup is scoped by tenant; ids from another tenant read as absent. */
 export interface StoreReader extends JournalReader {
+  listRefundLinks(query: RefundQuery): Promise<RefundLink[]>
+  accrualGetMode(tenantId: string): Promise<boolean>
   getMovement(tenantId: string, id: string): Promise<Movement | null>
   listMovements(query: MovementQuery): Promise<Movement[]>
   getExpectation(tenantId: string, id: string): Promise<Expectation | null>
@@ -144,13 +155,16 @@ export interface StoreReader extends JournalReader {
   getExpectationsByNormalizedReference(tenantId: string, key: string): Promise<Expectation[]>
   listExpectations(query: ExpectationQuery): Promise<Expectation[]>
   listAllocations(query: AllocationQuery): Promise<Allocation[]>
-  listRefundLinks(tenantId: string, opts?: { creditMovementId?: string; refundMovementId?: string }): Promise<RefundLink[]>
   getException(tenantId: string, id: string): Promise<ExceptionRecord | null>
   listExceptions(query: ExceptionQuery): Promise<ExceptionRecord[]>
   getJournalPeriod(tenantId: string): Promise<JournalPeriod | null>
   getCursor(key: CursorKey): Promise<string | null>
   /** The event log, in `seq` order. Events are written by the store itself; see `events.ts`. */
   listEvents(query: EventQuery): Promise<OutboxEvent[]>
+  getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null>
+  listValuations(query: ValuationQuery): Promise<MovementValuation[]>
+  /** Highest event sequence intentionally removed for this tenant, or zero. */
+  getEventsPrunedThrough(tenantId: string): Promise<number>
 }
 
 /**
@@ -165,6 +179,8 @@ export interface StoreReader extends JournalReader {
  * default isolation level.
  */
 export interface StoreTx extends StoreReader, JournalTx {
+  linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink>
+  postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
   /** Lock the tenant's close state until this transaction ends, then return it. */
   lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null>
   /** Append a close action. The implementation acquires the tenant period lock. */
@@ -196,6 +212,9 @@ export interface StoreTx extends StoreReader, JournalTx {
 
   setCursor(key: CursorKey, value: string): Promise<void>
 
+  /** Prune an eligible old prefix and record its high-water mark atomically. */
+  pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult>
+
   /** Fails with `expectation_reference_unique` if the reference is taken in this tenant. */
   insertExpectation(expectation: NewExpectation): Promise<Expectation>
 
@@ -204,6 +223,8 @@ export interface StoreTx extends StoreReader, JournalTx {
    * to it. Writes an `expectation.cancelled` event.
    */
   cancelExpectation(tenantId: string, id: string, reason: string): Promise<Expectation>
+
+  amendExpectation(tenantId: string, id: string, changes: ExpectationChanges, reason: string): Promise<Expectation>
 
   /**
    * Allocate part of a movement to an expectation, and update the
@@ -217,29 +238,18 @@ export interface StoreTx extends StoreReader, JournalTx {
    */
   allocate(allocation: NewAllocation): Promise<Allocation>
 
-  /**
-   * Record that `refundMovementId` returns `amount` of `creditMovementId`.
-   * Refuses a link whose movements are not in the same tenant, whose assets
-   * differ, whose directions are not credit-in and debit-out, or that would
-   * push the credit's refunded total above its amount. Does not change any
-   * expectation status: the caller reverses allocations explicitly.
-   */
-  linkRefund(
-    tenantId: string,
-    creditMovementId: string,
-    refundMovementId: string,
-    amount: bigint,
-  ): Promise<RefundLink>
-
   /** Writes an `exception.opened` event. */
   openException(exception: NewException): Promise<ExceptionRecord>
   /** Writes an `exception.resolved` or `exception.dismissed` event. */
   resolveException(tenantId: string, id: string, resolution: Resolution): Promise<ExceptionRecord>
+  insertValuations(batch: readonly NewMovementValuation[]): Promise<void>
 }
 
 export interface JournalQuery {
   readonly tenantId: string
   readonly movementId?: string
+  /** Restrict to entries attached to any of these movements. */
+  readonly movementIds?: readonly string[]
   /** Filter lines to this account code (matches any entry that has at least one line on this account). */
   readonly account?: string
   /** Entries with `seq` greater than this, for paging in posting order. */
@@ -272,10 +282,24 @@ export interface Store extends StoreReader {
   /**
    * Run `fn` in a transaction. Commits if it resolves, rolls back everything
    * it wrote if it throws, and rethrows. The `tx` handle is dead once `fn`
-   * settles. Do not nest transactions.
+   * settles. Do not nest transactions. A SQL store may rerun `fn` after a
+   * deadlock, so callbacks must not perform irreversible external effects.
    */
   transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>
   close(): Promise<void>
+  exportListBatches(tenantId: string): Promise<readonly ExportBatch[]>
+  exportGetMark(tenantId: string, destination: string): Promise<string | null>
+  exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void>
+  accrualGetMode(tenantId: string): Promise<boolean>
+  postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
+}
+
+export interface ExportBatch {
+  readonly destination: string
+  readonly last_seq: number
+  readonly last_exported_at: number
+  control_totals: string
+  checksum: string
 }
 
 /** Where a database's schema is, against where this store would take it. */
@@ -306,21 +330,24 @@ export type ConstraintName =
   | 'allocation_over_expectation'
   | 'allocation_expectation_cancelled'
   | 'expectation_reference_unique'
+  | 'expectation_muxed_id_unique'
   | 'expectation_has_allocations'
   | 'expectation_not_open'
+  | 'expectation_not_amendable'
+  | 'amendment_below_allocated'
   | 'disposition_unsupported'
   | 'movement_not_open'
   | 'exception_not_open'
-  | 'refund_asset'
-  | 'refund_direction'
-  | 'refund_tenant'
+  | 'refund_invalid'
   | 'refund_over_credit'
+  | 'journal_manual_slot'
   | 'journal_unbalanced'
   | 'journal_posting_conflict'
   | 'journal_cash_mismatch'
   | 'journal_asset'
   | 'journal_period_closed'
   | 'journal_period_not_closed'
+  | 'journal_cash_without_movement'
 
 export class StoreError extends Error {
   constructor(

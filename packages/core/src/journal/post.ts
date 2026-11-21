@@ -33,7 +33,7 @@ export async function postMovement(
     await tx.listAllocations({ tenantId, movementId }),
     await tx.listExceptions({ tenantId, movementId }),
     await tx.listJournalEntries({ tenantId, movementId }),
-    options,
+    {...options,refunds:await tx.listRefundLinks({tenantId,movementIds:[movementId]})},
   )
   if (plan === null) return null
   if (
@@ -76,7 +76,7 @@ export async function postJournal(options: PostJournalOptions): Promise<PostJour
     ...(options.afterSeq === undefined ? {} : { afterSeq: options.afterSeq }),
     limit: options.limit ?? 500,
   })
-  const posted: Record<JournalEntryKind, number> = { initial: 0, reclass: 0, correction: 0 }
+  const posted: Record<JournalEntryKind, number> = { initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0 }
   const errors: { movementId: string; error: Error }[] = []
   for (const m of movements) {
     if (m.disposition === 'pending') continue

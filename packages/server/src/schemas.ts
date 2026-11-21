@@ -73,7 +73,7 @@ export const expectationBody = {
     amount: { type: 'string', pattern: AMOUNT, description: 'A decimal string, never a JSON number; never rounded.' },
     asset: { type: 'string', minLength: 1, description: '`native` (the default) or `CODE:ISSUER`.' },
     direction: { enum: ['credit', 'debit'] },
-    muxedId: { type: 'string', pattern: UINT64 },
+    muxedId: { anyOf: [{ type: 'string', pattern: UINT64 }, { const: 'issue' }] },
     memo: {
       oneOf: [
         {
@@ -147,6 +147,84 @@ export const resolveBody = {
   ],
 } as const
 
+
+export const cancelExpectationBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['reason'],
+  properties: { reason: { type: 'string', minLength: 1, maxLength: 2000 } },
+} as const
+
+export const amendExpectationBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['reason'],
+  properties: {
+    reason: { type: 'string', minLength: 1, maxLength: 2000 },
+    amount: { type: 'string', pattern: AMOUNT, description: 'A decimal string, never a JSON number; never rounded.' },
+    muxedId: { anyOf: [{ type: 'string', pattern: UINT64 }, { type: 'null' }] },
+    memo: {
+      anyOf: [
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'value'],
+          properties: { type: { const: 'text' }, value: { type: 'string', minLength: 1 } },
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'value'],
+          properties: { type: { const: 'id' }, value: { type: 'string', minLength: 1 } },
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'value'],
+          properties: { type: { const: 'hash' }, value: { type: 'string', pattern: HASH } },
+        },
+        { type: 'null' },
+      ],
+    },
+    payers: { type: 'array', maxItems: 100, items: { type: 'string', pattern: ACCOUNT } },
+    dueAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] },
+    expiresAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] },
+    metadata: { type: 'object', maxProperties: 50, additionalProperties: { type: 'string', maxLength: 1024 } },
+  },
+} as const
+
+export const manualJournalLine = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['account', 'role', 'side', 'amount'],
+  properties: {
+    account: { type: 'string', minLength: 1 },
+    role: { enum: [...LINE_ROLES] },
+    side: { enum: ['debit', 'credit'] },
+    amount: { type: 'string', pattern: AMOUNT, description: 'A decimal string, never a JSON number; never rounded.' },
+    asset: { type: 'string', minLength: 1, description: '`native` (the default) or `CODE:ISSUER`.' },
+  },
+} as const
+
+export const postJournalBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['description', 'reason', 'lines'],
+  properties: {
+    description: { type: 'string', minLength: 1 },
+    reason: { type: 'string', minLength: 1 },
+    note: { type: 'string' },
+    postedBy: { type: 'string' },
+    movementId: { type: 'string', minLength: 1 },
+    effectiveAt: { type: 'string', format: 'date-time' },
+    lines: {
+      type: 'array',
+      minItems: 2,
+      items: manualJournalLine,
+    },
+  },
+} as const
+
 // Responses.
 
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` })
@@ -170,10 +248,16 @@ const PROBLEM_CODES: readonly ProblemCode[] = [
   'resolution_refused',
   'not_found',
   'reference_taken',
+  'muxed_id_taken',
+  'expectation_conflict',
+  'event_history_pruned',
   'internal',
 ]
 
 export const components = {
+  CancelExpectationBody: cancelExpectationBody,
+  AmendExpectationBody: amendExpectationBody,
+  PostJournalBody: postJournalBody,
   Memo: record({ type: { enum: ['text', 'id', 'hash', 'return'] }, value: str }),
   Movement: record({
     id: str,
@@ -272,11 +356,13 @@ export const components = {
     createdAt: time,
     data: { type: 'object', description: 'The records the event is about, as they were; see docs/webhooks.md.' },
   }),
+  RefundLink: record({id:str,creditMovementId:str,refundMovementId:str,asset:str,amount:str,residualAmount:str,createdAt:{type:'string',format:'date-time'}}),
   MovementDetail: record({
     movement: ref('Movement'),
     allocations: { type: 'array', items: ref('Allocation') },
     exceptions: { type: 'array', items: ref('Exception') },
     journal: { type: 'array', items: ref('JournalEntry') },
+    refunds: { type: 'array', items: ref('RefundLink') },
   }),
   ExpectationDetail: record({
     expectation: ref('Expectation'),

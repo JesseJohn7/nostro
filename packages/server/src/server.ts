@@ -9,9 +9,10 @@
 import { Readable } from 'node:stream'
 import Fastify from 'fastify'
 import type { FastifyError, FastifyInstance, FastifyServerOptions } from 'fastify'
-import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationStatus, Memo, NewExpectation, Store } from '@nostro-labs/nostro'
+import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, NewExpectation, Store } from '@nostro-labs/nostro'
 import {
   ConstraintError,
+  EventHistoryPrunedError,
   InvalidAssetError,
   Money,
   NATIVE,
@@ -27,17 +28,19 @@ import {
   incomeStatement,
   journalCsvRows,
   journalEntryJson,
+  refundLinkJson,
   moveAccount,
   movementJson,
   outboxEventJson,
   parseAsset,
+  postManualEntry,
   resolutionJson,
   trialBalance,
 } from '@nostro-labs/nostro'
 import type { Authenticate } from './auth.js'
 import { buildOpenApi } from './openapi.js'
 import { HttpProblem } from './problem.js'
-import { UINT64, expectationBody, idParams, query, resolveBody } from './schemas.js'
+import { UINT64, amendExpectationBody, cancelExpectationBody, expectationBody, idParams, postJournalBody, query, resolveBody } from './schemas.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -60,6 +63,8 @@ interface Paging {
   limit: number
 }
 
+type Mutable<T> = { -readonly [K in keyof T]: T[K] }
+
 /** A page of rows, and where the next one starts if this one was full. */
 function page<T extends { seq: number }, J>(rows: readonly T[], limit: number, json: (row: T) => J) {
   return { data: rows.map(json), next: rows.length === limit ? rows[rows.length - 1]!.seq : null }
@@ -67,13 +72,29 @@ function page<T extends { seq: number }, J>(rows: readonly T[], limit: number, j
 
 const after = (q: Paging) => (q.after === undefined ? {} : { afterSeq: q.after })
 
+interface PostJournalBody {
+  description: string
+  reason: string
+  note?: string
+  postedBy?: string
+  movementId?: string
+  effectiveAt?: string
+  lines: {
+    account: string
+    role: LineRole
+    side: 'debit' | 'credit'
+    amount: string
+    asset?: string
+  }[]
+}
+
 interface ExpectationBody {
   reference: string
   account: string
   amount: string
   asset?: string
   direction?: 'credit' | 'debit'
-  muxedId?: string
+  muxedId?: string | 'issue'
   memo?: { type: 'text' | 'id' | 'hash'; value: string }
   payers?: string[]
   dueAt?: string
@@ -136,7 +157,7 @@ function toNewExpectation(tenantId: string, b: ExpectationBody): NewExpectation 
     account: b.account,
     direction: b.direction ?? 'credit',
     amount,
-    muxedId: b.muxedId === undefined ? null : uint64('muxedId', b.muxedId),
+    muxedId: b.muxedId === undefined ? null : b.muxedId === 'issue' ? 'issue' : uint64('muxedId', b.muxedId),
     memo,
     payers: b.payers ?? [],
     dueAt: b.dueAt === undefined ? null : new Date(b.dueAt),
@@ -162,6 +183,10 @@ export function createServer(options: ServerOptions): FastifyInstance {
     else if (err instanceof ValidationError) problem = invalid(err.message)
     else if (err instanceof ConstraintError && err.constraint === 'expectation_reference_unique') {
       problem = new HttpProblem(409, 'reference_taken', 'An expectation with this reference already exists.')
+    } else if (err instanceof ConstraintError && err.constraint === 'expectation_muxed_id_unique') {
+      problem = new HttpProblem(409, 'muxed_id_taken', 'That muxed id is already used for an expectation on this account.')
+    } else if (err instanceof ConstraintError && (err.constraint === 'expectation_not_amendable' || err.constraint === 'amendment_below_allocated' || err.constraint === 'expectation_has_allocations' || err.constraint === 'expectation_not_open')) {
+      problem = new HttpProblem(409, 'expectation_conflict', err.message)
     } else if (typeof err.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 500) {
       problem = new HttpProblem(400, 'invalid_request', err.message)
     } else {
@@ -216,6 +241,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
         const movementId = movement.id
         return {
           movement: movementJson(movement),
+          refunds: (await store.listRefundLinks({tenantId,movementIds:[movementId]})).map(refundLinkJson),
           allocations: (await store.listAllocations({ tenantId, movementId })).map(allocationJson),
           exceptions: (await store.listExceptions({ tenantId, movementId })).map(exceptionJson),
           journal: (await store.listJournalEntries({ tenantId, movementId })).map(journalEntryJson),
@@ -250,8 +276,66 @@ export function createServer(options: ServerOptions): FastifyInstance {
         '/expectations',
         { schema: { body: expectationBody }, preValidation: async (request) => onlyStrings(request.body, '') },
         async (request, reply) => {
-        const created = await store.transaction((tx) => tx.insertExpectation(toNewExpectation(request.tenantId, request.body)))
-        return reply.code(201).header('location', `/v1/expectations/${created.id}`).send(expectationJson(created))
+          const created = await store.transaction((tx) => tx.insertExpectation(toNewExpectation(request.tenantId, request.body)))
+          return reply.code(201).header('location', `/v1/expectations/${created.id}`).send(expectationJson(created))
+        },
+      )
+
+      v1.post<{ Params: { id: string }; Body: { reason: string } }>(
+        '/expectations/:id/cancel',
+        { schema: { params: idParams, body: cancelExpectationBody }, preValidation: async (request) => onlyStrings(request.body, '') },
+        async ({ tenantId, params, body }) => {
+          try {
+            const cancelled = await store.transaction((tx) => tx.cancelExpectation(tenantId, params.id, body.reason))
+            return expectationJson(cancelled)
+          } catch (err) {
+            if (err instanceof NotFoundError) throw new HttpProblem(404, 'not_found', `No expectation ${params.id}.`)
+            if (err instanceof ValidationError) throw invalid(err.message)
+            throw err
+          }
+        },
+      )
+
+      v1.post<{ Params: { id: string }; Body: { reason: string; amount?: string; muxedId?: string | null; memo?: { type: 'text' | 'id'; value: string } | null; payers?: string[]; dueAt?: string | null; expiresAt?: string | null; metadata?: Record<string, string> } }>(
+        '/expectations/:id/amend',
+        { schema: { params: idParams, body: amendExpectationBody }, preValidation: async (request) => onlyStrings(request.body, '') },
+        async ({ tenantId, params, body }) => {
+          try {
+            const { reason, ...rest } = body
+            const changes: Mutable<ExpectationChanges> = {}
+            if (rest.amount !== undefined) {
+              const current = await store.getExpectation(tenantId, params.id)
+              if (current === null) throw new HttpProblem(404, 'not_found', `No expectation ${params.id}.`)
+              try { changes.amount = Money.parse(rest.amount, current.amount.asset, current.amount.decimals) } catch (err) {
+                if (err instanceof PrecisionError) throw invalid(`amount: ${(err as Error).message}`)
+                throw err
+              }
+            }
+            if (rest.muxedId !== undefined) changes.muxedId = rest.muxedId === null ? null : uint64('muxedId', rest.muxedId)
+            if (rest.memo !== undefined) {
+              if (rest.memo === null) changes.memo = null
+              else if (rest.memo.type === 'text') {
+                if (Buffer.byteLength(rest.memo.value, 'utf8') > 28) throw invalid('memo.value must fit in a text memo: 28 bytes.')
+                changes.memo = { type: 'text', value: rest.memo.value }
+              } else if (rest.memo.type === 'id') {
+                if (!new RegExp(UINT64).test(rest.memo.value)) throw invalid('memo.value must be a whole number for an id memo.')
+                changes.memo = { type: 'id', value: uint64('memo.value', rest.memo.value) }
+              } else {
+                if (!/^[0-9a-f]{64}$/.test(rest.memo.value)) throw invalid('memo.value must be a 64-character lowercase hex hash.')
+                changes.memo = { type: 'hash', value: rest.memo.value }
+              }
+            }
+            if (rest.payers !== undefined) changes.payers = rest.payers
+            if (rest.dueAt !== undefined) changes.dueAt = rest.dueAt === null ? null : new Date(rest.dueAt)
+            if (rest.expiresAt !== undefined) changes.expiresAt = rest.expiresAt === null ? null : new Date(rest.expiresAt)
+            if (rest.metadata !== undefined) changes.metadata = rest.metadata
+            const amended = await store.transaction((tx) => tx.amendExpectation(tenantId, params.id, changes, reason))
+            return expectationJson(amended)
+          } catch (err) {
+            if (err instanceof NotFoundError) throw new HttpProblem(404, 'not_found', `No expectation ${params.id}.`)
+            if (err instanceof ValidationError) throw invalid(err.message)
+            throw err
+          }
         },
       )
 
@@ -272,9 +356,20 @@ export function createServer(options: ServerOptions): FastifyInstance {
           ),
       )
 
-      v1.get<{ Querystring: Paging }>('/events', { schema: { querystring: query.events } }, async ({ tenantId, query: q }) =>
-        page(await store.listEvents({ tenantId, limit: q.limit, ...after(q) }), q.limit, outboxEventJson),
-      )
+      v1.get<{ Querystring: Paging }>('/events', { schema: { querystring: query.events } }, async ({ tenantId, query: q }) => {
+        try {
+          return page(await store.listEvents({ tenantId, limit: q.limit, ...after(q) }), q.limit, outboxEventJson)
+        } catch (err) {
+          if (err instanceof EventHistoryPrunedError) {
+            throw new HttpProblem(
+              410,
+              'event_history_pruned',
+              `Event history through sequence ${err.prunedThrough} was pruned; resume after that sequence.`,
+            )
+          }
+          throw err
+        }
+      })
 
       v1.post<{ Params: { id: string }; Body: ExceptionDecision }>(
         '/exceptions/:id/resolve',
@@ -304,6 +399,52 @@ export function createServer(options: ServerOptions): FastifyInstance {
         { schema: { querystring: query.journal } },
         async ({ tenantId, query: q }) =>
           page(await store.listJournalEntries({ tenantId, limit: q.limit, ...after(q), ...dates(q) }), q.limit, journalEntryJson),
+      )
+
+      v1.post<{ Body: PostJournalBody }>(
+        '/journal',
+        { schema: { body: postJournalBody }, preValidation: async (request) => onlyStrings(request.body, '') },
+        async ({ tenantId, body }, reply) => {
+          try {
+            const lines = body.lines.map((l) => {
+              const assetId = l.asset === undefined || l.asset === 'native' ? NATIVE : parseAsset(l.asset)
+              const amount = Money.parse(l.amount, assetId)
+              return {
+                account: l.account,
+                role: l.role,
+                side: l.side,
+                amount,
+              }
+            })
+            const entry = await postManualEntry({
+              store,
+              tenantId,
+              description: body.description,
+              reason: body.reason,
+              ...(body.note !== undefined ? { note: body.note } : {}),
+              ...(body.postedBy !== undefined ? { postedBy: body.postedBy } : {}),
+              ...(body.movementId !== undefined ? { movementId: body.movementId } : {}),
+              ...(body.effectiveAt !== undefined ? { effectiveAt: new Date(body.effectiveAt) } : {}),
+              lines,
+            })
+            reply.status(201)
+            return journalEntryJson(entry)
+          } catch (err) {
+            if (err instanceof ValidationError || err instanceof PrecisionError || err instanceof InvalidAssetError) {
+              throw new HttpProblem(422, 'invalid_request', err.message)
+            }
+            if (err instanceof ConstraintError) {
+              if (err.constraint === 'journal_cash_without_movement' || err.constraint === 'journal_unbalanced' || err.constraint === 'journal_manual_slot') {
+                throw new HttpProblem(422, 'invalid_request', err.message)
+              }
+              if (err.constraint === 'journal_posting_conflict' || err.constraint === 'journal_period_closed') {
+                throw new HttpProblem(409, 'resolution_refused', err.message)
+              }
+              throw new HttpProblem(409, 'resolution_refused', err.message)
+            }
+            throw err
+          }
+        },
       )
 
       v1.get<{ Querystring: { from?: string; to?: string } }>(

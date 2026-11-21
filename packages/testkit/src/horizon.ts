@@ -48,6 +48,13 @@ export class FakeHorizon {
   /** Oldest ledger whose history is still kept. 0 means no retention window. */
   elderLedger = 0
   gone = new Set<string>()
+  tradeAggregations: {
+    base_asset_type?: string
+    counter_asset_type?: string
+    timestamp: number
+    count: string
+    close_r: { n: string; d: string }
+  }[] = []
   requests: URL[] = []
 
   readonly fetch = (async (input: string | URL | Request) => {
@@ -103,6 +110,14 @@ export class FakeHorizon {
       if (!known(m[1]!)) return notFound()
       const failed = q.get('include_failed') === 'true'
       return page(this.transactions.filter((t) => t.participants.includes(m![1]!) && (failed || t.successful)))
+    }
+    if (url.pathname === '/trade_aggregations') {
+      const records = this.tradeAggregations.filter((t) => {
+        if (q.get('base_asset_type') && t.base_asset_type && q.get('base_asset_type') !== t.base_asset_type) return false
+        if (q.get('counter_asset_type') && t.counter_asset_type && q.get('counter_asset_type') !== t.counter_asset_type) return false
+        return true
+      })
+      return respond({ _embedded: { records } })
     }
     throw new Error(`unrouted ${url.pathname}`)
   }) as typeof globalThis.fetch

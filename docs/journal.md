@@ -21,7 +21,6 @@ Every line has a role. The chart of accounts maps roles to account codes; pass y
 | `network_fees` | `expenses:network-fees` | transaction fees |
 | `uncategorized_income` | `income:uncategorized` | an incoming movement deliberately ignored |
 | `uncategorized_expense` | `expenses:uncategorized` | an outgoing movement deliberately ignored |
-| `customer_credit` (refund) | `liabilities:customer-credit` | a refund debit linked to the credit it returns clears the customer credit it was owed from |
 
 Unexplained money out is a suspense *asset*, not a liability: it was usually exchanged for something
 (a DEX trade, a bill booked elsewhere), and sharing an account with unexplained receipts would let
@@ -40,21 +39,6 @@ each invoice by its expectation, so an exporter can match them up. The same goes
 | 7 USDC arrived with no memo | Dr cash 7 · Cr unapplied 7 |
 | 0.00001 XLM network fee | Dr network fees · Cr cash |
 | Later, a person applies the 7 USDC to INV-3 | **reclass:** Dr unapplied 7 · Cr receivable 7 (INV-3) |
-
-## Refunds
-
-A debit whose `MEMO_RETURN` equals the transaction hash of a recorded credit on the same account is
-recorded as a refund of that credit, and the link is stored. The refund reverses what the credit
-posted, rather than leaving an `unexplained` debit behind:
-
-| What happened | Entry |
-|---|---|
-| 30 USDC overpayment refunded in full (5 owed as credit) | Dr customer credit 5 · Cr cash 5 (refund of the 5 excess) |
-| INV-2 paid 25, then the payment refunded in full | the payment's receivable reverses; INV-2 reopens |
-
-A refund of a settled invoice's payment reopens the invoice in part or in full, matching the amount
-returned. A debit with no return memo that looks like a refund raises `REFUND_UNLINKED` for a person
-to resolve; nothing is guessed.
 
 ## Entries are adjusted, never edited
 
@@ -92,7 +76,7 @@ for await (const line of journalBeancountRows({ store, tenantId: 'acme', commodi
 
 One row per journal line, RFC 4180 with CRLF line endings. Columns: `entry_id`, `seq`, `kind`,
 `posted_at`, `effective_at`, `description`, `line_no`, `account`, `role`, `asset`, `debit`, `credit`,
-`movement_id`, `tx_hash`, `expectation_reference`, `exception_id`, `exception_code`.
+`movement_id`, `tx_hash`, `expectation_reference`, `exception_id`, `exception_code`, `value`.
 
 - Amounts are exact decimal strings, never floats, even beyond 64 bits.
 - `from` / `to` select by effective date: `from` inclusive, `to` exclusive.
@@ -332,3 +316,82 @@ Lists income and expense accounts for the period and computes a net result per a
 
 **CLI:** `nostro report balance-sheet`, `nostro report income [--from ...] [--to ...]`.
 **HTTP:** `GET /v1/reports/balance-sheet`, `GET /v1/reports/income`.
+
+## Manual journal entries
+
+Some journal entries have no on-chain movement behind them: writing off unrecoverable suspense, reclassifying rent or expenses, or correcting balances.
+
+`postManualEntry({ store, tenantId, description, reason, lines, note?, postedBy?, effectiveAt? })` creates an entry with `kind: 'manual'`.
+Reversing a manual entry is performed via `reverseManualEntry({ store, tenantId, entryId, reason, postedBy? })`, which posts equal and opposite lines.
+
+**Rules:**
+- Manual entries **cannot** touch `cash` or `issued` roles. Cash lines only change when money moves on the chain.
+- Entries must balance per asset (I3).
+- A non-empty `reason` is required.
+- Manual entries cannot name a movement or use `unapplied`, `customer_credit`, or `unexplained`. Use the `other` role for independent adjustments. Use `applyMovement` or `ignoreMovement` for movement balances; they serialize with reconciliation.
+
+**CLI:** `nostro journal post --description "..." --reason "..." --line "<account>:<role>:<side>:<amount>[:<asset>]"`
+**HTTP:** `POST /v1/journal`
+
+## Movement valuations
+
+Valuations express the value of movements in a reporting currency (such as USD or EUR) at the time they occurred, using external price feeds or Horizon DEX trade aggregations:
+
+```ts
+import { valueMovements, HorizonPriceSource, MapPriceSource } from '@nostro-labs/nostro'
+
+const priceSource = new HorizonPriceSource({ url: 'https://horizon.stellar.org' })
+await valueMovements({ store, tenantId: 'acme', priceSource, reportingAsset: USDC })
+```
+
+- **Price sources:** `PriceSource` interface provides `price(base, quote, timestamp)`. `HorizonPriceSource` fetches one-hour trade aggregations from Horizon. `MapPriceSource` uses an in-memory price map.
+- **Integer arithmetic:** Fractional prices `PriceFraction` (`{ n: bigint, d: bigint }`) and round-half-up integer arithmetic prevent float drift.
+- **CSV export:** `journalCsv` includes a `value` column populated from recorded valuations.
+- Only the segment containing the movement is eligible; empty segments and contract tokens remain unvalued. A classic asset used as the reporting currency is explicit: USDC is never silently treated as USD.
+- Movements without a price are skipped (not guessed).
+
+## Cost basis and realised gains
+
+Track acquisition costs and compute capital gains or losses on asset disposals:
+
+```ts
+import { costBasis } from '@nostro-labs/nostro'
+
+const report = await costBasis({ store, tenantId: 'acme', asset: NATIVE, method: 'fifo' })
+```
+
+- **Methods:** Supports FIFO (first-in, first-out) and LIFO (last-in, first-out).
+- Unknown acquisition costs remain listed in `unvaluedCredits`; affected disposals expose `missingCostAmount` and have no calculated gain. Lots are isolated by wallet. Internal transfers are currently reported as separate credit/debit legs, so select and reconcile transfers explicitly before using gains reports.
+- The chosen FIFO/LIFO method must be kept consistent by the caller; method policy is not persisted per tenant. Mixed reporting currencies are rejected.
+- **Proportional cost splitting:** Disposing of part of a lot divides cost with round-half-up integer arithmetic, preserving conservation of total cost without rounding residue.
+- **Notice:** This is internal bookkeeping and ledger reconciliation, **not tax advice**. Consult a qualified professional for statutory tax reporting.
+
+**CLI:** `nostro report gains --asset native [--method fifo|lifo]`
+
+## Aging reports
+
+`agingReport({ store, tenantId, asOf, buckets })` reports open balances across aging buckets (default: `[30, 60, 90]` days):
+
+- **Expectations:** Amounts still owed on open or partially paid invoices (receivables) and payouts (payables), grouped by days past `dueAt`. Items with no due date are grouped under `no_due_date`.
+- **Unexplained money:** Unapplied receipts, customer credit, and suspense (`unexplained`), grouped by days since the movement occurred, alongside the exception code.
+- **Journal reconciliation:** Unexplained money totals equal the matching ledger balances in the journal.
+
+**CLI:** `nostro report aging [--as-of YYYY-MM-DD] [--buckets 30,60,90] [--json] [--csv]`
+
+
+## Refunds
+
+A return-memo debit is linked to its original credit in the same transaction as reconciliation.
+Returned unallocated money moves the original credit's `customer_credit` or `unapplied` slot to
+`refund_clearing`; the outgoing debit clears that role against cash. `refund_clearing` uses
+`liabilities:refund-clearing` by default and nets to zero when both movements are posted.
+
+Example: 15 XLM paid a 10 XLM invoice, then 7 XLM was returned. The original receipt remains
+Dr cash 15 / Cr receivable 10, with its remaining Cr customer credit 5 reclassified to
+Cr refund clearing 5. The return is Dr refund clearing 5 / Dr uncategorized expense 2 / Cr cash 7.
+The invoice stays settled. Partial returns clear only their exact portion; a larger return than the
+original credit permits becomes `REFUND_UNLINKED` and is left for a person.
+
+Links and journal entries are append-only. Repeated reconciliation and journal sweeps change
+nothing, I1 includes the recorded returned amount, I3 balances each entry per asset, and aging
+reports exclude the returned residual. [Matching policy](./matching.md#refunds-recorded-by-return-memo).

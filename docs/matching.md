@@ -29,7 +29,9 @@ randomness, and every decision records its reasons as evidence.
 | `memo_hash` | identifier | 0.95 | `MEMO_HASH` equals the 64-hex hash asked for, compared exactly | payer typo or a reused old hash |
 | `memo_text` | identifier | 0.85 | normalised text memo equals the normalised reference or requested memo | normalisation is deliberately loose |
 | `memo_cross_type` | identifier | 0.75 | id memo sent for a text reference, or text memo sent for an id; see below | any integer reference that happens to equal a pending memo id |
+| `memo_contained` | identifier | 0.60 | a text memo contains the reference as a token or inside a longer normalised run | a memo that merely quotes the reference |
 | `memo_truncated` | identifier | 0.60 | a 28-byte text memo is a proper prefix of the normalised reference | long references often share a prefix; corroboration only |
+| `memo_near_miss` | identifier | 0.50 | a text-memo token is one edit from the reference after normalisation | a different reference one character away |
 | `exact_amount` | amount | 0.60 unique / 0.20 shared | exactly the amount still owed, same asset, inside the window | any two invoices for the same amount |
 | `known_payer` | payer | 0.40 | `counterparty` is an account listed in `payers` | accounts are shared and reused; corroboration only, never an identifier |
 
@@ -51,6 +53,18 @@ Payers often send the right reference in the wrong kind of memo field. This stra
 Leading zeros keep their meaning: `MEMO_ID 123` never matches reference `00123`, because the payer
 who meant that would have sent the text `"00123"`. Hash and return memos are not candidates for
 cross-type matching.
+
+`memo_contained` and `memo_near_miss` are corroborating identifier signals. Both use
+`normalizeReference`, skip a memo equal to the reference or the requested memo, and require a reference
+of at least four characters after trimming and three after normalisation: `INV-123` (normalised `123`)
+and `INV-1O42` (one edit from `INV-1042`) qualify, while `AB1` (only three raw characters) and
+`REF-12` (normalised `12`) do not. `memo_contained` finds the reference among the memo's tokens, or as
+a substring of the whole normalised memo; `memo_near_miss` accepts one substitution, insertion,
+deletion or adjacent transposition. They share the identifier family, so only the stronger of the two
+counts, and neither reaches 0.70 alone: both need evidence from another family, usually a unique
+amount. A reference quoted in an unrelated memo, or a second invoice whose reference differs by one
+character, can score here; with two close candidates the result is `AMBIGUOUS_MATCH`, not a silent
+settlement.
 
 Text memos are normalised before comparison (NFKC, zero-width and control characters removed,
 upper-cased, `INVOICE` / `INV` / `REF` / `NO` / `#` prefixes dropped at a word boundary, separators
@@ -124,6 +138,59 @@ second of two people deciding at once receives.
 Closing the last open exception of an undecided movement is refused, because it would leave the
 movement's disposition with nothing to support it (I1). Apply or ignore the movement instead.
 
+## Expectation lifecycle
+
+### Muxed ids
+
+An expectation can reserve a muxed id when it is created, with `nostro expect INV-1042 ... --muxed-id 7`
+(or `muxedId: "7"` over HTTP). `--issue-muxed-id` (or `muxedId: "issue"`) asks the store for the next
+id: one above the highest muxed id currently recorded for that tenant and account, starting at 1.
+Ids must be unique per account within a tenant; an explicit id already held by another expectation
+there is refused with `expectation_muxed_id_unique` (HTTP 409 `muxed_id_taken`). Settled and cancelled
+expectations keep their ids, so issuing does not take one they still hold. `nostro doctor` reports
+duplicates as an I1 `muxed_id_duplicate` finding.
+
+Ids are not permanent: `nostro amend ... --muxed-id none` (or `muxedId: null`) clears one, and an id
+can be reassigned. Uniqueness is checked against current rows, not a high-water mark, so clearing the
+highest id can make a later issue reuse it.
+
+### Amend and cancel
+
+`nostro amend <reference> --reason <why> ...` (or `POST /v1/expectations/:id/amend`) calls the store
+operation `amendExpectation(tenantId, id, changes, reason)`. Only `amount`, `muxedId`, `memo`, `payers`,
+`dueAt`, `expiresAt` and `metadata` may change. Open and partially paid expectations are amendable;
+settled and cancelled ones are not. At least one field and a non-empty reason are required. Reference,
+account, asset and direction are immutable, and an amount cannot change asset or decimals. The amount
+also cannot be lowered below what is already allocated: lowering it to exactly that allocation settles
+the expectation. A new muxed id must still be unique on the account. Payers and metadata are replaced,
+not merged. The amendment writes `expectation.amended` with `{ expectation, previous, reason }`: the
+reason is required and stored in that event, not on the expectation itself.
+
+`nostro cancel <reference> --reason <why>` (or `POST /v1/expectations/:id/cancel`) works only on an
+expectation with no allocations. The reason is kept as `cancelReason` and the store writes
+`expectation.cancelled`. A cancelled expectation is never a match candidate and cannot receive an
+allocation.
+
+### Expiry sweep
+
+`EXPECTATION_EXPIRED` is an expectation-level exception, not a movement disposition.
+`sweepExpectations({ store, tenantId, asOf?, limit? })` pages through open and part-paid expectations
+(500 at a time by default) and opens one exception for each whose `expiresAt` is on or before `asOf`
+(default now). The exception carries the expectation id, account, current amount, a detail with the
+reference and expiry, and evidence `{ asOf, status }`. The sweep is idempotent: an expectation with
+any earlier `EXPECTATION_EXPIRED` exception, open, resolved or dismissed, is left alone. It does not
+settle, cancel or otherwise change the expectation. The sweep treats expiry as inclusive; matching's
+late exception is a separate, strict past-due-window check that refuses only payments made after the
+expiry instant with `LATE_BEYOND_WINDOW`. Both can legitimately produce an exception for the same truly
+late, unpaid expectation: the sweep raises `EXPECTATION_EXPIRED` against the expectation and matching
+raises `LATE_BEYOND_WINDOW` against the payment. A person can still apply either by hand. `nostro serve`
+calls the sweep each round, through `reconcileAll()` before reconciliation when a network is
+configured and directly otherwise.
+
+The report is `{ scanned, expired, skipped }`: `scanned` counts expired candidates found, not every
+expectation visited; `expired` counts exceptions actually opened; and `skipped` covers expectations
+already carrying the exception or lost to a race with payment or cancellation.
+
 ## Not handled yet
 
 These are known gaps, each planned as its own self-contained piece of work:
@@ -134,7 +201,27 @@ These are known gaps, each planned as its own self-contained piece of work:
 - **Slippage tolerance** for path payments delivering slightly less than asked.
 - **One payment covering several invoices** with no per-invoice reference. Today this is an
   exception for a person to split.
-- **Return memos on credits.** A `MEMO_RETURN` currently raises `MEMO_MALFORMED`. Pairing it with
-  the original payment is left for the refunds work (#15). Once that lands, a debit whose
-  `MEMO_RETURN` equals the transaction hash of a recorded credit on the same account will be recorded
-  as a refund of that credit rather than `UNEXPECTED_DEBIT`; see the refunds design in #15.
+- **Return memos on credits.** An incoming `MEMO_RETURN` still raises `MEMO_MALFORMED`; automatic refund linking applies to outgoing transfers only.
+
+
+## Refunds recorded by return memo
+
+Before expectation scoring, an outgoing transfer with `MEMO_RETURN` is looked up by its exact
+transaction hash. There must be one earlier credit on the same tenant, network, wallet, asset and
+precision. Unknown, ambiguous, future, wrong-asset or excessive returns raise `REFUND_UNLINKED`;
+ordinary debits without a return memo are never guessed to be refunds.
+
+All three stores persist an immutable `RefundLink` containing the original movement, the outgoing
+movement, the exact amount and the part returning unallocated money. The credit is locked until the
+link, both dispositions, exceptions and journal entries commit together. Competing refunds cannot
+return more than the original credit, later allocations cannot spend returned money, and rerunning
+reconciliation creates no duplicate links or postings.
+
+Policy: return remaining customer credit or unapplied receipts first. Any remainder that refunds an
+already-settled invoice is a return expense; the invoice and its historical allocations stay settled.
+This policy deliberately does not reopen invoices or imply that a new payment is due. A business
+that needs a new receivable must record a new expectation explicitly. No transaction is signed or sent.
+
+Read links through `store.listRefundLinks({tenantId,creditMovementId})`, by `refundMovementId`, or
+by `movementIds`. `GET /v1/movements/{id}` returns `refunds` on either side, with exact decimal
+amounts. See [journal treatment](./journal.md#refunds).

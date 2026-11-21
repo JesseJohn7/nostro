@@ -1,3 +1,4 @@
+import { describeRefundConformance } from './refund-conformance.js'
 /**
  * The `Store` contract, as executable tests.
  *
@@ -19,6 +20,7 @@ import {
   doctor,
   normalizeReference,
   reconcile,
+  sweepExpectations,
 } from '@nostro-labs/nostro'
 
 const T = 'tenant-a'
@@ -58,6 +60,7 @@ function movement(over: Partial<NewMovement> = {}): NewMovement {
 const constraint = (name: string) => ({ name: 'ConstraintError', constraint: name })
 
 export function describeStoreConformance(name: string, makeStore: () => Store | Promise<Store>): void {
+  describeRefundConformance(name, makeStore)
   describeJournalConformance(name, makeStore)
   describe(`Store conformance: ${name}`, () => {
     let store: Store
@@ -810,6 +813,290 @@ export function describeStoreConformance(name: string, makeStore: () => Store | 
       expect(after.findings).toEqual([])
       expect(after.movements.byDisposition).toMatchObject({ allocated: 5, exception: 1, pending: 0 })
       expect(after.journal.totals.map((t) => t.debits.equals(t.credits))).toEqual([true])
+    })
+
+    describe('expectation amendments (conformance)', () => {
+      it('amends mutable fields on open and part-paid expectations and preserves identity', async () => {
+        const open = await store.transaction((tx) =>
+          tx.insertExpectation({
+            tenantId: T,
+            reference: 'AMEND-OPEN',
+            account: ACCOUNT,
+            amount: usdc('10'),
+            metadata: { tier: 'old' },
+          }),
+        )
+        const changed = await store.transaction((tx) =>
+          tx.amendExpectation(
+            T,
+            open.id,
+            {
+              amount: usdc('12'),
+              muxedId: 42n,
+              memo: { type: 'text', value: 'AMEND-OPEN' },
+              payers: [PAYER],
+              dueAt: new Date('2026-10-20T00:00:00Z'),
+              expiresAt: new Date('2026-11-20T00:00:00Z'),
+              metadata: { tier: 'gold' },
+            },
+            'open change',
+          ),
+        )
+        expect(changed).toMatchObject({
+          id: open.id,
+          reference: 'AMEND-OPEN',
+          account: ACCOUNT,
+          direction: 'credit',
+          status: 'open',
+          muxedId: 42n,
+          memo: { type: 'text', value: 'AMEND-OPEN' },
+          payers: [PAYER],
+          metadata: { tier: 'gold' },
+        })
+        expect(changed.amount.toString()).toBe('12.0000000')
+        expect(changed.amount.asset).toBe(open.amount.asset)
+        expect(changed.amount.decimals).toBe(open.amount.decimals)
+        expect(changed.dueAt).toEqual(new Date('2026-10-20T00:00:00Z'))
+        expect(changed.expiresAt).toEqual(new Date('2026-11-20T00:00:00Z'))
+        expect(open.muxedId).toBeNull()
+
+        const part = await expect10('AMEND-PART')
+        const m = await record({ amount: usdc('4') })
+        await store.transaction((tx) =>
+          tx.allocate({ tenantId: T, movementId: m.id, expectationId: part.id, amount: usdc('4'), strategy: 'manual' }),
+        )
+        expect((await store.getExpectation(T, part.id))!.status).toBe('partially_paid')
+        const partChanged = await store.transaction((tx) =>
+          tx.amendExpectation(
+            T,
+            part.id,
+            { amount: usdc('8'), muxedId: 7n, memo: { type: 'id', value: 7n }, payers: [PAYER], metadata: { k: 'v' } },
+            'part change',
+          ),
+        )
+        expect(partChanged).toMatchObject({
+          reference: 'AMEND-PART',
+          account: ACCOUNT,
+          direction: 'credit',
+          status: 'partially_paid',
+          muxedId: 7n,
+          memo: { type: 'id', value: 7n },
+          payers: [PAYER],
+          metadata: { k: 'v' },
+        })
+        expect(partChanged.amount.toString()).toBe('8.0000000')
+        expect(partChanged.amount.asset).toBe(part.amount.asset)
+        expect(partChanged.amount.decimals).toBe(part.amount.decimals)
+      })
+
+      it('enforces amendment constraints and records expectation.amended', async () => {
+        const e = await expect10('AMEND-C')
+        const m = await record({ amount: usdc('4') })
+        await store.transaction((tx) =>
+          tx.allocate({ tenantId: T, movementId: m.id, expectationId: e.id, amount: usdc('4'), strategy: 'manual' }),
+        )
+        await expect(
+          store.transaction((tx) => tx.amendExpectation(T, e.id, { amount: usdc('3') }, 'too low')),
+        ).rejects.toMatchObject({ name: 'ConstraintError', constraint: 'amendment_below_allocated' })
+        const settled = await store.transaction((tx) => tx.amendExpectation(T, e.id, { amount: usdc('4') }, 'settle'))
+        expect(settled.status).toBe('settled')
+        expect(settled.amount.toString()).toBe('4.0000000')
+
+        await expect(
+          store.transaction((tx) => tx.amendExpectation(T, e.id, { metadata: { x: 'y' } }, 'late')),
+        ).rejects.toMatchObject({ name: 'ConstraintError', constraint: 'expectation_not_amendable' })
+
+        const c = await expect10('AMEND-X')
+        await store.transaction((tx) => tx.cancelExpectation(T, c.id, 'void'))
+        await expect(
+          store.transaction((tx) => tx.amendExpectation(T, c.id, { metadata: { x: 'y' } }, 'late')),
+        ).rejects.toMatchObject({ name: 'ConstraintError', constraint: 'expectation_not_amendable' })
+
+        const v = await expect10('AMEND-V')
+        await expect(store.transaction((tx) => tx.amendExpectation(T, v.id, {}, 'reason'))).rejects.toBeInstanceOf(
+          ValidationError,
+        )
+        await expect(
+          store.transaction((tx) => tx.amendExpectation(T, v.id, { metadata: { a: 'b' } }, '')),
+        ).rejects.toBeInstanceOf(ValidationError)
+        await expect(
+          store.transaction((tx) => tx.amendExpectation(T, v.id, { metadata: { a: 'b' } }, '   ')),
+        ).rejects.toBeInstanceOf(ValidationError)
+
+        const ev = await expect10('AMEND-E')
+        const before = await store.getExpectation(T, ev.id)
+        await store.transaction((tx) => tx.amendExpectation(T, ev.id, { amount: usdc('11'), metadata: { n: '1' } }, 'because'))
+        const events = await store.listEvents({ tenantId: T })
+        const amended = events.filter((x) => x.type === 'expectation.amended' && x.subjectId === ev.id)
+        expect(amended).toHaveLength(1)
+        const payload = amended[0]!.payload as { expectation?: unknown; previous?: unknown; reason?: unknown }
+        expect(payload.reason).toBe('because')
+        expect(payload.expectation).toMatchObject({ id: ev.id, reference: 'AMEND-E', amount: '11.0000000' })
+        expect(payload.previous).toMatchObject({ id: ev.id, reference: 'AMEND-E', amount: before!.amount.toString() })
+      })
+    })
+
+    describe('muxed ids (conformance)', () => {
+      it('enforces uniqueness per tenant and account and scopes issue sequentially', async () => {
+        await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'MX-1', account: ACCOUNT, amount: usdc('1'), muxedId: 9n }),
+        )
+        await expect(
+          store.transaction((tx) =>
+            tx.insertExpectation({ tenantId: T, reference: 'MX-DUP', account: ACCOUNT, amount: usdc('1'), muxedId: 9n }),
+          ),
+        ).rejects.toMatchObject({ name: 'ConstraintError', constraint: 'expectation_muxed_id_unique' })
+        await expect(
+          store.transaction((tx) =>
+            tx.insertExpectation({ tenantId: T, reference: 'MX-OTHER', account: OTHER_ACCOUNT, amount: usdc('1'), muxedId: 9n }),
+          ),
+        ).resolves.toMatchObject({ muxedId: 9n })
+        await expect(
+          store.transaction((tx) =>
+            tx.insertExpectation({ tenantId: T2, reference: 'MX-T2', account: ACCOUNT, amount: usdc('1'), muxedId: 9n }),
+          ),
+        ).resolves.toMatchObject({ muxedId: 9n })
+
+        const i1 = await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'MX-I1', account: ACCOUNT, amount: usdc('1'), muxedId: 'issue' }),
+        )
+        await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'MX-7', account: ACCOUNT, amount: usdc('1'), muxedId: 7n }),
+        )
+        const i2 = await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'MX-I2', account: ACCOUNT, amount: usdc('1'), muxedId: 'issue' }),
+        )
+        const iOther = await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'MX-OA', account: OTHER_ACCOUNT, amount: usdc('1'), muxedId: 'issue' }),
+        )
+        const iTenant = await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T2, reference: 'MX-OT', account: ACCOUNT, amount: usdc('1'), muxedId: 'issue' }),
+        )
+        expect(i1.muxedId).toBe(10n)
+        expect(i2.muxedId).toBe(11n)
+        expect(iOther.muxedId).toBe(10n)
+        expect(iTenant.muxedId).toBe(10n)
+      })
+
+      it('rejects issuing past uint64 max and concurrent issue gives distinct ids', async () => {
+        await store.transaction((tx) =>
+          tx.insertExpectation({
+            tenantId: T,
+            reference: 'MX-MAX',
+            account: ACCOUNT,
+            amount: usdc('1'),
+            muxedId: 2n ** 64n - 1n,
+          }),
+        )
+        const overflow = store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'MX-OVER', account: ACCOUNT, amount: usdc('1'), muxedId: 'issue' }),
+        )
+        await expect(overflow).rejects.toSatisfy(
+          (e: unknown) => e instanceof ValidationError || e instanceof ConstraintError,
+        )
+
+        const [a, b] = await Promise.all([
+          store.transaction((tx) =>
+            tx.insertExpectation({ tenantId: T, reference: 'MX-C1', account: OTHER_ACCOUNT, amount: usdc('1'), muxedId: 'issue' }),
+          ),
+          store.transaction((tx) =>
+            tx.insertExpectation({ tenantId: T, reference: 'MX-C2', account: OTHER_ACCOUNT, amount: usdc('1'), muxedId: 'issue' }),
+          ),
+        ])
+        expect(a.muxedId).not.toBeNull()
+        expect(b.muxedId).not.toBeNull()
+        expect(a.muxedId).not.toBe(b.muxedId)
+      })
+    })
+
+    describe('amendment racing allocation', () => {
+      it('keeps expectation amount, status, allocations and events consistent', async () => {
+        const e = await expect10('RACE-1')
+        const m = await record({ amount: usdc('10') })
+        const results = await Promise.allSettled([
+          store.transaction((tx) => tx.amendExpectation(T, e.id, { amount: usdc('5') }, 'down')),
+          store.transaction((tx) =>
+            tx.allocate({ tenantId: T, movementId: m.id, expectationId: e.id, amount: usdc('10'), strategy: 'manual' }),
+          ),
+        ])
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1)
+        expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1)
+        const final = await store.getExpectation(T, e.id)
+        const allocations = await store.listAllocations({ tenantId: T, expectationId: e.id })
+        const total = allocations.reduce((sum, a) => sum + a.amount.raw, 0n)
+        expect(total <= final!.amount.raw).toBe(true)
+        if (total === 0n) {
+          expect(final!.amount.toString()).toBe('5.0000000')
+          expect(final!.status).toBe('open')
+        } else {
+          expect(total).toBe(final!.amount.raw)
+          expect(final!.amount.toString()).toBe('10.0000000')
+          expect(final!.status).toBe('settled')
+        }
+        const events = (await store.listEvents({ tenantId: T })).filter((x) => x.subjectId === e.id)
+        const amended = events.filter((x) => x.type === 'expectation.amended').length
+        const paid = events.filter((x) => x.type === 'expectation.partially_paid' || x.type === 'expectation.settled').length
+        expect(amended <= 1).toBe(true)
+        expect(paid <= 1).toBe(true)
+        if (allocations.length === 0) {
+          expect(amended).toBe(1)
+          expect(paid).toBe(0)
+        } else {
+          expect(amended).toBe(0)
+          expect(paid).toBe(1)
+        }
+      })
+    })
+
+    describe('sweeping expired expectations', () => {
+      it('raises EXPECTATION_EXPIRED once for unpaid expired expectations only', async () => {
+        const asOf = new Date('2026-12-01T00:00:00Z')
+        const past = new Date('2026-11-01T00:00:00Z')
+        const open = await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'EXP-OPEN', account: ACCOUNT, amount: usdc('10'), expiresAt: past }),
+        )
+        const part = await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'EXP-PART', account: ACCOUNT, amount: usdc('10'), expiresAt: past }),
+        )
+        const settled = await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'EXP-SET', account: ACCOUNT, amount: usdc('10'), expiresAt: past }),
+        )
+        const m1 = await record({ amount: usdc('4') })
+        await store.transaction((tx) =>
+          tx.allocate({ tenantId: T, movementId: m1.id, expectationId: part.id, amount: usdc('4'), strategy: 'manual' }),
+        )
+        const m2 = await record({ amount: usdc('10') })
+        await store.transaction((tx) =>
+          tx.allocate({ tenantId: T, movementId: m2.id, expectationId: settled.id, amount: usdc('10'), strategy: 'manual' }),
+        )
+        const first = await sweepExpectations({ store, tenantId: T, asOf })
+        expect(first.scanned).toBe(2)
+        expect(first.expired).toBe(2)
+        const raised = await store.listExceptions({ tenantId: T, code: 'EXPECTATION_EXPIRED' })
+        expect(raised.map((x) => x.expectationId).sort()).toEqual([open.id, part.id].sort())
+        const second = await sweepExpectations({ store, tenantId: T, asOf })
+        expect(second.expired).toBe(0)
+        expect(await store.listExceptions({ tenantId: T, code: 'EXPECTATION_EXPIRED' })).toHaveLength(2)
+      })
+
+      it('raises only one expiry when two sweeps race', async () => {
+        const asOf = new Date('2026-12-01T00:00:00Z')
+        const e = await store.transaction((tx) =>
+          tx.insertExpectation({
+            tenantId: T,
+            reference: 'EXP-RACE',
+            account: ACCOUNT,
+            amount: usdc('10'),
+            expiresAt: new Date('2026-11-01T00:00:00Z'),
+          }),
+        )
+        const [first, second] = await Promise.all([
+          sweepExpectations({ store, tenantId: T, asOf }),
+          sweepExpectations({ store, tenantId: T, asOf }),
+        ])
+        expect(first.expired + second.expired).toBe(1)
+        expect(await store.listExceptions({ tenantId: T, expectationId: e.id, code: 'EXPECTATION_EXPIRED' })).toHaveLength(1)
+      })
     })
 
     it('reports errors with stable, typed codes', () => {

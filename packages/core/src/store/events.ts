@@ -20,6 +20,7 @@ export type EventType =
   | 'expectation.partially_paid'
   | 'expectation.settled'
   | 'expectation.cancelled'
+  | 'expectation.amended'
   | 'exception.opened'
   | 'exception.resolved'
   | 'exception.dismissed'
@@ -29,6 +30,7 @@ export const EVENT_TYPES: readonly EventType[] = [
   'expectation.partially_paid',
   'expectation.settled',
   'expectation.cancelled',
+  'expectation.amended',
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
@@ -59,6 +61,34 @@ export interface EventQuery {
   /** Events with `seq` greater than this. */
   readonly afterSeq?: number
   readonly limit?: number
+}
+
+/** Thrown when a requested event position predates the tenant's retained log. */
+export class EventHistoryPrunedError extends Error {
+  constructor(
+    readonly tenantId: string,
+    readonly requestedAfter: number,
+    readonly prunedThrough: number,
+  ) {
+    super(`event history before sequence ${prunedThrough} has been pruned; request after a retained position`)
+    this.name = 'EventHistoryPrunedError'
+  }
+}
+
+export interface PruneEventsOptions {
+  readonly store: import('./store.js').Store
+  readonly tenantId: string
+  readonly olderThan: Date
+}
+
+export interface PruneEventsResult {
+  readonly deleted: number
+  readonly prunedThrough: number
+}
+
+/** Remove only the old event prefix that every persisted webhook cursor passed. */
+export async function pruneEvents(options: PruneEventsOptions): Promise<PruneEventsResult> {
+  return options.store.transaction((tx) => tx.pruneEventsBefore(options.tenantId, options.olderThan))
 }
 
 /**
@@ -110,6 +140,19 @@ export function exceptionChanged(exception: ExceptionRecord): NewOutboxEvent {
     type: exception.status === 'open' ? 'exception.opened' : exception.status === 'resolved' ? 'exception.resolved' : 'exception.dismissed',
     subjectId: exception.id,
     payload: json({ exception: exceptionJson(exception) }),
+  }
+}
+
+export function expectationAmended(
+  expectation: Expectation,
+  previous: Expectation,
+  reason: string,
+): NewOutboxEvent {
+  return {
+    tenantId: expectation.tenantId,
+    type: 'expectation.amended',
+    subjectId: expectation.id,
+    payload: json({ expectation: expectationJson(expectation), previous: expectationJson(previous), reason }),
   }
 }
 

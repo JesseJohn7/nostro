@@ -26,8 +26,20 @@ from a saved position and picks up where it stopped.
 | `expectation.partially_paid` | an allocation part-paid an expectation | `expectation`, `allocation` |
 | `expectation.settled` | an allocation paid it in full | `expectation`, `allocation` |
 | `expectation.cancelled` | it was cancelled | `expectation`, `allocation: null` |
+| `expectation.amended` | its details were changed by a person | `expectation`, `previous`, `reason` |
 | `exception.opened` | something needs a person | `exception` |
 | `exception.resolved`, `exception.dismissed` | someone closed it | `exception` |
+
+`expectation.amended` carries both the new and the old record, so a consumer can see what changed;
+`reason` is the non-empty explanation required for the amendment. An amendment writes only this
+event, even when it changes the expectation's status as a side effect; allocations still write
+`expectation.partially_paid` or `expectation.settled`.
+
+`EXPECTATION_EXPIRED` is an exception code, not an event type. `sweepExpectations()` opens it against
+an unpaid expectation past its expiry, so it arrives as `exception.opened` with
+`data.exception.code` set to `EXPECTATION_EXPIRED`. The sweep is idempotent and does not itself change
+the expectation's status. It is independent of matching's `LATE_BEYOND_WINDOW`: a truly late, unpaid
+expectation can draw both, as two separate `exception.opened` events.
 
 Records use the same JSON as the HTTP API: amounts are exact decimal strings next to their asset,
 and ids and dates are strings.
@@ -74,3 +86,19 @@ after each round (the secret comes only from `NOSTRO_WEBHOOK_SECRET`). The HTTP 
 log at `GET /v1/events` for clients that would rather poll. Secrets must be at least 32 characters
 (`openssl rand -hex 32`). Each destination keeps its own position (`consumer`, default `webhook`).
 Two deliverers sharing one consumer won't both advance it: the second one notices and stops.
+
+## Event retention
+
+Webhook consumers retain their own position in the tenant's event log. The `prune-events` command
+removes an old prefix only through the slowest saved consumer position, so an unresponsive consumer
+holds the prefix it still needs. Events newer than the requested cutoff remain available.
+
+```sh
+nostro prune-events --tenant acme --older-than 2026-01-01T00:00:00Z
+```
+
+The command is irreversible. A polling client whose `after` position is older than the recorded
+retention watermark receives HTTP `410 event_history_pruned` with the highest pruned sequence in
+`detail`; resume from that sequence. A newly registered webhook consumer starts at the current
+retention watermark and receives events retained from that point onward. Existing consumers keep
+their stored positions.

@@ -18,6 +18,7 @@ export type FindingCode =
   | 'disposition_unsupported'
   | 'allocation_asset'
   | 'allocation_over_movement'
+  | 'muxed_id_duplicate'
   // I2
   | 'balance_mismatch'
   // I3
@@ -26,6 +27,7 @@ export type FindingCode =
   | 'journal_asset'
   | 'journal_cash_mismatch'
   | 'journal_stale'
+  | 'manual_entry_touches_cash'
 
 /**
  * `error`: the invariant does not hold. `warning`: it holds, but something

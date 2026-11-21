@@ -51,6 +51,16 @@ function routesOf(tree: string): string[] {
   return out.sort()
 }
 
+interface DocumentedOperation {
+  requestBody?: { content: Record<string, { schema: object }> }
+  responses: Record<string, { content?: Record<string, { schema: object }> }>
+}
+
+const operation = (doc: ReturnType<typeof buildOpenApi>, method: string, path: string) =>
+  (doc.paths as Record<string, Record<string, DocumentedOperation>>)[path]![method]!
+
+const asSchema = (schema: object) => JSON.parse(JSON.stringify(schema).replaceAll('"#/components', '"nostro#/components'))
+
 describe('the OpenAPI document', () => {
   it("carries this package's version", async () => {
     const { readFileSync } = await import('node:fs')
@@ -84,19 +94,27 @@ describe('the OpenAPI document', () => {
     const ajv = new Ajv2020({ strict: false, allErrors: true })
     addFormats(ajv)
     ajv.addSchema({ $id: 'nostro', components: doc.components })
-    const conforms = (status: number, body: unknown, method: string, path: string) => {
-      const op = (doc.paths as Record<string, Record<string, { responses: Record<string, { content?: Record<string, { schema: object }> }> }>>)[path]![method]!
+    const conforms = (status: number, body: unknown, method: string, path: string, payload?: object) => {
+      const op = operation(doc, method, path)
       const response = op.responses[String(status)]
       expect(response, `${method} ${path} documents ${status}`).toBeDefined()
       const [, media] = Object.entries(response!.content!)[0]!
-      const schema = JSON.parse(JSON.stringify(media.schema).replaceAll('"#/components', '"nostro#/components'))
+      const schema = asSchema(media.schema)
       const validate = ajv.compile(schema)
       expect(validate(body), `${method} ${path} ${status}: ${ajv.errorsText(validate.errors)}`).toBe(true)
       ajv.removeSchema(schema)
+      if (payload !== undefined) {
+        const request = op.requestBody?.content['application/json']
+        expect(request, `${method} ${path} documents a JSON request body`).toBeDefined()
+        const requestSchema = asSchema(request!.schema)
+        const validateRequest = ajv.compile(requestSchema)
+        expect(validateRequest(payload), `${method} ${path} request: ${ajv.errorsText(validateRequest.errors)}`).toBe(true)
+        ajv.removeSchema(requestSchema)
+      }
     }
-    const call = async (method: 'GET' | 'POST', url: string, path: string, payload?: object, auth = true) => {
+    const call = async (method: 'GET' | 'POST', url: string, path: string, payload?: object, auth = true, documentedPayload = true) => {
       const res = await server.inject({ method, url, ...(auth ? { headers } : {}), ...(payload === undefined ? {} : { payload }) })
-      conforms(res.statusCode, res.json(), method.toLowerCase(), path)
+      conforms(res.statusCode, res.json(), method.toLowerCase(), path, documentedPayload ? payload : undefined)
       return res
     }
 
@@ -113,6 +131,22 @@ describe('the OpenAPI document', () => {
       reference: 'INV-9', account: A, amount: '3', payers: [B], dueAt: '2026-11-01T00:00:00Z', metadata: { po: '1' },
     })
     expect(created.statusCode).toBe(201)
+    const toCancel = await call('POST', '/v1/expectations', '/v1/expectations', { reference: 'INV-10', account: A, amount: '2' })
+    expect(toCancel.statusCode).toBe(201)
+
+    const cancelPath = '/v1/expectations/{id}/cancel'
+    expect((await call('POST', '/v1/expectations/nope/cancel', cancelPath, { reason: 'n' })).statusCode).toBe(404)
+    expect((await call('POST', `/v1/expectations/${toCancel.json().id}/cancel`, cancelPath, {}, true, false)).statusCode).toBe(400)
+    const cancelled = await call('POST', `/v1/expectations/${toCancel.json().id}/cancel`, cancelPath, { reason: 'no longer needed' })
+    expect(cancelled.json()).toMatchObject({ status: 'cancelled', cancelReason: 'no longer needed' })
+    expect((await call('POST', `/v1/expectations/${toCancel.json().id}/cancel`, cancelPath, { reason: 'again' })).statusCode).toBe(409)
+    expect((await call('POST', `/v1/expectations/${created.json().id}/cancel`, cancelPath, { reason: 'bad\u0000reason' })).statusCode).toBe(422)
+    const amendPath = '/v1/expectations/{id}/amend'
+    expect((await call('POST', '/v1/expectations/nope/amend', amendPath, { reason: 'n' })).statusCode).toBe(404)
+    expect((await call('POST', `/v1/expectations/${created.json().id}/amend`, amendPath, { reason: 'n', amount: 1 }, true, false)).statusCode).toBe(400)
+    expect((await call('POST', `/v1/expectations/${created.json().id}/amend`, amendPath, { reason: 'n' })).statusCode).toBe(422)
+    const amended = await call('POST', `/v1/expectations/${created.json().id}/amend`, amendPath, { reason: 'corrected', amount: '4', muxedId: null })
+    expect(amended.json()).toMatchObject({ amount: '4.0000000', muxedId: null })
 
     const openExceptions = (await call('GET', '/v1/exceptions?status=open', '/v1/exceptions')).json().data as { id: string }[]
     const path = '/v1/exceptions/{id}/resolve'
@@ -120,7 +154,7 @@ describe('the OpenAPI document', () => {
     expect((await call('POST', `/v1/exceptions/nope/resolve`, path, { action: 'ignore', note: 'n' })).statusCode).toBe(404)
     expect((await call('POST', `/v1/exceptions/${debit}/resolve`, path, { action: 'apply', allocations: [{ reference: 'nope' }], note: 'n' })).statusCode).toBe(422)
     expect((await call('POST', `/v1/exceptions/${debit}/resolve`, path, { action: 'close', note: 'n' })).statusCode).toBe(409)
-    expect((await call('POST', `/v1/exceptions/${debit}/resolve`, path, { action: 'pay' })).statusCode).toBe(400)
+    expect((await call('POST', `/v1/exceptions/${debit}/resolve`, path, { action: 'pay' }, true, false)).statusCode).toBe(400)
     const ignored = await call('POST', `/v1/exceptions/${debit}/resolve`, path, { action: 'ignore', note: 'paid a supplier' })
     expect(ignored.statusCode).toBe(200)
     expect(ignored.json().journalEntry.kind).toBe('reclass')
@@ -131,5 +165,39 @@ describe('the OpenAPI document', () => {
     expect((await call('GET', '/v1/movements/nope', '/v1/movements/{id}')).statusCode).toBe(404)
     expect((await call('POST', '/v1/expectations', '/v1/expectations', { reference: 'INV-9', account: A, amount: '3' })).statusCode).toBe(409)
     expect((await call('POST', '/v1/expectations', '/v1/expectations', { reference: 'R', account: A, amount: '0' })).statusCode).toBe(422)
+  })
+
+  it('documents the cancel, amend and create request bodies, including an issued muxed id', async () => {
+    const server = await app()
+    const doc = buildOpenApi()
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    addFormats(ajv)
+    ajv.addSchema({ $id: 'nostro', components: doc.components })
+    const bodyValidate = (path: string) => {
+      const request = operation(doc, 'post', path).requestBody?.content['application/json']
+      expect(request, `${path} documents a JSON request body`).toBeDefined()
+      return ajv.compile(asSchema(request!.schema))
+    }
+    const cancelBody = bodyValidate('/v1/expectations/{id}/cancel')
+    expect(cancelBody({ reason: 'n' }), ajv.errorsText(cancelBody.errors)).toBe(true)
+    for (const payload of [{}, { reason: '' }, { reason: 1 }, { reason: 'n', amount: '1' }]) {
+      expect(cancelBody(payload), JSON.stringify(payload)).toBe(false)
+    }
+    const amendBody = bodyValidate('/v1/expectations/{id}/amend')
+    const amendment = { reason: 'n', amount: '1', muxedId: null, memo: null, payers: [A], dueAt: null, expiresAt: null, metadata: { po: '1' } }
+    expect(amendBody(amendment), ajv.errorsText(amendBody.errors)).toBe(true)
+    for (const payload of [{}, { reason: '' }, { reason: 'n', amount: 1 }, { reason: 'n', muxedId: 'issue' }, { reason: 'n', memo: { type: 'hash', value: 'aa' } }]) {
+      expect(amendBody(payload), JSON.stringify(payload)).toBe(false)
+    }
+    const createBody = bodyValidate('/v1/expectations')
+    const issued = { reference: 'INV-ISSUE', account: A, amount: '3', muxedId: 'issue' }
+    expect(createBody(issued), ajv.errorsText(createBody.errors)).toBe(true)
+    expect(createBody({ ...issued, muxedId: '7' }), ajv.errorsText(createBody.errors)).toBe(true)
+    expect(createBody({ ...issued, muxedId: 7 })).toBe(false)
+    expect(createBody({ ...issued, muxedId: 'n' })).toBe(false)
+    const res = await server.inject({ method: 'POST', url: '/v1/expectations', headers, payload: issued })
+    expect(res.statusCode).toBe(201)
+    expect(res.json().muxedId).toMatch(/^[0-9]+$/)
+    expect(BigInt(res.json().muxedId) > 0n).toBe(true)
   })
 })

@@ -9,6 +9,7 @@
  */
 import type { JournalEntry } from '../model/index.js'
 import type { Store } from '../store/index.js'
+import { JournalRounder } from './round.js'
 
 export const JOURNAL_CSV_COLUMNS = [
   'entry_id',
@@ -28,6 +29,7 @@ export const JOURNAL_CSV_COLUMNS = [
   'expectation_reference',
   'exception_id',
   'exception_code',
+  'value',
 ] as const
 
 export interface JournalCsvOptions {
@@ -40,7 +42,12 @@ export interface JournalCsvOptions {
   /** Entries read per page. Default 500. */
   readonly pageSize?: number
   /** Internal upper bound used to keep a multi-pass export on one journal snapshot. */
+  readonly afterSeq?: number
   readonly throughSeq?: number
+  /** Target decimal places for exact, balanced rounding. Omit for unchanged output. */
+  readonly decimals?: number
+  /** Metadata keys to read as dimensions. Each key becomes a column named after it. */
+  readonly dimensions?: readonly string[]
 }
 
 const FORMULA = /^[=+\-@\t\r]/
@@ -55,67 +62,96 @@ export function journalCsvCell(value: string | number | null, text = false): str
 
 export const journalCsvRow = (cells: readonly string[]) => `${cells.join(',')}\r\n`
 
-/** Read the matching journal entries in bounded pages. */
-export async function* journalEntries(options: JournalCsvOptions): AsyncGenerator<JournalEntry> {
+async function* journalEntryPages(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry[]> {
   const { store, tenantId } = options
   const pageSize = options.pageSize ?? 500
-  let afterSeq: number | undefined
+  let afterSeq = includeBeforeFrom ? undefined : options.afterSeq
   for (;;) {
-    const page: JournalEntry[] = await store.listJournalEntries({
+    const page = await store.listJournalEntries({
       tenantId,
       limit: pageSize,
       ...(afterSeq === undefined ? {} : { afterSeq }),
-      ...(options.from === undefined ? {} : { effectiveFrom: options.from }),
+      ...(includeBeforeFrom || options.from === undefined ? {} : { effectiveFrom: options.from }),
       ...(options.to === undefined ? {} : { effectiveBefore: options.to }),
     })
+    if (page.length === 0) return
+    yield page
+    if (page.length < pageSize) return
+    afterSeq = page[page.length - 1]!.seq
+  }
+}
+
+/** Read the matching journal entries in bounded pages. */
+export async function* journalEntries(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry> {
+  for await (const page of journalEntryPages(options, includeBeforeFrom)) {
     for (const entry of page) {
       if (options.throughSeq !== undefined && entry.seq > options.throughSeq) return
       yield entry
     }
-    if (page.length < pageSize) return
-    afterSeq = page[page.length - 1]!.seq
   }
 }
 
 /** The CSV, header first, a row at a time; suitable for streaming large ledgers. */
 export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerator<string> {
   const { store, tenantId } = options
-  const txHash = new Map<string, string | null>()
-  const reference = new Map<string, string | null>()
-  const code = new Map<string, string | null>()
+  const dimColumnNames = options.dimensions ?? []
+  const allColumns = [...JOURNAL_CSV_COLUMNS, ...dimColumnNames]
+  yield journalCsvRow(allColumns.map((c) => c))
 
-  yield journalCsvRow(JOURNAL_CSV_COLUMNS.map((c) => c))
-  for await (const entry of journalEntries(options)) {
-    if (entry.movementId !== null && !txHash.has(entry.movementId)) {
-      txHash.set(entry.movementId, (await store.getMovement(tenantId, entry.movementId))?.txHash ?? null)
-    }
-    for (const [i, line] of entry.lines.entries()) {
-      if (line.expectationId !== null && !reference.has(line.expectationId)) {
-        reference.set(line.expectationId, (await store.getExpectation(tenantId, line.expectationId))?.reference ?? null)
+  const rounder = options.decimals === undefined ? null : new JournalRounder(options.decimals)
+
+  for await (const originalPage of journalEntryPages(options, rounder !== null)) {
+    const page = originalPage.filter((entry) => options.throughSeq === undefined || entry.seq <= options.throughSeq)
+    if (page.length === 0) return
+    const movementIds = [...new Set(page.flatMap((entry) => entry.movementId === null ? [] : [entry.movementId]))]
+    const expectationIds = [...new Set(page.flatMap((entry) => entry.lines.flatMap((line) => line.expectationId === null ? [] : [line.expectationId])))]
+    const exceptionIds = [...new Set(page.flatMap((entry) => entry.lines.flatMap((line) => line.exceptionId === null ? [] : [line.exceptionId])))]
+    const [movements, expectations, exceptions] = await Promise.all([
+      store.listMovements({ tenantId, ids: movementIds }),
+      store.listExpectations({ tenantId, ids: expectationIds }),
+      store.listExceptions({ tenantId, ids: exceptionIds }),
+    ])
+    const txHash = new Map(movements.map((movement) => [movement.id, movement.txHash]))
+    const reference = new Map(expectations.map((expectation) => [expectation.id, expectation.reference]))
+    const codes = new Map(exceptions.map((exception) => [exception.id, exception.code]))
+    const valuations = new Map(await Promise.all(movementIds.map(async (id) => [id, (await store.getValuation(tenantId, id))?.value.toString() ?? null] as const)))
+    const expectationMetadatas = new Map(expectations.map((expectation) => [expectation.id, expectation.metadata]))
+
+    for (const original of page) {
+      const entry = rounder === null ? original : rounder.round(original)
+      if (options.afterSeq !== undefined && original.seq <= options.afterSeq) continue
+      if (rounder !== null && options.from !== undefined && original.effectiveAt < options.from) continue
+      for (const [i, line] of entry.lines.entries()) {
+        const expectationId = line.expectationId ?? null
+        const amount = line.amount.toString()
+        const dimCells: string[] = []
+        for (const dim of dimColumnNames) {
+          const metadata = (expectationId === null ? undefined : expectationMetadatas.get(expectationId)) ?? {}
+          const val = metadata[dim] ?? ''
+          dimCells.push(journalCsvCell(val, true))
+        }
+        yield journalCsvRow([
+          journalCsvCell(entry.id),
+          journalCsvCell(entry.seq),
+          journalCsvCell(entry.kind),
+          journalCsvCell(entry.postedAt.toISOString()),
+          journalCsvCell(entry.effectiveAt.toISOString()),
+          journalCsvCell(entry.description, true),
+          journalCsvCell(i + 1),
+          journalCsvCell(line.account, true),
+          journalCsvCell(line.role),
+          journalCsvCell(line.amount.asset),
+          journalCsvCell(line.side === 'debit' ? amount : null),
+          journalCsvCell(line.side === 'credit' ? amount : null),
+          journalCsvCell(entry.movementId),
+          journalCsvCell(entry.movementId === null ? null : (txHash.get(entry.movementId) ?? null)),
+          journalCsvCell(line.expectationId === null ? null : (reference.get(line.expectationId) ?? null), true),
+          journalCsvCell(line.exceptionId),
+          journalCsvCell(line.exceptionId === null ? null : (codes.get(line.exceptionId) ?? null)),
+          journalCsvCell(entry.movementId === null ? null : (valuations.get(entry.movementId) ?? null)),
+          ...dimCells,
+        ])
       }
-      if (line.exceptionId !== null && !code.has(line.exceptionId)) {
-        code.set(line.exceptionId, (await store.getException(tenantId, line.exceptionId))?.code ?? null)
-      }
-      const amount = line.amount.toString()
-      yield journalCsvRow([
-        journalCsvCell(entry.id),
-        journalCsvCell(entry.seq),
-        journalCsvCell(entry.kind),
-        journalCsvCell(entry.postedAt.toISOString()),
-        journalCsvCell(entry.effectiveAt.toISOString()),
-        journalCsvCell(entry.description, true),
-        journalCsvCell(i + 1),
-        journalCsvCell(line.account, true),
-        journalCsvCell(line.role),
-        journalCsvCell(line.amount.asset),
-        journalCsvCell(line.side === 'debit' ? amount : null),
-        journalCsvCell(line.side === 'credit' ? amount : null),
-        journalCsvCell(entry.movementId),
-        journalCsvCell(entry.movementId === null ? null : (txHash.get(entry.movementId) ?? null)),
-        journalCsvCell(line.expectationId === null ? null : (reference.get(line.expectationId) ?? null), true),
-        journalCsvCell(line.exceptionId),
-        journalCsvCell(line.exceptionId === null ? null : (code.get(line.exceptionId) ?? null)),
-      ])
     }
   }
 }

@@ -109,6 +109,23 @@ describe('nostro serve', () => {
     expect(await server.stop()).toBe(0)
   })
 
+  it('includes issued muxed ids in API output', async () => {
+    const cwd = await migrated()
+    const created = await nostro(cwd, ['expect', 'INV-M1', '--account', A, '--amount', '1', '--issue-muxed-id', '--tenant', 'acme', '--json'])
+    const first = JSON.parse(created.stdout) as { id: string; muxedId: string }
+    const second = await nostro(cwd, ['expect', 'INV-M2', '--account', A, '--amount', '2', '--issue-muxed-id', '--tenant', 'acme', '--json'])
+    expect([first.muxedId, JSON.parse(second.stdout).muxedId]).toEqual(['1', '2'])
+    const server = await start(cwd, [])
+    try {
+      const listed = (await (await server.get('/v1/expectations')).json()) as { data: { reference: string; muxedId: string | null }[] }
+      expect(listed.data.map((e) => [e.reference, e.muxedId])).toEqual([['INV-M1', '1'], ['INV-M2', '2']])
+      const one = (await (await server.get(`/v1/expectations/${first.id}`)).json()) as { expectation: { muxedId: string } }
+      expect(one.expectation.muxedId).toBe('1')
+    } finally {
+      await server.stop()
+    }
+  })
+
   it('says which address it is bound to', async () => {
     const cwd = await migrated()
     const server = await start(cwd, ['--host', '0.0.0.0'])

@@ -18,7 +18,7 @@
  * Records are immutable values. Stores return frozen objects and replace rather
  * than mutate them.
  */
-import type { Money } from '../money/index.js'
+import type { AssetId, Money } from '../money/index.js'
 
 /** Which way value moved, relative to the watched account. */
 export type Direction = 'credit' | 'debit'
@@ -164,6 +164,16 @@ export interface NewExpectation {
   readonly account: string
   readonly direction?: Direction
   readonly amount: Money
+  readonly muxedId?: bigint | 'issue' | null
+  readonly memo?: Memo | null
+  readonly payers?: readonly string[]
+  readonly dueAt?: Date | null
+  readonly expiresAt?: Date | null
+  readonly metadata?: Readonly<Record<string, string>>
+}
+
+export interface ExpectationChanges {
+  readonly amount?: Money
   readonly muxedId?: bigint | null
   readonly memo?: Memo | null
   readonly payers?: readonly string[]
@@ -208,6 +218,7 @@ export type ExceptionCode =
   | 'DUPLICATE_PAYMENT'
   | 'PARTIAL_UNRESOLVED'
   | 'LATE_BEYOND_WINDOW'
+  | 'EXPECTATION_EXPIRED'
   | 'MEMO_MISSING'
   | 'MEMO_MALFORMED'
   | 'MEMO_TRUNCATED'
@@ -226,6 +237,7 @@ export const EXCEPTION_CODES: readonly ExceptionCode[] = [
   'DUPLICATE_PAYMENT',
   'PARTIAL_UNRESOLVED',
   'LATE_BEYOND_WINDOW',
+  'EXPECTATION_EXPIRED',
   'MEMO_MISSING',
   'MEMO_MALFORMED',
   'MEMO_TRUNCATED',
@@ -298,6 +310,9 @@ export type LineRole =
   | 'network_fees'
   | 'uncategorized_income'
   | 'uncategorized_expense'
+  | 'conversion'
+  | 'refund_clearing'
+  | 'other'
 
 export const LINE_ROLES: readonly LineRole[] = [
   'cash',
@@ -310,6 +325,9 @@ export const LINE_ROLES: readonly LineRole[] = [
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
+  'refund_clearing',
+  'other',
 ]
 
 export type Side = 'debit' | 'credit'
@@ -318,10 +336,11 @@ export type Side = 'debit' | 'credit'
  * `initial`: a movement's first entry, dated when the money moved.
  * `reclass`: moves an amount between counter-accounts; cash is untouched.
  * `correction`: changes the cash leg itself (a source correction).
+ * `manual`: a manual entry not tied to a movement (or a manual adjustment), cash untouched.
  */
-export type JournalEntryKind = 'initial' | 'reclass' | 'correction'
+export type JournalEntryKind = 'initial' | 'reclass' | 'correction' | 'conversion' | 'manual'
 
-export const JOURNAL_ENTRY_KINDS: readonly JournalEntryKind[] = ['initial', 'reclass', 'correction']
+export const JOURNAL_ENTRY_KINDS: readonly JournalEntryKind[] = ['initial', 'reclass', 'correction', 'conversion', 'manual']
 
 export interface JournalLine {
   readonly account: string
@@ -362,4 +381,68 @@ export interface NewJournalLine {
   readonly amount: Money
   readonly expectationId?: string | null
   readonly exceptionId?: string | null
+  readonly accrual?: boolean
+}
+
+export interface NewJournalEntry {
+  readonly tenantId: string
+  readonly movementId?: string | null
+  readonly postingNo?: number | null
+  readonly kind: JournalEntryKind
+  /** Defaults to the store's clock. */
+  readonly effectiveAt?: Date
+  readonly description: string
+  readonly lines: readonly NewJournalLine[]
+}
+
+/** A movement's signed effect on its account's balance: credits add, debits subtract. */
+export function signedAmount(movement: Pick<Movement, 'amount' | 'direction'>): Money {
+  return movement.direction === 'credit' ? movement.amount : movement.amount.negate()
+}
+
+export interface PriceFraction {
+  readonly n: bigint
+  readonly d: bigint
+}
+
+export interface Price {
+  readonly base: AssetId
+  readonly quote: AssetId
+  readonly price: PriceFraction
+  readonly source: string
+  readonly timestamp: Date
+}
+
+export interface PriceSource {
+  price(base: AssetId, quote: AssetId, instant: Date): Promise<Price | null>
+}
+
+export interface MovementValuation {
+  readonly movementId: string
+  readonly tenantId: string
+  readonly reportingAsset: AssetId
+  readonly priceNumerator: bigint
+  readonly priceDenominator: bigint
+  readonly priceSource: string
+  readonly priceTimestamp: Date
+  readonly value: Money
+  readonly valuedAt: Date
+}
+
+export interface NewMovementValuation {
+  readonly movementId: string
+  readonly tenantId: string
+  readonly reportingAsset: AssetId
+  readonly priceNumerator: bigint
+  readonly priceDenominator: bigint
+  readonly priceSource: string
+  readonly priceTimestamp: Date
+  readonly value: Money
+  readonly valuedAt?: Date
+}
+
+export interface ValuationQuery {
+  readonly tenantId: string
+  readonly movementId?: string
+  readonly reportingAsset?: AssetId
 }

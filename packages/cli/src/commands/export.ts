@@ -10,7 +10,7 @@ import {
   journalQuickBooksRows,
   journalXeroRows,
 } from '@nostro-labs/nostro'
-import { COMMON, CliError, UsageError, date, flag, positionals, string, tenant } from '../args.js'
+import { COMMON, CliError, UsageError, date, flag, integer, positionals, string, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { withStore } from '../command.js'
 import { write } from '../io.js'
@@ -52,6 +52,7 @@ Beancount is ledger text. Spreadsheet exports guard text cells against formulas.
 
 Options:
   --format <format>   csv (default), quickbooks, xero or beancount
+  --decimals <n>     Round CSV amounts to n decimal places (0–38)
   --from <date>       Entries effective on or after this
   --to <date>         Entries effective before this
   --output <file>     Write to this file; it must not exist, unless --force
@@ -61,12 +62,14 @@ Options:
   --tax-rate <name>   Xero tax rate already configured in the organisation (default "No Tax")
   --db <path|url>     SQLite file, or a postgres:// URL (env NOSTRO_DB; default ./nostro.db)
   --tenant <id>       Whose records to use (env NOSTRO_TENANT; default "default")
+  --destination       Name of the export destination high-water mark to use (default: none)
   -h, --help          Show this help
 
 Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17:00:00+01:00.`,
   options: {
     ...options,
     format: { type: 'string' },
+    decimals: { type: 'string' },
     from: { type: 'string' },
     to: { type: 'string' },
     output: { type: 'string' },
@@ -74,6 +77,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     'account-map': { type: 'string' },
     'commodity-map': { type: 'string' },
     'tax-rate': { type: 'string' },
+    destination: { type: 'string' },
   },
   async run(args, io) {
     positionals(args, 0)
@@ -82,6 +86,8 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const to = date(args, 'to')
     if (from !== undefined && to !== undefined && from >= to) throw new UsageError('--from must be before --to.')
     const format = string(args, 'format') ?? 'csv'
+    const decimals = string(args, 'decimals') === undefined ? undefined : integer(args, 'decimals', 7, 0, 38)
+    if (decimals !== undefined && format !== 'csv') throw new UsageError('--decimals only applies to CSV exports.')
     if (!['csv', 'quickbooks', 'xero', 'beancount'].includes(format)) {
       throw new UsageError('--format must be csv, quickbooks, xero or beancount.')
     }
@@ -106,8 +112,29 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const output = string(args, 'output')
     if (output === undefined && flag(args, 'force')) throw new UsageError('--force only applies with --output.')
 
+    const destination = string(args, 'destination')
+    const showBatches = flag(args, 'batches')
+
     return withStore(args, io, async (store) => {
-      const base = { store, tenantId, ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) }
+      const mark = destination ? await store.exportGetMark(tenantId, destination) : null
+      const afterSeq = mark === null ? undefined : Number(mark)
+      let throughSeq = afterSeq ?? 0
+      let cursor = afterSeq
+      for (;;) {
+        const page = await store.listJournalEntries({ tenantId, limit: 500,
+          ...(cursor === undefined ? {} : { afterSeq: cursor }),
+          ...(from === undefined ? {} : { effectiveFrom: from }),
+          ...(to === undefined ? {} : { effectiveBefore: to }),
+        })
+        if (page.length === 0) break
+        throughSeq = page[page.length - 1]!.seq
+        cursor = throughSeq
+        if (page.length < 500) break
+      }
+      const base = { store, tenantId, throughSeq,
+        ...(afterSeq === undefined ? {} : { afterSeq }),
+        ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) }
+
       const accountMap = accountMapPath === undefined ? undefined : await readMap(accountMapPath, io.cwd, 'account')
       const commodityMap = commodityMapPath === undefined ? undefined : await readMap(commodityMapPath, io.cwd, 'commodity')
       let rows: AsyncGenerator<string>
@@ -121,41 +148,55 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
         if (commodityMap === undefined) throw new UsageError('--format beancount requires --commodity-map <file>.')
         rows = journalBeancountRows({ ...base, commodityMap })
       } else {
-        rows = journalCsvRows(base)
+        rows = journalCsvRows({ ...base, ...(decimals === undefined ? {} : { decimals }) })
       }
       if (output === undefined) {
         for await (const row of rows) await write(io.stdout, row)
-        return 0
+      } else {
+        const path = resolve(io.cwd, output)
+        const file = createWriteStream(path, { flags: flag(args, 'force') ? 'w' : 'wx' })
+        try {
+          await once(file, 'open')
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === 'EEXIST') throw new CliError(`${path} exists; pass --force to overwrite it.`)
+          throw err
+        }
+        let chunks = 0
+        async function* counted() {
+          for await (const row of rows) {
+            chunks += 1
+            yield row
+          }
+        }
+        try {
+          // pipeline() waits for drain, and destroys the file on an error at either end.
+          await pipeline(Readable.from(counted()), file)
+        } catch (err) {
+          // Half a ledger is worse than none: leave no partial file behind.
+          await rm(path, { force: true })
+          throw err
+        }
+        const message =
+          format === 'beancount'
+            ? `Wrote Beancount ledger to ${path}.\n`
+            : `Wrote ${Math.max(0, chunks - 1)} journal line(s) to ${path}.\n`
+        await write(io.stdout, message)
       }
 
-      const path = resolve(io.cwd, output)
-      const file = createWriteStream(path, { flags: flag(args, 'force') ? 'w' : 'wx' })
-      try {
-        await once(file, 'open')
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === 'EEXIST') throw new CliError(`${path} exists; pass --force to overwrite it.`)
-        throw err
+      if (destination && throughSeq > (afterSeq ?? 0)) {
+        await store.exportSetMark(tenantId, destination, throughSeq)
       }
-      let chunks = 0
-      async function* counted() {
-        for await (const row of rows) {
-          chunks += 1
-          yield row
+
+      // List batches if requested
+      if (showBatches) {
+        const batches = await store.exportListBatches(tenantId)
+        const header = 'destination,last_seq,last_exported_at,control_totals,checksum'
+        await write(io.stdout, header + '\r\n')
+        for (const b of batches) {
+          await write(io.stdout, `${b.destination},${b.last_seq},${b.last_exported_at},${b.control_totals},${b.checksum}\r\n`)
         }
       }
-      try {
-        // pipeline() waits for drain, and destroys the file on an error at either end.
-        await pipeline(Readable.from(counted()), file)
-      } catch (err) {
-        // Half a ledger is worse than none: leave no partial file behind.
-        await rm(path, { force: true })
-        throw err
-      }
-      const message =
-        format === 'beancount'
-          ? `Wrote Beancount ledger to ${path}.\n`
-          : `Wrote ${Math.max(0, chunks - 1)} journal line(s) to ${path}.\n`
-      await write(io.stdout, message)
+
       return 0
     })
   },

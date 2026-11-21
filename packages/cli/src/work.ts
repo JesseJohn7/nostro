@@ -3,7 +3,7 @@
  * `nostro serve`: catch every stream up, then decide everything pending.
  */
 import type { AccountSyncReport, ExceptionCode, MovementSource, Store } from '@nostro-labs/nostro'
-import { reconcile, sync } from '@nostro-labs/nostro'
+import { reconcile, sweepExpectations, sync } from '@nostro-labs/nostro'
 
 export interface StreamProgress {
   readonly account: string
@@ -93,6 +93,7 @@ export async function reconcileAll(store: Store, tenantId: string, limit: number
     exceptions: {},
     errors: new Map(),
   }
+  await sweepExpectations({ store, tenantId })
   for (;;) {
     const report = await reconcile({ store, tenantId, limit })
     totals.decided += report.processed
