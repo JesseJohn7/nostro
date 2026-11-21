@@ -201,5 +201,27 @@ These are known gaps, each planned as its own self-contained piece of work:
 - **Slippage tolerance** for path payments delivering slightly less than asked.
 - **One payment covering several invoices** with no per-invoice reference. Today this is an
   exception for a person to split.
-- **Return memos on credits.** A `MEMO_RETURN` currently raises `MEMO_MALFORMED`. Pairing it with
-  the original payment is left for the refunds work (#15).
+- **Return memos on credits.** An incoming `MEMO_RETURN` still raises `MEMO_MALFORMED`; automatic refund linking applies to outgoing transfers only.
+
+
+## Refunds recorded by return memo
+
+Before expectation scoring, an outgoing transfer with `MEMO_RETURN` is looked up by its exact
+transaction hash. There must be one earlier credit on the same tenant, network, wallet, asset and
+precision. Unknown, ambiguous, future, wrong-asset or excessive returns raise `REFUND_UNLINKED`;
+ordinary debits without a return memo are never guessed to be refunds.
+
+All three stores persist an immutable `RefundLink` containing the original movement, the outgoing
+movement, the exact amount and the part returning unallocated money. The credit is locked until the
+link, both dispositions, exceptions and journal entries commit together. Competing refunds cannot
+return more than the original credit, later allocations cannot spend returned money, and rerunning
+reconciliation creates no duplicate links or postings.
+
+Policy: return remaining customer credit or unapplied receipts first. Any remainder that refunds an
+already-settled invoice is a return expense; the invoice and its historical allocations stay settled.
+This policy deliberately does not reopen invoices or imply that a new payment is due. A business
+that needs a new receivable must record a new expectation explicitly. No transaction is signed or sent.
+
+Read links through `store.listRefundLinks({tenantId,creditMovementId})`, by `refundMovementId`, or
+by `movementIds`. `GET /v1/movements/{id}` returns `refunds` on either side, with exact decimal
+amounts. See [journal treatment](./journal.md#refunds).

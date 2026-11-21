@@ -31,12 +31,12 @@ async function manualEntry(store: MemoryStore, amount: Money, accounts = [
   await store.transaction((tx) =>
     tx.postJournalEntry({
       tenantId: T,
-      kind: 'reclass',
+      kind: 'manual',
       effectiveAt: new Date('2026-10-05T12:00:00Z'),
       description: 'Move "held" funds',
       lines: [
-        { account: accounts[0]!, role: 'cash', side: 'debit', amount },
-        { account: accounts[1]!, role: 'unapplied', side: 'credit', amount },
+        { account: accounts[0]!, role: 'other', side: 'debit', amount },
+        { account: accounts[1]!, role: 'uncategorized_expense', side: 'credit', amount },
       ],
     }),
   )

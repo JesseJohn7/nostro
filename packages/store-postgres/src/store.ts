@@ -23,6 +23,7 @@ import type {
   DeliveryAttempt,
   DeliveryAttemptQuery,
   Disposition,
+  Direction,
   EventQuery,
   ExceptionQuery,
   ExceptionRecord,
@@ -50,12 +51,22 @@ import type {
   RewindInput,
   RewindQuery,
   PruneEventsResult,
+  RefundLink,
+  RefundQuery,
   Resolution,
   SchemaVersion,
   StoreReader,
   StoreTx,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '@nostro-labs/nostro'
 import {
+  refundParts,
+  refundCoverage,
+  refundLinkFromRow,
+  postAccrual,
+  Money,
   ConstraintError,
   NotFoundError,
   TransactionClosedError,
@@ -93,9 +104,10 @@ import type {
   JournalEntryRow,
   JournalLineRow,
   MovementRow,
+  MovementValuationRow,
   RewindRow,
 } from './rows.js'
-import { memoColumns, toAllocation, toDeliveryAttempt, toEvent, toException, toExpectation, toJournalEntry, toMovement, toRewind } from './rows.js'
+import { memoColumns, toAllocation, toDeliveryAttempt, toEvent, toException, toExpectation, toJournalEntry, toMovement, toRewind, toValuation } from './rows.js'
 import { MIGRATIONS, quoteSchema } from './schema.js'
 
 export interface PostgresStoreOptions {
@@ -158,6 +170,7 @@ class PgReader implements StoreReader {
       .add((p) => `id = ANY(${p}::text[])`, q.ids === undefined ? undefined : [...q.ids])
       .add((p) => `disposition = ${p}`, q.disposition)
       .add((p) => `account = ${p}`, q.account)
+      .add((p) => `tx_hash = ${p}`, q.txHash)
       .add((p) => `seq > ${p}`, q.afterSeq)
     const sql = `SELECT * FROM ${this.s}.movements${w} ORDER BY seq${w.limit(q.limit)}`
     return (await this.run<MovementRow>(sql, w.params)).map(toMovement)
@@ -354,6 +367,48 @@ class PgReader implements StoreReader {
       closedAt: row.created_at,
     })
   }
+
+  async listRefundLinks(q: RefundQuery): Promise<RefundLink[]> {
+    if (q.movementIds?.length === 0) return []
+    const w=new Where().add(p=>`tenant_id = ${p}`,q.tenantId)
+      .add(p=>`credit_movement_id = ${p}`,q.creditMovementId)
+      .add(p=>`refund_movement_id = ${p}`,q.refundMovementId)
+      .add(p=>`(credit_movement_id = ANY(${p}::text[]) OR refund_movement_id = ANY(${p}::text[]))`,q.movementIds===undefined?undefined:[...q.movementIds])
+    return (await this.run(`SELECT * FROM ${this.s}.refund_links${w} ORDER BY seq`,w.params)).map(refundLinkFromRow)
+  }
+
+  async accrualGetMode(tenantId: string): Promise<boolean> {
+    const [row] = await this.run<{ active: boolean }>(
+      `SELECT active FROM ${this.s}.accrual_modes WHERE tenant_id = $1`,
+      [tenantId],
+    )
+    return row?.active ?? false
+  }
+
+  async getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null> {
+    const [row] = await this.run<MovementValuationRow>(
+      `SELECT * FROM ${this.s}.movement_valuations WHERE tenant_id = $1 AND movement_id = $2`,
+      [tenantId, movementId],
+    )
+    return row === undefined ? null : toValuation(row)
+  }
+
+  async listValuations(q: ValuationQuery): Promise<MovementValuation[]> {
+    let sql = `SELECT * FROM ${this.s}.movement_valuations WHERE tenant_id = $1`
+    const params: unknown[] = [q.tenantId]
+    let idx = 2
+    if (q.movementId !== undefined) {
+      sql += ` AND movement_id = $${idx++}`
+      params.push(q.movementId)
+    }
+    if (q.reportingAsset !== undefined) {
+      sql += ` AND reporting_asset = $${idx++}`
+      params.push(q.reportingAsset)
+    }
+    sql += ' ORDER BY price_timestamp ASC'
+    const rows = await this.run<MovementValuationRow>(sql, params)
+    return rows.map(toValuation)
+  }
 }
 
 const isUniqueViolation = (err: unknown, constraint: string): boolean =>
@@ -380,40 +435,6 @@ class PgTx extends PgReader implements StoreTx {
 
   close(): void {
     this.open = false
-  }
-
-  async accrualGetMode(tenantId: string): Promise<boolean> {
-    const [row] = await this.run<{ active: boolean }>(
-      `SELECT active FROM ${this.s}.accrual_modes WHERE tenant_id = $1`,
-      [tenantId],
-    )
-    return row?.active ?? false
-  }
-
-  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void> {
-    const [expectation] = await this.run<{ asset: string; decimals: number }>(
-      `SELECT asset, decimals FROM ${this.s}.expectations WHERE tenant_id = $1 AND id = $2`,
-      [tenantId, expectationId],
-    )
-    if (expectation === undefined) return
-    const at = this.now()
-    const entryId = this.ids()
-    const roles = isCredit
-      ? [['assets:receivable', 'receivable', 'debit'], ['income:uncategorized', 'uncategorized_income', 'credit']] as const
-      : [['expenses:uncategorized', 'uncategorized_expense', 'debit'], ['liabilities:payable', 'payable', 'credit']] as const
-
-    await this.run(
-      `INSERT INTO ${this.s}.journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
-       VALUES ($1, $2, NULL, 1, 'initial', $3, $4, $5)`,
-      [entryId, tenantId, at, at, `Accrual for expectation ${reference}`],
-    )
-    for (const [index, [account, role, side]] of roles.entries()) {
-      await this.run(
-        `INSERT INTO ${this.s}.journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL)`,
-        [entryId, index + 1, tenantId, account, role, side, expectation.asset, expectation.decimals, amount, expectationId],
-      )
-    }
   }
 
   async lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null> {
@@ -702,7 +723,7 @@ class PgTx extends PgReader implements StoreTx {
     const m = await this.lockMovement(tenantId, movementId)
     const allocations = await this.listAllocations({ tenantId, movementId })
     const exceptions = await this.listExceptions({ tenantId, movementId })
-    checkDisposition(m, allocations, exceptions, disposition, reason)
+    checkDisposition(m, allocations, exceptions, disposition, reason,refundCoverage(m,await this.listRefundLinks({tenantId,movementIds:[m.id]})))
     const [row] = await this.run<MovementRow>(
       `UPDATE ${this.s}.movements SET disposition = $3, ignored_reason = $4
        WHERE tenant_id = $1 AND id = $2 RETURNING *`,
@@ -861,6 +882,7 @@ class PgTx extends PgReader implements StoreTx {
       e,
       await this.listAllocations({ tenantId: n.tenantId, movementId: m.id }),
       await this.listAllocations({ tenantId: n.tenantId, expectationId: e.id }),
+      refundCoverage(m,await this.listRefundLinks({tenantId:n.tenantId,movementIds:[m.id]})),
     )
     const now = this.now()
     const [row] = await this.run<AllocationRow>(
@@ -1003,6 +1025,49 @@ class PgTx extends PgReader implements StoreTx {
     await this.emit(exceptionChanged(next))
     return next
   }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink> {
+    await this.getMovement(tenantId,creditMovementId)
+    const [existing]=await this.listRefundLinks({tenantId,refundMovementId})
+    if (existing) {
+      if (existing.creditMovementId !== creditMovementId) throw new ConstraintError('refund_invalid','refund already linked to another credit')
+      return existing
+    }
+    const parts=await refundParts(this,tenantId,creditMovementId,refundMovementId)
+    const [row]=await this.run(`INSERT INTO ${this.s}.refund_links(id,tenant_id,credit_movement_id,refund_movement_id,asset,decimals,amount,residual_amount,created_at)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[this.ids(),tenantId,creditMovementId,refundMovementId,parts.amount.asset,parts.amount.decimals,parts.amount.raw.toString(),parts.residualAmount.raw.toString(),this.now()])
+    return refundLinkFromRow(row!)
+  }
+
+  async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {
+    const now = this.now()
+    for (const n of batch) {
+      const m = await this.getMovement(n.tenantId, n.movementId)
+      if (m === null) throw new NotFoundError('movement', n.movementId)
+      await this.run(
+        `INSERT INTO ${this.s}.movement_valuations (
+           tenant_id, movement_id, reporting_asset, price_n, price_d, price_source, price_timestamp, decimals, value, valued_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (tenant_id, movement_id) DO NOTHING`,
+        [
+          n.tenantId,
+          n.movementId,
+          n.reportingAsset,
+          n.priceNumerator.toString(),
+          n.priceDenominator.toString(),
+          n.priceSource,
+          n.priceTimestamp,
+          n.value.decimals,
+          n.value.raw.toString(),
+          n.valuedAt ?? now,
+        ],
+      )
+    }
+  }
 }
 
 export class PostgresStore extends PgReader implements MigratableStore {
@@ -1023,16 +1088,9 @@ export class PostgresStore extends PgReader implements MigratableStore {
     )
   }
 
-  async accrualGetMode(tenantId: string): Promise<boolean> {
-    const [row] = await this.run<{ active: boolean }>(
-      `SELECT active FROM ${this.s}.accrual_modes WHERE tenant_id = $1`,
-      [tenantId],
-    )
-    return row?.active ?? false
-  }
 
-  async postAccrualExpectation(expectationId: string, tenantId: string, isCredit: boolean, amount: string, reference: string): Promise<void> {
-    await this.transaction((tx) => tx.postAccrualExpectation(expectationId, tenantId, isCredit, amount, reference))
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await this.transaction(tx => tx.postAccrualExpectation(expectationId, tenantId, direction, amount, reference))
   }
 
   async exportListBatches(tenantId: string): Promise<readonly { readonly destination: string; readonly last_seq: number; readonly last_exported_at: number; readonly control_totals: string; readonly checksum: string }[]> {

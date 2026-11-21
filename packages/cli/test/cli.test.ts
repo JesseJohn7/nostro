@@ -118,11 +118,7 @@ describe('nostro migrate', () => {
       stdout: `Migrated ${file} from schema version 0 to ${SQLITE_MIGRATIONS.length}.\n`,
     })
     expect((await nostro(cwd, ['migrate'])).stdout).toBe(`${file} is up to date (schema version ${SQLITE_MIGRATIONS.length}).\n`)
-    expect(JSON.parse((await nostro(cwd, ['migrate', '--json'])).stdout)).toEqual({
-      database: file,
-      from: SQLITE_MIGRATIONS.length,
-      to: SQLITE_MIGRATIONS.length,
-    })
+    expect(JSON.parse((await nostro(cwd, ['migrate', '--json'])).stdout)).toEqual({ database: file, from: SQLITE_MIGRATIONS.length, to: SQLITE_MIGRATIONS.length })
   })
 
   it('takes the database from --db or NOSTRO_DB, with or without a sqlite: prefix', async () => {
@@ -202,15 +198,11 @@ describe('opening a database', () => {
     await new SqliteStore({ filename: file }).close()
     expect((await nostro(cwd, ['reconcile'])).stderr).toBe(`nostro: ${file} has not been set up. Run "nostro migrate" first.\n`)
     setVersion(file, 1)
-    expect((await nostro(cwd, ['reconcile'])).stderr).toContain(
-      `is at schema version 1; this nostro needs ${SQLITE_MIGRATIONS.length}. Run "nostro migrate".`,
-    )
+    expect((await nostro(cwd, ['reconcile'])).stderr).toContain(`is at schema version 1; this nostro needs ${SQLITE_MIGRATIONS.length}. Run "nostro migrate".`)
     setVersion(file, 99)
     const ahead = await nostro(cwd, ['reconcile'])
     expect(ahead.code).toBe(1)
-    expect(ahead.stderr).toContain(
-      `newer than this nostro understands (${SQLITE_MIGRATIONS.length}). Upgrade @nostro-labs/cli.`,
-    )
+    expect(ahead.stderr).toContain(`newer than this nostro understands (${SQLITE_MIGRATIONS.length}). Upgrade @nostro-labs/cli.`)
   })
 
   it('reports an unreachable PostgreSQL without printing its password', async () => {

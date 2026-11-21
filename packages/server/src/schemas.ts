@@ -221,6 +221,38 @@ export const replayBody = {
   },
 } as const
 
+export const manualJournalLine = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['account', 'role', 'side', 'amount'],
+  properties: {
+    account: { type: 'string', minLength: 1 },
+    role: { enum: [...LINE_ROLES] },
+    side: { enum: ['debit', 'credit'] },
+    amount: { type: 'string', pattern: AMOUNT, description: 'A decimal string, never a JSON number; never rounded.' },
+    asset: { type: 'string', minLength: 1, description: '`native` (the default) or `CODE:ISSUER`.' },
+  },
+} as const
+
+export const postJournalBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['description', 'reason', 'lines'],
+  properties: {
+    description: { type: 'string', minLength: 1 },
+    reason: { type: 'string', minLength: 1 },
+    note: { type: 'string' },
+    postedBy: { type: 'string' },
+    movementId: { type: 'string', minLength: 1 },
+    effectiveAt: { type: 'string', format: 'date-time' },
+    lines: {
+      type: 'array',
+      minItems: 2,
+      items: manualJournalLine,
+    },
+  },
+} as const
+
 // Responses.
 
 const ref = (name: string) => ({ $ref: `#/components/schemas/${name}` })
@@ -256,6 +288,7 @@ export const components = {
   CancelExpectationBody: cancelExpectationBody,
   AmendExpectationBody: amendExpectationBody,
   ReplayBody: replayBody,
+  PostJournalBody: postJournalBody,
   Memo: record({ type: { enum: ['text', 'id', 'hash', 'return'] }, value: str }),
   Movement: record({
     id: str,
@@ -386,11 +419,13 @@ export const components = {
     at: time,
   }),
   WebhookConsumerList: record({ data: { type: 'array', items: ref('ConsumerStatus') } }),
+  RefundLink: record({id:str,creditMovementId:str,refundMovementId:str,asset:str,amount:str,residualAmount:str,createdAt:{type:'string',format:'date-time'}}),
   MovementDetail: record({
     movement: ref('Movement'),
     allocations: { type: 'array', items: ref('Allocation') },
     exceptions: { type: 'array', items: ref('Exception') },
     journal: { type: 'array', items: ref('JournalEntry') },
+    refunds: { type: 'array', items: ref('RefundLink') },
   }),
   ExpectationDetail: record({
     expectation: ref('Expectation'),

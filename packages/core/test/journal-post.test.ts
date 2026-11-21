@@ -106,7 +106,7 @@ describe('reconcile posts the journal', () => {
     await reconcile({ store, tenantId: T })
     const before = (await store.listJournalEntries({ tenantId: T })).length
     expect((await reconcile({ store, tenantId: T })).journalEntries).toBe(0)
-    expect((await postJournal({ store, tenantId: T })).posted).toEqual({ initial: 0, reclass: 0, correction: 0 })
+    expect((await postJournal({ store, tenantId: T })).posted).toEqual({ initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0 })
     expect(await store.listJournalEntries({ tenantId: T })).toHaveLength(before)
   })
 

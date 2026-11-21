@@ -10,8 +10,8 @@
  */
 import type { Allocation, ExceptionRecord, JournalEntry, Movement } from '../model/index.js'
 import { planPosting } from '../journal/index.js'
-import type { ConstraintName } from '../store/index.js'
-import { ConstraintError, checkDisposition, checkJournalEntry, sumAmounts } from '../store/index.js'
+import type { RefundLink, ConstraintName } from '../store/index.js'
+import { refundCoverage, ConstraintError, checkDisposition, checkJournalEntry, sumAmounts } from '../store/index.js'
 import type { Finding, FindingCode, Invariant, Severity } from './types.js'
 
 /** A movement and everything recorded against it. Entries in posting order. */
@@ -20,6 +20,7 @@ export interface MovementRecords {
   readonly allocations: readonly Allocation[]
   readonly exceptions: readonly ExceptionRecord[]
   readonly entries: readonly JournalEntry[]
+  readonly refunds?: readonly RefundLink[]
 }
 
 const JOURNAL_CODES: Partial<Record<ConstraintName, FindingCode>> = {
@@ -29,7 +30,7 @@ const JOURNAL_CODES: Partial<Record<ConstraintName, FindingCode>> = {
   journal_cash_mismatch: 'journal_cash_mismatch',
 }
 
-export function checkMovement({ movement, allocations, exceptions, entries }: MovementRecords): Finding[] {
+export function checkMovement({ movement, allocations, exceptions, entries, refunds = [] }: MovementRecords): Finding[] {
   const findings: Finding[] = []
   const add = (invariant: Invariant, severity: Severity, code: FindingCode, detail: string, entryId: string | null = null) =>
     findings.push({
@@ -57,7 +58,7 @@ export function checkMovement({ movement, allocations, exceptions, entries }: Mo
     add('I1', 'error', 'allocation_over_movement', `allocations total ${allocated.toString()} of a ${movement.amount.toString()} movement`)
   }
   try {
-    checkDisposition(movement, allocations, exceptions, movement.disposition, movement.ignoredReason ?? undefined)
+    checkDisposition(movement, allocations, exceptions, movement.disposition, movement.ignoredReason ?? undefined,refundCoverage(movement,refunds))
   } catch (err) {
     if (!(err instanceof ConstraintError)) throw err
     const remedy =
@@ -84,7 +85,7 @@ export function checkMovement({ movement, allocations, exceptions, entries }: Mo
   }
   if (findings.length > 0) return findings
 
-  if (planPosting(movement, allocations, exceptions, entries) !== null) {
+  if (planPosting(movement, allocations, exceptions, entries, {refunds}) !== null) {
     add(
       'I3',
       'warning',

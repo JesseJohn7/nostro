@@ -9,7 +9,7 @@
 import { Readable } from 'node:stream'
 import Fastify from 'fastify'
 import type { FastifyError, FastifyInstance, FastifyServerOptions } from 'fastify'
-import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, Memo, NewExpectation, Store } from '@nostro-labs/nostro'
+import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, NewExpectation, Store } from '@nostro-labs/nostro'
 import {
   ConsumerPositionConflict,
   ConstraintError,
@@ -33,10 +33,12 @@ import {
   incomeStatement,
   journalCsvRows,
   journalEntryJson,
+  refundLinkJson,
   moveAccount,
   movementJson,
   outboxEventJson,
   parseAsset,
+  postManualEntry,
   resolutionJson,
   rewindConsumer,
   rewindJson,
@@ -45,7 +47,7 @@ import {
 import type { Authenticate } from './auth.js'
 import { buildOpenApi } from './openapi.js'
 import { HttpProblem } from './problem.js'
-import { UINT64, amendExpectationBody, cancelExpectationBody, consumerParams, expectationBody, idParams, query, replayBody, resolveBody } from './schemas.js'
+import { UINT64, amendExpectationBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, replayBody, resolveBody } from './schemas.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -76,6 +78,22 @@ function page<T extends { seq: number }, J>(rows: readonly T[], limit: number, j
 }
 
 const after = (q: Paging) => (q.after === undefined ? {} : { afterSeq: q.after })
+
+interface PostJournalBody {
+  description: string
+  reason: string
+  note?: string
+  postedBy?: string
+  movementId?: string
+  effectiveAt?: string
+  lines: {
+    account: string
+    role: LineRole
+    side: 'debit' | 'credit'
+    amount: string
+    asset?: string
+  }[]
+}
 
 interface ExpectationBody {
   reference: string
@@ -234,6 +252,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
         const movementId = movement.id
         return {
           movement: movementJson(movement),
+          refunds: (await store.listRefundLinks({tenantId,movementIds:[movementId]})).map(refundLinkJson),
           allocations: (await store.listAllocations({ tenantId, movementId })).map(allocationJson),
           exceptions: (await store.listExceptions({ tenantId, movementId })).map(exceptionJson),
           journal: (await store.listJournalEntries({ tenantId, movementId })).map(journalEntryJson),
@@ -450,6 +469,52 @@ export function createServer(options: ServerOptions): FastifyInstance {
         { schema: { querystring: query.journal } },
         async ({ tenantId, query: q }) =>
           page(await store.listJournalEntries({ tenantId, limit: q.limit, ...after(q), ...dates(q) }), q.limit, journalEntryJson),
+      )
+
+      v1.post<{ Body: PostJournalBody }>(
+        '/journal',
+        { schema: { body: postJournalBody }, preValidation: async (request) => onlyStrings(request.body, '') },
+        async ({ tenantId, body }, reply) => {
+          try {
+            const lines = body.lines.map((l) => {
+              const assetId = l.asset === undefined || l.asset === 'native' ? NATIVE : parseAsset(l.asset)
+              const amount = Money.parse(l.amount, assetId)
+              return {
+                account: l.account,
+                role: l.role,
+                side: l.side,
+                amount,
+              }
+            })
+            const entry = await postManualEntry({
+              store,
+              tenantId,
+              description: body.description,
+              reason: body.reason,
+              ...(body.note !== undefined ? { note: body.note } : {}),
+              ...(body.postedBy !== undefined ? { postedBy: body.postedBy } : {}),
+              ...(body.movementId !== undefined ? { movementId: body.movementId } : {}),
+              ...(body.effectiveAt !== undefined ? { effectiveAt: new Date(body.effectiveAt) } : {}),
+              lines,
+            })
+            reply.status(201)
+            return journalEntryJson(entry)
+          } catch (err) {
+            if (err instanceof ValidationError || err instanceof PrecisionError || err instanceof InvalidAssetError) {
+              throw new HttpProblem(422, 'invalid_request', err.message)
+            }
+            if (err instanceof ConstraintError) {
+              if (err.constraint === 'journal_cash_without_movement' || err.constraint === 'journal_unbalanced' || err.constraint === 'journal_manual_slot') {
+                throw new HttpProblem(422, 'invalid_request', err.message)
+              }
+              if (err.constraint === 'journal_posting_conflict' || err.constraint === 'journal_period_closed') {
+                throw new HttpProblem(409, 'resolution_refused', err.message)
+              }
+              throw new HttpProblem(409, 'resolution_refused', err.message)
+            }
+            throw err
+          }
+        },
       )
 
       v1.get<{ Querystring: { from?: string; to?: string } }>(

@@ -19,6 +19,7 @@ import type {
   Allocation,
   CursorKey,
   Disposition,
+  Direction,
   ExceptionRecord,
   Expectation,
   ExpectationChanges,
@@ -29,6 +30,9 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '../model/index.js'
 import {
   assertValidNewJournalEntry,
@@ -38,8 +42,10 @@ import {
   assertValidNewMovement,
 } from '../model/index.js'
 import type {
-  AllocationQuery,
+  RefundLink,
+  RefundQuery,
   ExportBatch,
+  AllocationQuery,
   ExceptionQuery,
   ExpectationQuery,
   InsertMovementsResult,
@@ -66,6 +72,9 @@ import {
   storedMemo,
   sameFacts,
 } from './rules.js'
+import { Money } from '../money/index.js'
+import { refundParts, refundCoverage } from './refunds.js'
+import { postAccrual } from './accrual.js'
 import { ConstraintError, NotFoundError, TransactionClosedError } from './store.js'
 import { EventHistoryPrunedError, eventCursorKey } from './events.js'
 import type { EventQuery, NewOutboxEvent, OutboxEvent, PruneEventsResult } from './events.js'
@@ -112,6 +121,8 @@ interface State {
   readonly rewinds: Map<string, Rewind>
   /** Movement id → its entry ids in posting order. Arrays are replaced, never pushed to. */
   readonly journalByMovement: Map<string, readonly string[]>
+  readonly refunds: Map<string, RefundLink>
+  readonly valuations: Map<string, MovementValuation>
   periodActions: readonly {
     readonly tenantId: string
     readonly action: 'close' | 'reopen'
@@ -144,6 +155,8 @@ function emptyState(): State {
     rewindSeq: 0,
     rewinds: new Map(),
     periodActions: [],
+    refunds: new Map(),
+    valuations: new Map(),
   }
 }
 
@@ -170,6 +183,8 @@ function cloneState(s: State): State {
     rewindSeq: s.rewindSeq,
     rewinds: new Map(s.rewinds),
     periodActions: [...s.periodActions],
+    refunds: new Map(s.refunds),
+    valuations: new Map(s.valuations),
   }
 }
 
@@ -202,6 +217,16 @@ abstract class MemoryReader implements StoreReader {
 
   protected check(): void {}
 
+  async listRefundLinks(q: RefundQuery): Promise<RefundLink[]> {
+    this.check()
+    return [...this.snapshot().refunds.values()].filter(link => link.tenantId === q.tenantId &&
+      (q.creditMovementId === undefined || link.creditMovementId === q.creditMovementId) &&
+      (q.refundMovementId === undefined || link.refundMovementId === q.refundMovementId) &&
+      (q.movementIds === undefined || q.movementIds.includes(link.creditMovementId) || q.movementIds.includes(link.refundMovementId)))
+  }
+
+  async accrualGetMode(_tenantId: string): Promise<boolean> { this.check(); return false }
+
   async getMovement(tenantId: string, id: string): Promise<Movement | null> {
     this.check()
     const m = this.snapshot().movements.get(id)
@@ -218,6 +243,7 @@ abstract class MemoryReader implements StoreReader {
       if (ids !== null && !ids.has(m.id)) continue
       if (q.disposition !== undefined && m.disposition !== q.disposition) continue
       if (q.account !== undefined && m.account !== q.account) continue
+      if (q.txHash !== undefined && m.txHash !== q.txHash) continue
       if (q.afterSeq !== undefined && m.seq <= q.afterSeq) continue
       out.push(m)
     }
@@ -427,6 +453,23 @@ abstract class MemoryReader implements StoreReader {
     }
     return null
   }
+
+  async getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null> {
+    this.check()
+    return this.snapshot().valuations.get(`${tenantId}:${movementId}`) ?? null
+  }
+
+  async listValuations(q: ValuationQuery): Promise<MovementValuation[]> {
+    this.check()
+    const out: MovementValuation[] = []
+    for (const v of this.snapshot().valuations.values()) {
+      if (v.tenantId !== q.tenantId) continue
+      if (q.movementId !== undefined && v.movementId !== q.movementId) continue
+      if (q.reportingAsset !== undefined && v.reportingAsset !== q.reportingAsset) continue
+      out.push(v)
+    }
+    return out
+  }
 }
 
 class MemoryTx extends MemoryReader implements StoreTx {
@@ -451,18 +494,6 @@ class MemoryTx extends MemoryReader implements StoreTx {
   protected override check(): void {
     if (!this.open) throw new TransactionClosedError()
   }
-
-  async accrualGetMode(_tenantId: string): Promise<boolean> {
-    return false
-  }
-
-  async postAccrualExpectation(
-    _expectationId: string,
-    _tenantId: string,
-    _isCredit: boolean,
-    _amount: string,
-    _reference: string,
-  ): Promise<void> {}
 
   async lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null> {
     this.check()
@@ -582,6 +613,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       [...this.draft.exceptions.values()].filter((e) => e.movementId === m.id),
       disposition,
       reason,
+      refundCoverage(m, await this.listRefundLinks({tenantId,movementIds:[m.id]})),
     )
     const next: Movement = Object.freeze({
       ...m,
@@ -766,6 +798,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       e,
       this.allocationsOf('movementId', m.id),
       this.allocationsOf('expectationId', e.id),
+      refundCoverage(m, await this.listRefundLinks({tenantId:n.tenantId,movementIds:[m.id]})),
     )
 
     const now = this.now()
@@ -873,6 +906,45 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.emit(exceptionChanged(next))
     return next
   }
+
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await postAccrual(this, expectationId, tenantId, direction, amount, reference)
+  }
+
+  async linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink> {
+    this.check()
+    const [existing] = await this.listRefundLinks({tenantId,refundMovementId})
+    if (existing) {
+      if (existing.creditMovementId !== creditMovementId) throw new ConstraintError('refund_invalid','refund already linked to another credit')
+      return existing
+    }
+    const parts = await refundParts(this,tenantId,creditMovementId,refundMovementId)
+    const link = Object.freeze({id:this.ids(),...parts,createdAt:this.now()})
+    this.draft.refunds.set(link.id,link)
+    return link
+  }
+
+  async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {
+    this.check()
+    const now = this.now()
+    for (const n of batch) {
+      this.movement(n.tenantId, n.movementId)
+      const k = `${n.tenantId}:${n.movementId}`
+      if (this.draft.valuations.has(k)) continue
+      const v: MovementValuation = Object.freeze({
+        movementId: n.movementId,
+        tenantId: n.tenantId,
+        reportingAsset: n.reportingAsset,
+        priceNumerator: n.priceNumerator,
+        priceDenominator: n.priceDenominator,
+        priceSource: n.priceSource,
+        priceTimestamp: copyDate(n.priceTimestamp),
+        value: n.value,
+        valuedAt: n.valuedAt ? copyDate(n.valuedAt) : now,
+      })
+      this.draft.valuations.set(k, v)
+    }
+  }
 }
 
 export class MemoryStore extends MemoryReader implements Store {
@@ -887,30 +959,23 @@ export class MemoryStore extends MemoryReader implements Store {
     this.now = options.now ?? (() => new Date())
   }
 
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+    await this.transaction(tx => tx.postAccrualExpectation(expectationId, tenantId, direction, amount, reference))
+  }
+
+  private readonly exportMarks = new Map<string, ExportBatch>()
+
   async exportGetMark(tenantId: string, destination: string): Promise<string | null> {
-    return null
+    const mark = this.exportMarks.get(key(tenantId, destination))
+    return mark ? String(mark.last_seq) : null
   }
 
   async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
-    // no-op for in-memory store
-  }
-
-  async accrualGetMode(tenantId: string): Promise<boolean> {
-    return false
-  }
-
-  async postAccrualExpectation(
-    expectationId: string,
-    tenantId: string,
-    isCredit: boolean,
-    amount: string,
-    reference: string,
-  ): Promise<void> {
-    // no journal in the in-memory store's export surface
+    this.exportMarks.set(key(tenantId, destination), { destination, last_seq: lastSeq, last_exported_at: this.now().getTime(), control_totals: '{}', checksum: '' })
   }
 
   async exportListBatches(tenantId: string): Promise<ExportBatch[]> {
-    return []
+    return [...this.exportMarks.entries()].filter(([k]) => JSON.parse(k)[0] === tenantId).map(([, v]) => ({ ...v }))
   }
 
   protected snapshot(): State {

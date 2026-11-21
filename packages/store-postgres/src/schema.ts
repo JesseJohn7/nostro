@@ -41,6 +41,7 @@ const LINE_ROLES = list([
   'conversion',
 ])
 const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
+const MANUAL_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual'])
 const EVENT_TYPES = list([
   'movement.decided',
   'expectation.partially_paid',
@@ -410,8 +411,56 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       RETURN NULL;
     END $$;
   `,
+  (s) => `
+    DO $do$
+    DECLARE c text;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '${s}.journal_entries'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%kind%'
+      LOOP
+        EXECUTE format('ALTER TABLE ${s}.journal_entries DROP CONSTRAINT %I', c);
+      END LOOP;
+    END $do$;
+    ALTER TABLE ${s}.journal_entries ADD CONSTRAINT journal_entries_kind_check CHECK (kind IN (${MANUAL_ENTRY_KINDS}));
 
-  // 11: webhook delivery observability and replay audit. A separate,
+    ALTER TABLE ${s}.journal_lines DROP CONSTRAINT journal_lines_role_check;
+    ALTER TABLE ${s}.journal_lines ADD CONSTRAINT journal_lines_role_check CHECK (role IN (${LINE_ROLES}, 'other'));
+
+    CREATE TABLE IF NOT EXISTS ${s}.movement_valuations (
+      tenant_id        text NOT NULL,
+      movement_id      text NOT NULL REFERENCES ${s}.movements (id),
+      reporting_asset  text NOT NULL,
+      price_n          numeric(40, 0) NOT NULL,
+      price_d          numeric(40, 0) NOT NULL,
+      price_source     text NOT NULL,
+      price_timestamp  timestamptz NOT NULL,
+      decimals         smallint NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      value            numeric(40, 0) NOT NULL,
+      valued_at        timestamptz NOT NULL,
+      PRIMARY KEY (tenant_id, movement_id)
+    );
+    CREATE INDEX IF NOT EXISTS movement_valuations_reporting ON ${s}.movement_valuations (tenant_id, reporting_asset);
+  `,
+  (s) => `
+    CREATE TABLE ${s}.refund_links (
+      seq bigint GENERATED ALWAYS AS IDENTITY, id text PRIMARY KEY, tenant_id text NOT NULL,
+      credit_movement_id text NOT NULL REFERENCES ${s}.movements(id), refund_movement_id text NOT NULL UNIQUE REFERENCES ${s}.movements(id),
+      asset text NOT NULL, decimals smallint NOT NULL CHECK(decimals BETWEEN 0 AND 38),
+      amount numeric(40,0) NOT NULL CHECK(amount>0), residual_amount numeric(40,0) NOT NULL CHECK(residual_amount>=0 AND residual_amount<=amount),
+      created_at timestamptz NOT NULL
+    );
+    CREATE INDEX refund_credit ON ${s}.refund_links(tenant_id,credit_movement_id,seq);
+    CREATE INDEX IF NOT EXISTS movements_transaction ON ${s}.movements(tenant_id,account,tx_hash);
+    CREATE TRIGGER refund_links_no_update BEFORE UPDATE OR DELETE ON ${s}.refund_links
+      FOR EACH ROW EXECUTE FUNCTION ${s}.journal_append_only();
+    CREATE TRIGGER refund_links_no_truncate BEFORE TRUNCATE ON ${s}.refund_links
+      FOR EACH STATEMENT EXECUTE FUNCTION ${s}.journal_append_only();
+    ALTER TABLE ${s}.journal_lines DROP CONSTRAINT journal_lines_role_check;
+    ALTER TABLE ${s}.journal_lines ADD CONSTRAINT journal_lines_role_check CHECK(role IN (${LINE_ROLES},'other','refund_clearing'));
+  `,
+
+  // 13: webhook delivery observability and replay audit. A separate,
   // prunable table; the append-only event trigger above is untouched.
   (s) => `
     CREATE TABLE IF NOT EXISTS ${s}.webhook_delivery_attempts (

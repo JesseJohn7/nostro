@@ -27,6 +27,7 @@ export type FindingCode =
   | 'journal_asset'
   | 'journal_cash_mismatch'
   | 'journal_stale'
+  | 'manual_entry_touches_cash'
 
 /**
  * `error`: the invariant does not hold. `warning`: it holds, but something

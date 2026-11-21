@@ -111,7 +111,7 @@ describe('nostro doctor', () => {
     expect((await nostro(cwd, ['post'])).stdout).toBe('The journal reflects every decision (3 movement(s) examined).\n')
     expect(JSON.parse((await nostro(cwd, ['post', '--json'])).stdout)).toEqual({
       examined: 3,
-      posted: { initial: 0, reclass: 0, correction: 0 },
+      posted: { initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0 },
       errors: [],
     })
     expect((await nostro(cwd, ['doctor'])).stdout).not.toContain('journal_stale')
@@ -269,5 +269,18 @@ describe('nostro chart move', () => {
     expect(await nostro(cwd, ['chart', 'nope'])).toMatchObject({ code: 2, stderr: expect.stringContaining('Use "move"') })
     expect(await nostro(cwd, ['chart', 'move', '--to', 'x'])).toMatchObject({ code: 2, stderr: expect.stringContaining('--from') })
     expect(await nostro(cwd, ['chart', 'move', '--from', 'x'])).toMatchObject({ code: 2, stderr: expect.stringContaining('--to') })
+  })
+})
+
+describe('manual journal CLI', () => {
+  it('parses account codes containing colons and records its audit reason', async () => {
+    const cwd = await migrated()
+    const run = await nostro(cwd, ['journal','post','--description','Opening adjustment','--reason','Verified statement',
+      '--line','assets:adjustments:other:debit:5', '--line','equity:opening:other:credit:5'])
+    expect(run.code).toBe(0)
+    const db = new Database(join(cwd,'nostro.db'))
+    expect(db.prepare('SELECT account FROM journal_lines ORDER BY line_no').all()).toEqual([{account:'assets:adjustments'},{account:'equity:opening'}])
+    expect((db.prepare('SELECT description FROM journal_entries').get() as {description:string}).description).toContain('Verified statement')
+    db.close()
   })
 })

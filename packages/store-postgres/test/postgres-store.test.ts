@@ -288,7 +288,7 @@ if (pool === undefined) {
         const { store, s, movement } = await withMovement()
         // Put the schema back to version 1, keeping its data.
         await pool.query(
-          `DROP TABLE ${s}.expectation_reference_index, ${s}.journal_period_actions, ${s}.journal_lines, ${s}.journal_entries, ${s}.events`,
+          `DROP TABLE ${s}.refund_links, ${s}.movement_valuations, ${s}.event_prune_state, ${s}.exports, ${s}.accrual_modes, ${s}.expectation_reference_index, ${s}.journal_period_actions, ${s}.journal_lines, ${s}.journal_entries, ${s}.events`,
         )
         await pool.query(
           `DROP FUNCTION ${s}.journal_entry_balanced, ${s}.journal_line_balanced, ${s}.journal_check_entry, ${s}.journal_append_only, ${s}.events_append_only, ${s}.journal_period_actions_append_only`,
@@ -312,7 +312,7 @@ if (pool === undefined) {
             memo: { type: 'text', value: 'REF-8' },
           }),
         )
-        await pool.query(`DROP TABLE ${s}.expectation_reference_index`)
+        await pool.query(`DROP TABLE ${s}.refund_links, ${s}.movement_valuations, ${s}.event_prune_state, ${s}.exports, ${s}.accrual_modes, ${s}.expectation_reference_index`)
         await pool.query(`DELETE FROM ${s}.migrations WHERE version >= 5`)
         await store.migrate()
         const ids = async (key: string) =>
