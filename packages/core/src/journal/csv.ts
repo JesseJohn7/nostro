@@ -28,6 +28,7 @@ export const JOURNAL_CSV_COLUMNS = [
   'expectation_reference',
   'exception_id',
   'exception_code',
+  'value',
 ] as const
 
 export interface JournalCsvOptions {
@@ -83,11 +84,16 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
   const txHash = new Map<string, string | null>()
   const reference = new Map<string, string | null>()
   const code = new Map<string, string | null>()
+  const valuations = new Map<string, string | null>()
 
   yield journalCsvRow(JOURNAL_CSV_COLUMNS.map((c) => c))
   for await (const entry of journalEntries(options)) {
     if (entry.movementId !== null && !txHash.has(entry.movementId)) {
       txHash.set(entry.movementId, (await store.getMovement(tenantId, entry.movementId))?.txHash ?? null)
+    }
+    if (entry.movementId !== null && !valuations.has(entry.movementId)) {
+      const v = await store.getValuation(tenantId, entry.movementId)
+      valuations.set(entry.movementId, v ? v.value.toString() : null)
     }
     for (const [i, line] of entry.lines.entries()) {
       if (line.expectationId !== null && !reference.has(line.expectationId)) {
@@ -97,6 +103,7 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
         code.set(line.exceptionId, (await store.getException(tenantId, line.exceptionId))?.code ?? null)
       }
       const amount = line.amount.toString()
+      const val = entry.movementId !== null ? (valuations.get(entry.movementId) ?? null) : null
       yield journalCsvRow([
         journalCsvCell(entry.id),
         journalCsvCell(entry.seq),
@@ -115,6 +122,7 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
         journalCsvCell(line.expectationId === null ? null : (reference.get(line.expectationId) ?? null), true),
         journalCsvCell(line.exceptionId),
         journalCsvCell(line.exceptionId === null ? null : (code.get(line.exceptionId) ?? null)),
+        journalCsvCell(val),
       ])
     }
   }

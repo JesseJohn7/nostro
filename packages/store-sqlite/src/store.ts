@@ -46,6 +46,10 @@ import type {
   SchemaVersion,
   StoreReader,
   StoreTx,
+  AssetId,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '@nostro-labs/nostro'
 import {
   ConstraintError,
@@ -412,6 +416,41 @@ class SqliteReader implements StoreReader {
       closedAt: new Date(row.created_at as number),
     })
   }
+
+  getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null> {
+    const row = this.one('SELECT * FROM movement_valuations WHERE tenant_id = ? AND movement_id = ?', [tenantId, movementId])
+    return Promise.resolve(row === undefined ? null : toValuation(row))
+  }
+
+  listValuations(q: ValuationQuery): Promise<MovementValuation[]> {
+    let sql = 'SELECT * FROM movement_valuations WHERE tenant_id = ?'
+    const params: Param[] = [q.tenantId]
+    if (q.movementId !== undefined) {
+      sql += ' AND movement_id = ?'
+      params.push(q.movementId)
+    }
+    if (q.reportingAsset !== undefined) {
+      sql += ' AND reporting_asset = ?'
+      params.push(q.reportingAsset)
+    }
+    sql += ' ORDER BY price_timestamp ASC'
+    const rows = this.all(sql, params)
+    return Promise.resolve(rows.map(toValuation))
+  }
+}
+
+function toValuation(row: Row): MovementValuation {
+  return Object.freeze({
+    movementId: row.movement_id as string,
+    tenantId: row.tenant_id as string,
+    reportingAsset: row.reporting_asset as AssetId,
+    priceNumerator: BigInt(row.price_n as string),
+    priceDenominator: BigInt(row.price_d as string),
+    priceSource: row.price_source as string,
+    priceTimestamp: new Date(row.price_timestamp as number),
+    value: Money.fromRaw(BigInt(row.value as string), row.reporting_asset as AssetId, row.decimals as number),
+    valuedAt: new Date(row.valued_at as number),
+  })
 }
 
 class SqliteTx extends SqliteReader implements StoreTx {
@@ -822,6 +861,30 @@ class SqliteTx extends SqliteReader implements StoreTx {
     )
     this.emit(exceptionChanged(next))
     return next
+  }
+
+  async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {
+    const now = this.now()
+    for (const n of batch) {
+      this.movement(n.tenantId, n.movementId)
+      this.exec(
+        `INSERT OR IGNORE INTO movement_valuations (
+           tenant_id, movement_id, reporting_asset, price_n, price_d, price_source, price_timestamp, decimals, value, valued_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          n.tenantId,
+          n.movementId,
+          n.reportingAsset,
+          n.priceNumerator.toString(),
+          n.priceDenominator.toString(),
+          n.priceSource,
+          n.priceTimestamp.getTime(),
+          n.value.decimals,
+          n.value.raw.toString(),
+          n.valuedAt ? n.valuedAt.getTime() : now.getTime(),
+        ],
+      )
+    }
   }
 }
 

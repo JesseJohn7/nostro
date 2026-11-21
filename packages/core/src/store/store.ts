@@ -29,6 +29,9 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '../model/index.js'
 import type { AssetId } from '../money/index.js'
 import type { EventQuery, OutboxEvent } from './events.js'
@@ -126,6 +129,8 @@ export interface StoreReader extends JournalReader {
   getCursor(key: CursorKey): Promise<string | null>
   /** The event log, in `seq` order. Events are written by the store itself; see `events.ts`. */
   listEvents(query: EventQuery): Promise<OutboxEvent[]>
+  getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null>
+  listValuations(query: ValuationQuery): Promise<MovementValuation[]>
 }
 
 /**
@@ -198,6 +203,7 @@ export interface StoreTx extends StoreReader, JournalTx {
   openException(exception: NewException): Promise<ExceptionRecord>
   /** Writes an `exception.resolved` or `exception.dismissed` event. */
   resolveException(tenantId: string, id: string, resolution: Resolution): Promise<ExceptionRecord>
+  insertValuations(batch: readonly NewMovementValuation[]): Promise<void>
 }
 
 export interface JournalQuery {
@@ -283,6 +289,7 @@ export type ConstraintName =
   | 'journal_asset'
   | 'journal_period_closed'
   | 'journal_period_not_closed'
+  | 'journal_cash_without_movement'
 
 export class StoreError extends Error {
   constructor(

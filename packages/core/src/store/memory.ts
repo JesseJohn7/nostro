@@ -29,6 +29,9 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  MovementValuation,
+  NewMovementValuation,
+  ValuationQuery,
 } from '../model/index.js'
 import {
   assertValidNewJournalEntry,
@@ -96,6 +99,7 @@ interface State {
   readonly events: Map<string, OutboxEvent>
   /** Movement id → its entry ids in posting order. Arrays are replaced, never pushed to. */
   readonly journalByMovement: Map<string, readonly string[]>
+  readonly valuations: Map<string, MovementValuation>
   periodActions: readonly {
     readonly tenantId: string
     readonly action: 'close' | 'reopen'
@@ -123,6 +127,7 @@ function emptyState(): State {
     eventSeq: 0,
     events: new Map(),
     periodActions: [],
+    valuations: new Map(),
   }
 }
 
@@ -144,6 +149,7 @@ function cloneState(s: State): State {
     eventSeq: s.eventSeq,
     events: new Map(s.events),
     periodActions: [...s.periodActions],
+    valuations: new Map(s.valuations),
   }
 }
 
@@ -322,6 +328,23 @@ abstract class MemoryReader implements StoreReader {
         : null
     }
     return null
+  }
+
+  async getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null> {
+    this.check()
+    return this.snapshot().valuations.get(`${tenantId}:${movementId}`) ?? null
+  }
+
+  async listValuations(q: ValuationQuery): Promise<MovementValuation[]> {
+    this.check()
+    const out: MovementValuation[] = []
+    for (const v of this.snapshot().valuations.values()) {
+      if (v.tenantId !== q.tenantId) continue
+      if (q.movementId !== undefined && v.movementId !== q.movementId) continue
+      if (q.reportingAsset !== undefined && v.reportingAsset !== q.reportingAsset) continue
+      out.push(v)
+    }
+    return out
   }
 }
 
@@ -693,6 +716,28 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.draft.exceptions.set(id, next)
     this.emit(exceptionChanged(next))
     return next
+  }
+
+  async insertValuations(batch: readonly NewMovementValuation[]): Promise<void> {
+    this.check()
+    const now = this.now()
+    for (const n of batch) {
+      this.movement(n.tenantId, n.movementId)
+      const k = `${n.tenantId}:${n.movementId}`
+      if (this.draft.valuations.has(k)) continue
+      const v: MovementValuation = Object.freeze({
+        movementId: n.movementId,
+        tenantId: n.tenantId,
+        reportingAsset: n.reportingAsset,
+        priceNumerator: n.priceNumerator,
+        priceDenominator: n.priceDenominator,
+        priceSource: n.priceSource,
+        priceTimestamp: copyDate(n.priceTimestamp),
+        value: n.value,
+        valuedAt: n.valuedAt ? copyDate(n.valuedAt) : now,
+      })
+      this.draft.valuations.set(k, v)
+    }
   }
 }
 

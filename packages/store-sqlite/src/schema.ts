@@ -28,7 +28,7 @@ const LINE_ROLES = list([
   'uncategorized_income',
   'uncategorized_expense',
 ])
-const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
+const ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'manual'])
 const EVENT_TYPES = [
   'movement.decided',
   'expectation.partially_paid',
@@ -360,5 +360,46 @@ export const MIGRATIONS: readonly string[] = [
         WHERE tenant_id = NEW.tenant_id AND account = NEW.account AND muxed_id = NEW.muxed_id AND id <> NEW.id
       )
       BEGIN SELECT RAISE(ABORT, 'muxed id already used on account'); END;
+  `,
+  // 8: manual journal entry kind, and movement valuations
+  `
+    PRAGMA foreign_keys = OFF;
+    DROP TABLE IF EXISTS journal_entries_new;
+    CREATE TABLE journal_entries_new (
+      seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+      id           TEXT NOT NULL UNIQUE,
+      tenant_id    TEXT NOT NULL,
+      movement_id  TEXT REFERENCES movements (id),
+      posting_no   INTEGER CHECK (posting_no >= 1),
+      kind         TEXT NOT NULL CHECK (kind IN (${ENTRY_KINDS})),
+      effective_at INTEGER NOT NULL,
+      posted_at    INTEGER NOT NULL,
+      description  TEXT NOT NULL,
+      CHECK ((movement_id IS NULL) = (posting_no IS NULL)),
+      UNIQUE (movement_id, posting_no)
+    );
+    INSERT INTO journal_entries_new (seq, id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+      SELECT seq, id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description FROM journal_entries;
+    DROP TABLE journal_entries;
+    ALTER TABLE journal_entries_new RENAME TO journal_entries;
+    CREATE INDEX journal_entries_effective ON journal_entries (tenant_id, effective_at);
+    CREATE INDEX journal_entries_movement ON journal_entries (tenant_id, movement_id, seq);
+    ${appendOnly('journal_entries')}
+    PRAGMA foreign_keys = ON;
+
+    CREATE TABLE IF NOT EXISTS movement_valuations (
+      tenant_id        TEXT NOT NULL,
+      movement_id      TEXT NOT NULL REFERENCES movements (id),
+      reporting_asset  TEXT NOT NULL,
+      price_n          TEXT NOT NULL,
+      price_d          TEXT NOT NULL,
+      price_source     TEXT NOT NULL,
+      price_timestamp  INTEGER NOT NULL,
+      decimals         INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      value            TEXT NOT NULL,
+      valued_at        INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, movement_id)
+    );
+    CREATE INDEX IF NOT EXISTS movement_valuations_reporting ON movement_valuations (tenant_id, reporting_asset);
   `,
 ]

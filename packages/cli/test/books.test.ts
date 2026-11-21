@@ -111,7 +111,7 @@ describe('nostro doctor', () => {
     expect((await nostro(cwd, ['post'])).stdout).toBe('The journal reflects every decision (3 movement(s) examined).\n')
     expect(JSON.parse((await nostro(cwd, ['post', '--json'])).stdout)).toEqual({
       examined: 3,
-      posted: { initial: 0, reclass: 0, correction: 0 },
+      posted: { initial: 0, reclass: 0, correction: 0, manual: 0 },
       errors: [],
     })
     expect((await nostro(cwd, ['doctor'])).stdout).not.toContain('journal_stale')

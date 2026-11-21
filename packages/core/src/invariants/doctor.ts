@@ -120,6 +120,22 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
     const page = await store.listJournalEntries({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
     for (const entry of page) {
       entries += 1
+      if (entry.movementId === null || entry.kind === 'manual') {
+        for (const line of entry.lines) {
+          if (line.role === 'cash' || line.role === 'issued') {
+            findings.push({
+              invariant: 'I2',
+              severity: 'error',
+              code: 'manual_entry_touches_cash',
+              detail: `entry ${entry.id} is a manual entry but touches ${line.role}`,
+              movementId: entry.movementId,
+              entryId: entry.id,
+              account: line.account,
+              asset: line.amount.asset,
+            })
+          }
+        }
+      }
       const unbalanced = tally(entry, sums)
       if (unbalanced.length > 0 && !reported.has(`journal_unbalanced ${entry.id}`)) {
         findings.push({

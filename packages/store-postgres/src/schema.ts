@@ -39,7 +39,7 @@ const LINE_ROLES = list([
   'uncategorized_income',
   'uncategorized_expense',
 ])
-const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
+const ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'manual'])
 const EVENT_TYPES = list([
   'movement.decided',
   'expectation.partially_paid',
@@ -365,5 +365,34 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
     DROP TRIGGER IF EXISTS expectations_muxed_id_update_unique ON ${s}.expectations;
     CREATE TRIGGER expectations_muxed_id_update_unique BEFORE UPDATE ON ${s}.expectations
       FOR EACH ROW EXECUTE FUNCTION ${s}.expectations_muxed_id_unique();
+  `,
+
+  (s) => `
+    DO $do$
+    DECLARE c text;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '${s}.journal_entries'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%kind%'
+      LOOP
+        EXECUTE format('ALTER TABLE ${s}.journal_entries DROP CONSTRAINT %I', c);
+      END LOOP;
+    END $do$;
+    ALTER TABLE ${s}.journal_entries ADD CONSTRAINT journal_entries_kind_check CHECK (kind IN (${ENTRY_KINDS}));
+
+    CREATE TABLE IF NOT EXISTS ${s}.movement_valuations (
+      tenant_id        text NOT NULL,
+      movement_id      text NOT NULL REFERENCES ${s}.movements (id),
+      reporting_asset  text NOT NULL,
+      price_n          numeric(40, 0) NOT NULL,
+      price_d          numeric(40, 0) NOT NULL,
+      price_source     text NOT NULL,
+      price_timestamp  timestamptz NOT NULL,
+      decimals         smallint NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      value            numeric(40, 0) NOT NULL,
+      valued_at        timestamptz NOT NULL,
+      PRIMARY KEY (tenant_id, movement_id)
+    );
+    CREATE INDEX IF NOT EXISTS movement_valuations_reporting ON ${s}.movement_valuations (tenant_id, reporting_asset);
   `,
 ]

@@ -3,7 +3,7 @@
  * server validates requests with. Served at `GET /v1/openapi.json`.
  */
 import { readFileSync } from 'node:fs'
-import { components, expectationBody, query, ref, resolveBody } from './schemas.js'
+import { components, expectationBody, postJournalBody, query, ref, resolveBody } from './schemas.js'
 
 /** This package's version, which is the API's. */
 const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version
@@ -181,6 +181,17 @@ export function buildOpenApi() {
           summary: 'Journal entries, in posting order',
           parameters: parameters(query.journal),
           responses: { '200': ok('JournalEntryPage'), ...errors },
+        },
+        post: {
+          operationId: 'postManualJournalEntry',
+          summary: 'Post a manual journal entry',
+          requestBody: { required: true, content: { 'application/json': { schema: postJournalBody } } },
+          responses: {
+            '201': ok('JournalEntry', 'Posted'),
+            '409': problem('The rules refuse it: period closed or posting conflict (`resolution_refused`).'),
+            '422': problem('The entry is not valid: unbalanced, touches cash without movement, or invalid asset/amount (`invalid_request`).'),
+            ...errors,
+          },
         },
       },
       '/v1/journal.csv': {

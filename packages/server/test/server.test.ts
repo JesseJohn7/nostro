@@ -9,6 +9,7 @@ import { apiKeys, createServer } from '../src/index.js'
 
 const A = `G${'A'.repeat(55)}`
 const B = `G${'B'.repeat(55)}`
+const CASH = `assets:stellar:testnet:${A}`
 const ISSUER = 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN'
 const ACME_KEY = 'a'.repeat(64)
 const OTHER_KEY = 'b'.repeat(64)
@@ -665,5 +666,83 @@ describe('reports and account moves', () => {
     expect(cash.statusCode).toBe(422)
     expect(cash.json()).toMatchObject({ code: 'invalid_request' })
     expect((await move({ from: 1, to: 'x' })).statusCode).toBe(400)
+  })
+})
+
+describe('manual journal entries (issue #61)', () => {
+  it('posts a manual journal entry, returns 201, and reads back via GET /v1/journal', async () => {
+    const app = server(await seeded())
+    const post = (payload: unknown) => app.inject({ method: 'POST', url: '/v1/journal', headers: auth(), payload: payload as object })
+
+    const res = await post({
+      description: 'Write off old suspense',
+      reason: 'Unrecoverable after 2 years',
+      postedBy: 'alice@example.com',
+      lines: [
+        { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: '10' },
+        { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: '10' },
+      ],
+    })
+    expect(res.statusCode).toBe(201)
+    const json = res.json()
+    expect(json).toMatchObject({
+      kind: 'manual',
+      movementId: null,
+      postingNo: null,
+      description: 'Write off old suspense (Reason: Unrecoverable after 2 years) [by alice@example.com]',
+    })
+    expect(json.lines).toHaveLength(2)
+
+    // Reads back via GET /v1/journal
+    const listRes = await app.inject({ url: '/v1/journal', headers: auth() })
+    expect(listRes.statusCode).toBe(200)
+    const list = listRes.json()
+    expect(list.data.some((e: { kind: string; id: string }) => e.id === json.id && e.kind === 'manual')).toBe(true)
+  })
+
+  it('refuses a manual entry touching cash or issued', async () => {
+    const app = server(await seeded())
+    const post = (payload: unknown) => app.inject({ method: 'POST', url: '/v1/journal', headers: auth(), payload: payload as object })
+
+    const res = await post({
+      description: 'Invalid cash touch',
+      reason: 'Should be refused',
+      lines: [
+        { account: CASH, role: 'cash', side: 'debit', amount: '10' },
+        { account: 'liabilities:unapplied', role: 'unapplied', side: 'credit', amount: '10' },
+      ],
+    })
+    expect(res.statusCode).toBe(422)
+    expect(res.json()).toMatchObject({ code: 'invalid_request' })
+  })
+
+  it('refuses an unbalanced manual entry', async () => {
+    const app = server(await seeded())
+    const post = (payload: unknown) => app.inject({ method: 'POST', url: '/v1/journal', headers: auth(), payload: payload as object })
+
+    const res = await post({
+      description: 'Unbalanced',
+      reason: 'Testing balance check',
+      lines: [
+        { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: '10' },
+        { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: '5' },
+      ],
+    })
+    expect(res.statusCode).toBe(422)
+    expect(res.json()).toMatchObject({ code: 'invalid_request' })
+  })
+
+  it('refuses a request missing required fields like reason or lines', async () => {
+    const app = server(await seeded())
+    const post = (payload: unknown) => app.inject({ method: 'POST', url: '/v1/journal', headers: auth(), payload: payload as object })
+
+    const noReason = await post({
+      description: 'Missing reason',
+      lines: [
+        { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: '10' },
+        { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: '10' },
+      ],
+    })
+    expect(noReason.statusCode).toBe(400)
   })
 })
