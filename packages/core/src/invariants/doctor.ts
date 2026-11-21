@@ -92,13 +92,47 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
 
   for (let afterSeq: number | undefined; ; ) {
     const page = await store.listMovements({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
+    const movementIds = page.map((movement) => movement.id)
+    const [pageAllocations, pageExceptions, pageEntries] = await Promise.all([
+      store.listAllocations({ tenantId, movementIds }),
+      store.listExceptions({ tenantId, movementIds }),
+      store.listJournalEntries({ tenantId, movementIds }),
+    ])
+    const allocationsByMovement = new Map<string, typeof pageAllocations>()
+    const exceptionsByMovement = new Map<string, typeof pageExceptions>()
+    const entriesByMovement = new Map<string, typeof pageEntries>()
+    for (const allocation of pageAllocations) {
+      allocationsByMovement.set(allocation.movementId, [
+        ...(allocationsByMovement.get(allocation.movementId) ?? []),
+        allocation,
+      ])
+    }
+    for (const exception of pageExceptions) {
+      if (exception.movementId === null) continue
+      exceptionsByMovement.set(exception.movementId, [
+        ...(exceptionsByMovement.get(exception.movementId) ?? []),
+        exception,
+      ])
+    }
+    for (const entry of pageEntries) {
+      if (entry.movementId === null) continue
+      entriesByMovement.set(entry.movementId, [
+        ...(entriesByMovement.get(entry.movementId) ?? []),
+        entry,
+      ])
+    }
     for (const m of page) {
       total += 1
       byDisposition[m.disposition] += 1
       if (m.disposition === 'pending' && (oldestPending === null || m.occurredAt < oldestPending)) {
         oldestPending = m.occurredAt
       }
-      let found = checkMovement(await recordsOf(store, tenantId, m))
+      let found = checkMovement({
+        movement: m,
+        allocations: allocationsByMovement.get(m.id) ?? [],
+        exceptions: exceptionsByMovement.get(m.id) ?? [],
+        entries: entriesByMovement.get(m.id) ?? [],
+      })
       if (found.length > 0) {
         found = await store.transaction(async (tx) => {
           const locked = await tx.getMovement(tenantId, m.id)

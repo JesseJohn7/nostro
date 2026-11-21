@@ -527,7 +527,7 @@ describe('postManualEntry', () => {
       tenantId: T,
       description: 'Write off old suspense',
       lines: [
-        { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: usdc('10') },
+        { account: 'assets:suspense', role: 'other', side: 'credit', amount: usdc('10') },
         { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: usdc('10') },
       ],
       reason: 'Balance confirmed unrecoverable after 2 years',
@@ -564,7 +564,7 @@ describe('postManualEntry', () => {
         tenantId: T,
         description: 'Entry without reason',
         lines: [
-          { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: usdc('5') },
+          { account: 'assets:suspense', role: 'other', side: 'credit', amount: usdc('5') },
           { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: usdc('5') },
         ],
       }),
@@ -579,7 +579,7 @@ describe('postManualEntry', () => {
         tenantId: T,
         description: '',
         lines: [
-          { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: usdc('5') },
+          { account: 'assets:suspense', role: 'other', side: 'credit', amount: usdc('5') },
           { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: usdc('5') },
         ],
         reason: 'Some reason',
@@ -595,7 +595,7 @@ describe('postManualEntry', () => {
         tenantId: T,
         description: 'Unbalanced',
         lines: [
-          { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: usdc('10') },
+          { account: 'assets:suspense', role: 'other', side: 'credit', amount: usdc('10') },
           { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: usdc('5') },
         ],
         reason: 'Testing unbalanced',
@@ -610,7 +610,7 @@ describe('postManualEntry', () => {
       tenantId: T,
       description: 'Reclassify rent',
       lines: [
-        { account: 'assets:suspense', role: 'unexplained', side: 'debit', amount: usdc('500') },
+        { account: 'assets:suspense', role: 'other', side: 'debit', amount: usdc('500') },
         { account: 'expenses:rent', role: 'uncategorized_expense', side: 'credit', amount: usdc('500') },
       ],
       reason: 'Identified as rent',

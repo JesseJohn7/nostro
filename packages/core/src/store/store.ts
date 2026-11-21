@@ -33,11 +33,14 @@ import type {
   NewMovementValuation,
   ValuationQuery,
 } from '../model/index.js'
+import type { Money } from '../money/index.js'
 import type { AssetId } from '../money/index.js'
-import type { EventQuery, OutboxEvent } from './events.js'
+import type { EventQuery, OutboxEvent, PruneEventsResult } from './events.js'
 
 export interface MovementQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no movements. */
+  readonly ids?: readonly string[]
   readonly disposition?: Disposition
   readonly account?: string
   /** Return movements with `seq` greater than this; for paging in ingest order. */
@@ -47,6 +50,8 @@ export interface MovementQuery {
 
 export interface ExpectationQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no expectations. */
+  readonly ids?: readonly string[]
   readonly account?: string
   readonly asset?: AssetId
   readonly direction?: Direction
@@ -60,15 +65,21 @@ export interface ExpectationQuery {
 export interface AllocationQuery {
   readonly tenantId: string
   readonly movementId?: string
+  readonly movementIds?: readonly string[]
   readonly expectationId?: string
+  readonly expectationIds?: readonly string[]
 }
 
 export interface ExceptionQuery {
   readonly tenantId: string
+  /** Restrict to these ids; an empty list matches no exceptions. */
+  readonly ids?: readonly string[]
   readonly status?: ExceptionStatus
   readonly code?: ExceptionCode
   readonly movementId?: string
+  readonly movementIds?: readonly string[]
   readonly expectationId?: string
+  readonly expectationIds?: readonly string[]
   /** Return exceptions with `seq` greater than this; for paging in opening order. */
   readonly afterSeq?: number
   readonly limit?: number
@@ -109,6 +120,7 @@ export interface JournalPeriod {
 
 /** Read access. Every lookup is scoped by tenant; ids from another tenant read as absent. */
 export interface StoreReader extends JournalReader {
+  accrualGetMode(tenantId: string): Promise<boolean>
   getMovement(tenantId: string, id: string): Promise<Movement | null>
   listMovements(query: MovementQuery): Promise<Movement[]>
   getExpectation(tenantId: string, id: string): Promise<Expectation | null>
@@ -131,6 +143,8 @@ export interface StoreReader extends JournalReader {
   listEvents(query: EventQuery): Promise<OutboxEvent[]>
   getValuation(tenantId: string, movementId: string): Promise<MovementValuation | null>
   listValuations(query: ValuationQuery): Promise<MovementValuation[]>
+  /** Highest event sequence intentionally removed for this tenant, or zero. */
+  getEventsPrunedThrough(tenantId: string): Promise<number>
 }
 
 /**
@@ -145,6 +159,7 @@ export interface StoreReader extends JournalReader {
  * default isolation level.
  */
 export interface StoreTx extends StoreReader, JournalTx {
+  postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
   /** Lock the tenant's close state until this transaction ends, then return it. */
   lockJournalPeriod(tenantId: string): Promise<JournalPeriod | null>
   /** Append a close action. The implementation acquires the tenant period lock. */
@@ -175,6 +190,9 @@ export interface StoreTx extends StoreReader, JournalTx {
   ): Promise<Movement>
 
   setCursor(key: CursorKey, value: string): Promise<void>
+
+  /** Prune an eligible old prefix and record its high-water mark atomically. */
+  pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult>
 
   /** Fails with `expectation_reference_unique` if the reference is taken in this tenant. */
   insertExpectation(expectation: NewExpectation): Promise<Expectation>
@@ -209,6 +227,8 @@ export interface StoreTx extends StoreReader, JournalTx {
 export interface JournalQuery {
   readonly tenantId: string
   readonly movementId?: string
+  /** Restrict to entries attached to any of these movements. */
+  readonly movementIds?: readonly string[]
   /** Filter lines to this account code (matches any entry that has at least one line on this account). */
   readonly account?: string
   /** Entries with `seq` greater than this, for paging in posting order. */
@@ -241,10 +261,24 @@ export interface Store extends StoreReader {
   /**
    * Run `fn` in a transaction. Commits if it resolves, rolls back everything
    * it wrote if it throws, and rethrows. The `tx` handle is dead once `fn`
-   * settles. Do not nest transactions.
+   * settles. Do not nest transactions. A SQL store may rerun `fn` after a
+   * deadlock, so callbacks must not perform irreversible external effects.
    */
   transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>
   close(): Promise<void>
+  exportListBatches(tenantId: string): Promise<readonly ExportBatch[]>
+  exportGetMark(tenantId: string, destination: string): Promise<string | null>
+  exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void>
+  accrualGetMode(tenantId: string): Promise<boolean>
+  postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
+}
+
+export interface ExportBatch {
+  readonly destination: string
+  readonly last_seq: number
+  readonly last_exported_at: number
+  control_totals: string
+  checksum: string
 }
 
 /** Where a database's schema is, against where this store would take it. */
@@ -283,6 +317,7 @@ export type ConstraintName =
   | 'disposition_unsupported'
   | 'movement_not_open'
   | 'exception_not_open'
+  | 'journal_manual_slot'
   | 'journal_unbalanced'
   | 'journal_posting_conflict'
   | 'journal_cash_mismatch'

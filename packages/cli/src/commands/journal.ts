@@ -4,8 +4,8 @@
  * Supported subcommands:
  *   post   Post a manual journal entry that cannot touch cash (issue #61)
  */
-import { Money, NATIVE, parseAsset, postManualEntry } from '@nostro-labs/nostro'
-import type { NewJournalLine, Side } from '@nostro-labs/nostro'
+import { LINE_ROLES, Money, NATIVE, parseAsset, postManualEntry } from '@nostro-labs/nostro'
+import type { NewJournalLine, Side, LineRole } from '@nostro-labs/nostro'
 import { COMMON, UsageError, date, flag, positionals, string, strings, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
@@ -13,15 +13,16 @@ import { json, write } from '../io.js'
 
 function parseLine(spec: string): NewJournalLine {
   // Format: account:role:side:amount[:asset]
-  const parts = spec.split(':')
-  if (parts.length < 4) {
+  const match = /^(.*):([a-z_]+):(debit|credit):([^:]+)(?::(.*))?$/.exec(spec)
+  if (!match) {
     throw new UsageError(`Invalid --line format "${spec}". Expected account:role:side:amount[:asset]`)
   }
-  const account = parts[0]!
-  const role = parts[1]! as any
-  const side = parts[2]! as Side
-  const amountStr = parts[3]!
-  const assetStr = parts.slice(4).join(':') || 'native'
+  const account = match[1]!
+  const role = match[2]! as LineRole
+  if (!LINE_ROLES.includes(role)) throw new UsageError(`Unknown journal role ${role}`)
+  const side = match[3]! as Side
+  const amountStr = match[4]!
+  const assetStr = match[5] || 'native'
   const asset = assetStr === 'native' || assetStr.toUpperCase() === 'XLM' ? NATIVE : parseAsset(assetStr)
   const amount = Money.parse(amountStr, asset)
 
@@ -42,7 +43,6 @@ Options:
   --reason <why>         Why this entry is posted (required)
   --note <text>          Additional audit note
   --posted-by <name>     Author or operator posting this entry
-  --movement <id>        Link entry to a movement
   --effective-at <date>  Effective accounting date (default: now)
   --line <spec>          account:role:side:amount[:asset] (repeat for each line)
   --lines-json <json>    Lines as a JSON array

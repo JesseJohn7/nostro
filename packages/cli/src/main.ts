@@ -17,6 +17,7 @@ import { exportJournal } from './commands/export.js'
 import { journalCommand } from './commands/journal.js'
 import { migrate } from './commands/migrate.js'
 import { post } from './commands/post.js'
+import { pruneEventsCommand } from './commands/prune-events.js'
 import { period } from './commands/period.js'
 import { reconcile } from './commands/reconcile.js'
 import { report } from './commands/report.js'
@@ -43,6 +44,7 @@ export const COMMANDS: readonly Command[] = [
   doctor,
   exportJournal,
   journalCommand,
+  pruneEventsCommand,
   serve,
 ]
 

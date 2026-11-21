@@ -76,7 +76,7 @@ for await (const line of journalBeancountRows({ store, tenantId: 'acme', commodi
 
 One row per journal line, RFC 4180 with CRLF line endings. Columns: `entry_id`, `seq`, `kind`,
 `posted_at`, `effective_at`, `description`, `line_no`, `account`, `role`, `asset`, `debit`, `credit`,
-`movement_id`, `tx_hash`, `expectation_reference`, `exception_id`, `exception_code`.
+`movement_id`, `tx_hash`, `expectation_reference`, `exception_id`, `exception_code`, `value`.
 
 - Amounts are exact decimal strings, never floats, even beyond 64 bits.
 - `from` / `to` select by effective date: `from` inclusive, `to` exclusive.
@@ -321,14 +321,14 @@ Lists income and expense accounts for the period and computes a net result per a
 
 Some journal entries have no on-chain movement behind them: writing off unrecoverable suspense, reclassifying rent or expenses, or correcting balances.
 
-`postManualEntry({ store, tenantId, description, reason, lines, note?, postedBy?, movementId?, effectiveAt? })` creates an entry with `kind: 'manual'`.
+`postManualEntry({ store, tenantId, description, reason, lines, note?, postedBy?, effectiveAt? })` creates an entry with `kind: 'manual'`.
 Reversing a manual entry is performed via `reverseManualEntry({ store, tenantId, entryId, reason, postedBy? })`, which posts equal and opposite lines.
 
 **Rules:**
 - Manual entries **cannot** touch `cash` or `issued` roles. Cash lines only change when money moves on the chain.
 - Entries must balance per asset (I3).
 - A non-empty `reason` is required.
-- If `movementId` is provided, `postingNo` is sequenced atomically, detecting concurrent races with reclassifications.
+- Manual entries cannot name a movement or use `unapplied`, `customer_credit`, or `unexplained`. Use the `other` role for independent adjustments. Use `applyMovement` or `ignoreMovement` for movement balances; they serialize with reconciliation.
 
 **CLI:** `nostro journal post --description "..." --reason "..." --line "<account>:<role>:<side>:<amount>[:<asset>]"`
 **HTTP:** `POST /v1/journal`
@@ -344,9 +344,10 @@ const priceSource = new HorizonPriceSource({ url: 'https://horizon.stellar.org' 
 await valueMovements({ store, tenantId: 'acme', priceSource, reportingAsset: USDC })
 ```
 
-- **Price sources:** `PriceSource` interface provides `price(base, quote, timestamp)`. `HorizonPriceSource` fetches 15-minute trade aggregations from Horizon. `MapPriceSource` uses an in-memory price map.
+- **Price sources:** `PriceSource` interface provides `price(base, quote, timestamp)`. `HorizonPriceSource` fetches one-hour trade aggregations from Horizon. `MapPriceSource` uses an in-memory price map.
 - **Integer arithmetic:** Fractional prices `PriceFraction` (`{ n: bigint, d: bigint }`) and round-half-up integer arithmetic prevent float drift.
 - **CSV export:** `journalCsv` includes a `value` column populated from recorded valuations.
+- Only the segment containing the movement is eligible; empty segments and contract tokens remain unvalued. A classic asset used as the reporting currency is explicit: USDC is never silently treated as USD.
 - Movements without a price are skipped (not guessed).
 
 ## Cost basis and realised gains
@@ -360,6 +361,8 @@ const report = await costBasis({ store, tenantId: 'acme', asset: NATIVE, method:
 ```
 
 - **Methods:** Supports FIFO (first-in, first-out) and LIFO (last-in, first-out).
+- Unknown acquisition costs remain listed in `unvaluedCredits`; affected disposals expose `missingCostAmount` and have no calculated gain. Lots are isolated by wallet. Internal transfers are currently reported as separate credit/debit legs, so select and reconcile transfers explicitly before using gains reports.
+- The chosen FIFO/LIFO method must be kept consistent by the caller; method policy is not persisted per tenant. Mixed reporting currencies are rejected.
 - **Proportional cost splitting:** Disposing of part of a lot divides cost with round-half-up integer arithmetic, preserving conservation of total cost without rounding residue.
 - **Notice:** This is internal bookkeeping and ledger reconciliation, **not tax advice**. Consult a qualified professional for statutory tax reporting.
 

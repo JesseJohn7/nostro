@@ -679,7 +679,7 @@ describe('manual journal entries (issue #61)', () => {
       reason: 'Unrecoverable after 2 years',
       postedBy: 'alice@example.com',
       lines: [
-        { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: '10' },
+        { account: 'assets:suspense', role: 'other', side: 'credit', amount: '10' },
         { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: '10' },
       ],
     })
@@ -724,7 +724,7 @@ describe('manual journal entries (issue #61)', () => {
       description: 'Unbalanced',
       reason: 'Testing balance check',
       lines: [
-        { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: '10' },
+        { account: 'assets:suspense', role: 'other', side: 'credit', amount: '10' },
         { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: '5' },
       ],
     })
@@ -739,7 +739,7 @@ describe('manual journal entries (issue #61)', () => {
     const noReason = await post({
       description: 'Missing reason',
       lines: [
-        { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: '10' },
+        { account: 'assets:suspense', role: 'other', side: 'credit', amount: '10' },
         { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: '10' },
       ],
     })

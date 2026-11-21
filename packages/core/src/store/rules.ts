@@ -359,6 +359,14 @@ export function checkJournalEntry(
       }
     }
   }
+  if (entry.kind === 'manual' || movement === null) {
+    if (entry.kind === 'manual' && movement !== null) {
+      throw new ConstraintError('journal_manual_slot', 'manual entries cannot name a movement; use the movement resolution API')
+    }
+    if (entry.lines.some(line => ['unapplied', 'customer_credit', 'unexplained'].includes(line.role))) {
+      throw new ConstraintError('journal_manual_slot', 'movement balance roles require a movement; use other for independent adjustments')
+    }
+  }
   if (movement === null) return
 
   const expected = existing.length + 1

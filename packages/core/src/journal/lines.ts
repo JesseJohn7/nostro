@@ -52,9 +52,11 @@ export function desiredLines(
   exceptions: readonly ExceptionRecord[],
 ): DesiredLine[] | null {
   if (movement.disposition === 'pending') return null
+
   const credit = movement.direction === 'credit'
   const own: Side = credit ? 'debit' : 'credit'
   const other: Side = credit ? 'credit' : 'debit'
+
   const latest = exceptions[exceptions.length - 1] ?? null
 
   const lines: DesiredLine[] = [
@@ -192,6 +194,7 @@ export function planPosting(
 ): NewJournalEntry | null {
   const desired = desiredLines(movement, allocations, exceptions)
   if (desired === null) return null
+
   const delta = diffLines(desired, existing)
   if (delta.length === 0) return null
 

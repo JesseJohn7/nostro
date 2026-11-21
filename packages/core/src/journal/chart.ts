@@ -61,6 +61,8 @@ export interface ChartOfAccounts {
   readonly unexplained: string
   readonly network_fees: string
   readonly uncategorized_income: string
+  readonly conversion: string
+  readonly other: string
   readonly uncategorized_expense: string
 }
 
@@ -75,6 +77,8 @@ export const DEFAULT_CHART: ChartOfAccounts = {
   network_fees: 'expenses:network-fees',
   uncategorized_income: 'income:uncategorized',
   uncategorized_expense: 'expenses:uncategorized',
+  conversion: 'equity:conversion',
+  other: 'equity:adjustments',
 }
 
 /** The account a role posts to for a movement on `account` in `network`. */

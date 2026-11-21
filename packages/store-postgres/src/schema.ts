@@ -38,8 +38,10 @@ const LINE_ROLES = list([
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
 ])
-const ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'manual'])
+const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
+const MANUAL_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual'])
 const EVENT_TYPES = list([
   'movement.decided',
   'expectation.partially_paid',
@@ -367,6 +369,48 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       FOR EACH ROW EXECUTE FUNCTION ${s}.expectations_muxed_id_unique();
   `,
 
+  // 7: export destination high-water marks
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.exports (
+      tenant_id     text NOT NULL,
+      destination   text NOT NULL,
+      last_seq      bigint NOT NULL DEFAULT 0,
+      last_exported_at timestamptz NOT NULL DEFAULT now(),
+      control_totals jsonb NOT NULL DEFAULT '{}',
+      checksum      text NOT NULL DEFAULT '',
+      PRIMARY KEY (tenant_id, destination)
+    );
+  `,
+
+  // 8: per-tenant accrual mode for expectations
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.accrual_modes (
+      tenant_id    text NOT NULL PRIMARY KEY,
+      active       boolean NOT NULL DEFAULT false
+    );
+  `,
+
+  // 9: support batched exception lookups by expectation
+  (s) => `
+    CREATE INDEX IF NOT EXISTS exceptions_expectation
+      ON ${s}.exceptions (tenant_id, expectation_id) WHERE expectation_id IS NOT NULL;
+  `,
+
+  // 10: event retention watermark and guarded pruning
+  (s) => `
+    CREATE TABLE ${s}.event_prune_state (
+      tenant_id text PRIMARY KEY,
+      pruned_through bigint NOT NULL DEFAULT 0 CHECK (pruned_through >= 0)
+    );
+    CREATE OR REPLACE FUNCTION ${s}.events_append_only() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF current_setting('nostro.event_prune', true) IS DISTINCT FROM 'on' THEN
+        RAISE EXCEPTION 'the event log is append-only' USING ERRCODE = 'check_violation';
+      END IF;
+      IF TG_LEVEL = 'ROW' THEN RETURN OLD; END IF;
+      RETURN NULL;
+    END $$;
+  `,
   (s) => `
     DO $do$
     DECLARE c text;
@@ -378,7 +422,10 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
         EXECUTE format('ALTER TABLE ${s}.journal_entries DROP CONSTRAINT %I', c);
       END LOOP;
     END $do$;
-    ALTER TABLE ${s}.journal_entries ADD CONSTRAINT journal_entries_kind_check CHECK (kind IN (${ENTRY_KINDS}));
+    ALTER TABLE ${s}.journal_entries ADD CONSTRAINT journal_entries_kind_check CHECK (kind IN (${MANUAL_ENTRY_KINDS}));
+
+    ALTER TABLE ${s}.journal_lines DROP CONSTRAINT journal_lines_role_check;
+    ALTER TABLE ${s}.journal_lines ADD CONSTRAINT journal_lines_role_check CHECK (role IN (${LINE_ROLES}, 'other'));
 
     CREATE TABLE IF NOT EXISTS ${s}.movement_valuations (
       tenant_id        text NOT NULL,

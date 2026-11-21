@@ -250,6 +250,7 @@ const PROBLEM_CODES: readonly ProblemCode[] = [
   'reference_taken',
   'muxed_id_taken',
   'expectation_conflict',
+  'event_history_pruned',
   'internal',
 ]
 

@@ -257,7 +257,7 @@ export function describeStoreProperties(
               }
               expect((await reconcile({ store, tenantId })).processed).toBe(0)
               const posted = await postJournal({ store, tenantId })
-              expect(posted.posted).toEqual({ initial: 0, reclass: 0, correction: 0, manual: 0 })
+              expect(posted.posted).toEqual({ initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0 })
               expect(await snapshot(store, tenantId)).toEqual(before)
             }),
           ),

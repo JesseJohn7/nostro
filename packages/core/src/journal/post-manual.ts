@@ -70,16 +70,11 @@ export async function postManualEntry(options: PostManualEntryOptions): Promise<
   }
 
   return store.transaction(async (tx) => {
-    let postingNo: number | null = null
-    if (movementId != null && movementId !== '') {
-      const existing = await tx.listJournalEntries({ tenantId, movementId })
-      postingNo = existing.length + 1
-    }
-
+    if (movementId != null) throw new ValidationError('movementId', 'manual entries cannot name a movement')
     return tx.postJournalEntry({
       tenantId,
       movementId: movementId ?? null,
-      postingNo,
+      postingNo: null,
       kind: 'manual',
       ...(options.effectiveAt !== undefined ? { effectiveAt: options.effectiveAt } : {}),
       description: desc,
@@ -98,12 +93,19 @@ export async function reverseManualEntry(options: ReverseManualEntryOptions): Pr
   assertStorableText('reason', reason)
 
   return store.transaction(async (tx) => {
-    // Find entry
-    const entries = await tx.listJournalEntries({ tenantId })
-    const target = entries.find((e) => e.id === entryId)
+    let target: JournalEntry | undefined
+    let afterSeq: number | undefined
+    for (;;) {
+      const entries = await tx.listJournalEntries({ tenantId, limit: 500, ...(afterSeq === undefined ? {} : { afterSeq }) })
+      target = entries.find(e => e.id === entryId)
+      if (target || entries.length < 500) break
+      afterSeq = entries[entries.length - 1]!.seq
+    }
     if (target === undefined) {
       throw new Error(`Manual entry ${entryId} not found in tenant ${tenantId}`)
     }
+
+    if (target.kind !== 'manual') throw new ValidationError('entryId', 'only manual entries can be reversed here')
 
     // Invert lines: debit -> credit, credit -> debit
     const reversedLines: NewJournalLine[] = target.lines.map((l) => ({
@@ -117,16 +119,13 @@ export async function reverseManualEntry(options: ReverseManualEntryOptions): Pr
 
     const desc = `Reversal of ${entryId}: ${target.description}`
 
-    return postManualEntry({
-      store: { transaction: <T>(fn: (t: any) => Promise<T>) => fn(tx) } as Store,
-      tenantId,
+    if (options.postedBy) assertStorableText('postedBy', options.postedBy)
+    if (options.note) assertStorableText('note', options.note)
+    return tx.postJournalEntry({
+      tenantId, kind: 'manual',
       effectiveAt: options.effectiveAt ?? new Date(),
-      description: desc,
+      description: `${desc} (Reason: ${reason})${options.note ? ` (Note: ${options.note})` : ''}${options.postedBy ? ` [by ${options.postedBy}]` : ''}`,
       lines: reversedLines,
-      reason,
-      ...(options.note !== undefined ? { note: options.note } : {}),
-      ...(options.postedBy !== undefined ? { postedBy: options.postedBy } : {}),
-      ...(target.movementId !== null ? { movementId: target.movementId } : {}),
     })
   })
 }

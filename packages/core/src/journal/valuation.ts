@@ -20,6 +20,8 @@ export function convertAmount(
   reportingAsset: AssetId,
   reportingDecimals: number = STROOP_DECIMALS,
 ): Money {
+  if (price.d === 0n) throw new Error("Price denominator cannot be zero")
+  if (price.n <= 0n || price.d <= 0n) throw new RangeError('Price must be a positive fraction')
   if (amount.asset === reportingAsset && amount.decimals === reportingDecimals) {
     return amount
   }
@@ -74,6 +76,7 @@ export class HorizonPriceSource implements PriceSource {
   }
 
   async price(base: AssetId, quote: AssetId, instant: Date): Promise<Price | null> {
+    if (isContractAsset(base) || isContractAsset(quote)) return null
     const params = new URLSearchParams()
     this.appendAsset(params, 'base', base)
     this.appendAsset(params, 'counter', quote)
@@ -82,8 +85,8 @@ export class HorizonPriceSource implements PriceSource {
     const resolution = 3600000
     const instantMs = instant.getTime()
     // Window around instant
-    const startTime = instantMs - resolution
-    const endTime = instantMs + resolution
+    const startTime = Math.floor(instantMs / resolution) * resolution
+    const endTime = startTime + resolution
     params.set('resolution', String(resolution))
     params.set('start_time', String(startTime))
     params.set('end_time', String(endTime))
@@ -109,7 +112,7 @@ export class HorizonPriceSource implements PriceSource {
     if (records.length === 0) return null
 
     // Filter segments that had trades
-    const withTrades = records.filter((r) => Number(r.count) > 0)
+    const withTrades = records.filter((r) => Number(r.count) > 0 && Number(r.timestamp) === startTime)
     if (withTrades.length === 0) return null
 
     // Pick segment closest to instant
@@ -139,11 +142,7 @@ export class HorizonPriceSource implements PriceSource {
       params.set(`${prefix}_asset_type`, 'native')
       return
     }
-    if (isContractAsset(assetId)) {
-      // Contract assets have no Horizon trade aggregations endpoint support; treat as native fallback
-      params.set(`${prefix}_asset_type`, 'native')
-      return
-    }
+    if (isContractAsset(assetId)) throw new Error('Horizon does not price contract tokens')
     // Classic CODE:ISSUER asset
     const colon = assetId.indexOf(':')
     const code = colon === -1 ? assetId : assetId.slice(0, colon)

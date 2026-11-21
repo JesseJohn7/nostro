@@ -7,7 +7,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { JournalQuery, Movement, NewJournalEntry, NewJournalLine, Store } from '@nostro-labs/nostro'
-import { Money, NotFoundError, ValidationError, asset, closePeriod, postMovement, reopenPeriod } from '@nostro-labs/nostro'
+import { agingReport, costBasis, valueMovements, MapPriceSource, reconcile, postManualEntry, Money, NotFoundError, ValidationError, asset, closePeriod, postMovement, reopenPeriod } from '@nostro-labs/nostro'
 
 const T = 'tenant-a'
 const T2 = 'tenant-b'
@@ -187,7 +187,7 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
         description: 'Write off suspense',
         lines: [
           { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: usdc('1') },
-          { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: usdc('1') },
+          { account: 'assets:suspense', role: 'other', side: 'credit', amount: usdc('1') },
         ],
       })
       expect(manual).toMatchObject({ movementId: null, postingNo: null })
@@ -205,8 +205,8 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
         effectiveAt: through,
         description: 'Other tenant period remains open',
         lines: [
-          { account: 'assets:suspense', role: 'unexplained', side: 'debit', amount: m.amount },
-          { account: 'liabilities:unapplied-receipts', role: 'unapplied', side: 'credit', amount: m.amount },
+          { account: 'assets:suspense', role: 'other', side: 'debit', amount: m.amount },
+          { account: 'liabilities:unapplied-receipts', role: 'other', side: 'credit', amount: m.amount },
         ],
       })
       expect(otherTenantEntry.tenantId).toBe(T2)
@@ -383,7 +383,7 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
           kind: 'manual',
           description: 'Write off suspense',
           lines: [
-            { account: 'assets:suspense', role: 'unexplained', side: 'credit', amount: usdc('10') },
+            { account: 'assets:suspense', role: 'other', side: 'credit', amount: usdc('10') },
             { account: 'expenses:write-off', role: 'uncategorized_expense', side: 'debit', amount: usdc('10') },
           ],
         }),
@@ -417,6 +417,31 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
       const listed = await store.listValuations({ tenantId: T })
       expect(listed).toHaveLength(1)
       expect(listed[0]!.movementId).toBe(m.id)
+    })
+
+    it('values movements idempotently and reports aging and lots on the same records', async () => {
+      const m = await movement()
+      await reconcile({store, tenantId:T})
+      const options = {store, tenantId:T, reportingAsset:USDC, priceSource:new MapPriceSource([])}
+      expect((await valueMovements(options)).valued).toBe(1)
+      expect((await valueMovements(options)).valued).toBe(0)
+      const lots = await costBasis({store,tenantId:T,asset:USDC,account:ACCOUNT})
+      expect(lots.openLots[0]!.remainingCost.raw).toBe(m.amount.raw)
+      const aging = await agingReport({store,tenantId:T,asOf:new Date('2030-01-01')})
+      expect(aging.unexplainedMoney.items[0]!.amount.raw).toBe(m.amount.raw)
+    })
+
+    it('refuses movement balance adjustments even when racing reconciliation', async () => {
+      const m = await movement()
+      const [manual] = await Promise.allSettled([
+        postManualEntry({store,tenantId:T,description:'Invalid write-off',reason:'test',lines:[
+          {account:'liabilities:unapplied-receipts',role:'unapplied',side:'debit',amount:m.amount},
+          {account:'income:uncategorized',role:'uncategorized_income',side:'credit',amount:m.amount},
+        ]}),
+        reconcile({store,tenantId:T}),
+      ])
+      expect(manual.status).toBe('rejected')
+      expect(await store.listJournalEntries({tenantId:T,movementId:m.id})).toHaveLength(1)
     })
 
     it('refuses to post the same cash twice, even with the right posting number', async () => {

@@ -13,6 +13,7 @@ export type ProblemCode =
   | 'reference_taken'
   | 'muxed_id_taken'
   | 'expectation_conflict'
+  | 'event_history_pruned'
   | 'internal'
 
 export interface Problem {
@@ -28,6 +29,7 @@ const TITLES: Readonly<Record<number, string>> = {
   401: 'Unauthorized',
   404: 'Not Found',
   409: 'Conflict',
+  410: 'Gone',
   422: 'Unprocessable Content',
   500: 'Internal Server Error',
 }

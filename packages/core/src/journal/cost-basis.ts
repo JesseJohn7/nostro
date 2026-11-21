@@ -37,6 +37,7 @@ export interface Disposal {
   readonly proceeds: Money | null
   readonly cost: Money
   readonly gain: Money | null
+  readonly missingCostAmount: Money
   readonly lotsUsed: readonly LotSlice[]
 }
 
@@ -88,12 +89,14 @@ interface MutableLot {
   originalAmount: Money
   remainingAmountRaw: bigint
   originalCost: Money
+  unknownCost: boolean
   remainingCostRaw: bigint
 }
 
 export async function costBasis(options: CostBasisOptions): Promise<CostBasisReport> {
   const { store, tenantId, account, asset } = options
   const method = options.method ?? 'fifo'
+  if (method !== 'fifo' && method !== 'lifo') throw new RangeError('Unknown cost basis method')
   const cutoff = options.to ?? options.asOf ?? null
 
   // Collect all movements for the tenant and asset
@@ -129,6 +132,7 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
     if (cutoff !== null && m.occurredAt >= cutoff) break
 
     const val = await store.getValuation(tenantId, m.id)
+    if (val !== null && repDetermined && val.reportingAsset !== repAsset) throw new Error('Mixed reporting currencies in cost basis')
     if (!repDetermined && val !== null) {
       repAsset = val.reportingAsset
       repDecimals = val.value.decimals
@@ -138,7 +142,6 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
     if (m.direction === 'credit') {
       if (val === null) {
         unvaluedCredits.push(m)
-        continue
       }
       lots.push({
         movementId: m.id,
@@ -147,14 +150,16 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
         asset: m.amount.asset,
         originalAmount: m.amount,
         remainingAmountRaw: m.amount.raw,
-        originalCost: val.value,
-        remainingCostRaw: val.value.raw,
+        originalCost: val?.value ?? Money.fromRaw(0n, repAsset, repDecimals),
+        unknownCost: val === null,
+        remainingCostRaw: val?.value.raw ?? 0n,
       })
     } else {
       // Debit or fee
       let neededRaw = m.amount.raw
       const slices: LotSlice[] = []
       let totalDisposalCostRaw = 0n
+      let unknownRaw = 0n
 
       // Method determines iteration order
       const candidateIndices =
@@ -164,7 +169,7 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
 
       for (const idx of candidateIndices) {
         const lot = lots[idx]!
-        if (lot.remainingAmountRaw <= 0n) continue
+        if (lot.account !== m.account || lot.remainingAmountRaw <= 0n) continue
         const takeRaw = lot.remainingAmountRaw < neededRaw ? lot.remainingAmountRaw : neededRaw
 
         let costTakenRaw: bigint
@@ -178,6 +183,7 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
           if (costTakenRaw > lot.remainingCostRaw) costTakenRaw = lot.remainingCostRaw
         }
 
+        if (lot.unknownCost) unknownRaw += takeRaw
         lot.remainingAmountRaw -= takeRaw
         lot.remainingCostRaw -= costTakenRaw
         neededRaw -= takeRaw
@@ -194,7 +200,8 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
 
       const cost = Money.fromRaw(totalDisposalCostRaw, repAsset, repDecimals)
       const proceeds = val !== null ? val.value : null
-      const gain = proceeds !== null ? proceeds.subtract(cost) : null
+      const missingCostAmount = Money.fromRaw(unknownRaw + neededRaw, asset, m.amount.decimals)
+      const gain = proceeds !== null && missingCostAmount.isZero() ? proceeds.subtract(cost) : null
 
       allDisposals.push({
         movementId: m.id,
@@ -205,6 +212,7 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
         proceeds,
         cost,
         gain,
+        missingCostAmount,
         lotsUsed: Object.freeze(slices),
       })
     }
@@ -219,7 +227,7 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
 
   // Open lots: remainingAmountRaw > 0
   const openLots: OpenLot[] = lots
-    .filter((l) => l.remainingAmountRaw > 0n)
+    .filter((l) => l.remainingAmountRaw > 0n && !l.unknownCost)
     .map((l) =>
       Object.freeze({
         movementId: l.movementId,

@@ -18,6 +18,10 @@ await store.migrate() // creates the schema and applies pending migrations; safe
 - Uniqueness, positive amounts and closed value sets are enforced by the database as well as in code.
 - Concurrent workers are safe: rows a write depends on are locked with `SELECT … FOR UPDATE`, and a
   cursor read inside a transaction holds that cursor until the transaction ends.
+- Event writers serialize per tenant using a transaction-scoped advisory lock. If PostgreSQL
+  detects a deadlock (`40P01`), the store rolls back and retries the whole transaction up to
+  three times. The transaction callback may run more than once; keep external side effects
+  outside it. Transactions touching more than one tenant follow the same retry rule.
 - Text memos are stored as bytes, because a Stellar text memo can contain NUL and a PostgreSQL
   `text` column cannot.
 

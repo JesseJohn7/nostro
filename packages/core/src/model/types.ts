@@ -310,6 +310,8 @@ export type LineRole =
   | 'network_fees'
   | 'uncategorized_income'
   | 'uncategorized_expense'
+  | 'conversion'
+  | 'other'
 
 export const LINE_ROLES: readonly LineRole[] = [
   'cash',
@@ -322,6 +324,8 @@ export const LINE_ROLES: readonly LineRole[] = [
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
+  'other',
 ]
 
 export type Side = 'debit' | 'credit'
@@ -332,9 +336,9 @@ export type Side = 'debit' | 'credit'
  * `correction`: changes the cash leg itself (a source correction).
  * `manual`: a manual entry not tied to a movement (or a manual adjustment), cash untouched.
  */
-export type JournalEntryKind = 'initial' | 'reclass' | 'correction' | 'manual'
+export type JournalEntryKind = 'initial' | 'reclass' | 'correction' | 'conversion' | 'manual'
 
-export const JOURNAL_ENTRY_KINDS: readonly JournalEntryKind[] = ['initial', 'reclass', 'correction', 'manual']
+export const JOURNAL_ENTRY_KINDS: readonly JournalEntryKind[] = ['initial', 'reclass', 'correction', 'conversion', 'manual']
 
 export interface JournalLine {
   readonly account: string
@@ -375,6 +379,7 @@ export interface NewJournalLine {
   readonly amount: Money
   readonly expectationId?: string | null
   readonly exceptionId?: string | null
+  readonly accrual?: boolean
 }
 
 export interface NewJournalEntry {

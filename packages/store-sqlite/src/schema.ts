@@ -27,8 +27,10 @@ const LINE_ROLES = list([
   'network_fees',
   'uncategorized_income',
   'uncategorized_expense',
+  'conversion',
 ])
-const ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'manual'])
+const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
+const MANUAL_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual'])
 const EVENT_TYPES = [
   'movement.decided',
   'expectation.partially_paid',
@@ -276,7 +278,26 @@ export const MIGRATIONS: readonly string[] = [
     CREATE INDEX IF NOT EXISTS expectation_reference_keys
       ON expectation_reference_index (tenant_id, normalized);
   `,
+  // 7: export destination high-water marks
   `
+    CREATE TABLE IF NOT EXISTS exports (
+      tenant_id     TEXT NOT NULL,
+      destination   TEXT NOT NULL,
+      last_seq      INTEGER NOT NULL DEFAULT 0,
+      last_exported_at INTEGER NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS INTEGER)),
+      control_totals TEXT NOT NULL DEFAULT '{}',
+      checksum      TEXT NOT NULL DEFAULT '',
+PRIMARY KEY (tenant_id, destination)
+    );
+  `,
+  // 8: per-tenant accrual mode for expectations
+  `
+    CREATE TABLE IF NOT EXISTS accrual_modes (
+      tenant_id     TEXT NOT NULL PRIMARY KEY,
+      active        INTEGER NOT NULL DEFAULT 0
+    );
+  `,
+`
     CREATE TABLE exceptions_new (
       seq             INTEGER PRIMARY KEY AUTOINCREMENT,
       id              TEXT NOT NULL UNIQUE,
@@ -361,9 +382,26 @@ export const MIGRATIONS: readonly string[] = [
       )
       BEGIN SELECT RAISE(ABORT, 'muxed id already used on account'); END;
   `,
-  // 8: manual journal entry kind, and movement valuations
+
+  // Support batched exception lookups by expectation.
+  `CREATE INDEX IF NOT EXISTS exceptions_expectation
+    ON exceptions (tenant_id, expectation_id) WHERE expectation_id IS NOT NULL;`,
+
+  // Event retention watermark and guarded pruning.
   `
-    PRAGMA foreign_keys = OFF;
+    CREATE TABLE event_prune_state (
+      tenant_id TEXT PRIMARY KEY,
+      pruned_through INTEGER NOT NULL DEFAULT 0 CHECK (pruned_through >= 0)
+    );
+    DROP TRIGGER events_no_delete;
+    CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+      WHEN nostro_event_prune_allowed() = 0
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+  `,
+  // 12: manual journal entry kind, and movement valuations
+  `
+    CREATE TEMP TABLE saved_journal_lines AS SELECT * FROM journal_lines;
+    DROP TABLE journal_lines;
     DROP TABLE IF EXISTS journal_entries_new;
     CREATE TABLE journal_entries_new (
       seq          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -371,7 +409,7 @@ export const MIGRATIONS: readonly string[] = [
       tenant_id    TEXT NOT NULL,
       movement_id  TEXT REFERENCES movements (id),
       posting_no   INTEGER CHECK (posting_no >= 1),
-      kind         TEXT NOT NULL CHECK (kind IN (${ENTRY_KINDS})),
+      kind         TEXT NOT NULL CHECK (kind IN (${MANUAL_ENTRY_KINDS})),
       effective_at INTEGER NOT NULL,
       posted_at    INTEGER NOT NULL,
       description  TEXT NOT NULL,
@@ -385,7 +423,21 @@ export const MIGRATIONS: readonly string[] = [
     CREATE INDEX journal_entries_effective ON journal_entries (tenant_id, effective_at);
     CREATE INDEX journal_entries_movement ON journal_entries (tenant_id, movement_id, seq);
     ${appendOnly('journal_entries')}
-    PRAGMA foreign_keys = ON;
+    CREATE TABLE journal_lines (
+      entry_id TEXT NOT NULL REFERENCES journal_entries(id),
+      line_no INTEGER NOT NULL CHECK (line_no >= 1), tenant_id TEXT NOT NULL,
+      account TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN (${LINE_ROLES}, 'other')),
+      side TEXT NOT NULL CHECK (side IN ('debit','credit')),
+      asset TEXT NOT NULL, decimals INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount TEXT NOT NULL ${positive('amount')},
+      expectation_id TEXT REFERENCES expectations(id), exception_id TEXT REFERENCES exceptions(id),
+      PRIMARY KEY(entry_id,line_no)
+    );
+    INSERT INTO journal_lines SELECT * FROM saved_journal_lines;
+    DROP TABLE saved_journal_lines;
+    CREATE INDEX journal_lines_account ON journal_lines(tenant_id,account,asset);
+    ${appendOnly('journal_lines')}
 
     CREATE TABLE IF NOT EXISTS movement_valuations (
       tenant_id        TEXT NOT NULL,
