@@ -8,6 +8,10 @@
 # built for the Node it runs on.
 
 FROM node:22.19.0-bookworm-slim AS build
+# Allow better-sqlite3 to compile when a prebuilt binary is unavailable.
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ \
+    && rm -rf /var/lib/apt/lists/*
+ENV npm_config_nodedir=/usr/local
 RUN corepack enable
 WORKDIR /src
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
