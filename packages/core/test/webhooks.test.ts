@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { MemoryStore, deliverWebhooks, eventCursorKey, signWebhook, verifyWebhook } from '../src/index.js'
+import { MemoryStore, deliverWebhooks, eventCursorKey, failureReason, getConsumerStatus, rewindConsumer, signWebhook, verifyWebhook } from '../src/index.js'
 
 const T = 'acme'
 const A = `G${'A'.repeat(55)}`
@@ -94,11 +94,75 @@ describe('deliverWebhooks', () => {
     }) as typeof globalThis.fetch
     expect(await deliver(store, racing, { consumer: 'a' })).toEqual({
       delivered: 0,
-      position: events[0]!.seq,
+      position: events[1]!.seq,
       failure: null,
       contended: true,
     })
     expect(await store.getCursor(eventCursorKey(T, 'a'))).toBe(String(events[1]!.seq))
+  })
+
+  it('records every failure and shows the recovery on the status route', async () => {
+    const store = await withEvents()
+    const events = await store.listEvents({ tenantId: T })
+    expect((await deliver(store, receiver([503]).fetch, { consumer: 'billing' })).failure).toEqual({
+      eventId: events[0]!.id,
+      reason: 'HTTP 503',
+    })
+
+    const failed = await getConsumerStatus(store, T, 'billing')
+    expect(failed.position).toBe(0)
+    expect(failed.lag).toBe(3)
+    expect(failed.lastAttempt).toMatchObject({ eventId: events[0]!.id, httpStatus: 503, error: 'HTTP 503', outcome: 'failure' })
+    expect(failureReason(failed.lastFailure)).toBe('HTTP 503')
+    expect(failed.lastSuccess).toBeNull()
+
+    expect(await deliver(store, receiver().fetch, { consumer: 'billing' })).toMatchObject({ delivered: 3, failure: null })
+    const recovered = await getConsumerStatus(store, T, 'billing')
+    expect(recovered.lag).toBe(0)
+    expect(recovered.lastSuccess).toMatchObject({ eventSeq: events[2]!.seq, outcome: 'success' })
+    expect((await store.listDeliveryAttempts({ tenantId: T, consumer: 'billing' })).map((a) => a.outcome)).toEqual([
+      'success', 'success', 'success', 'failure',
+    ])
+  })
+
+  it('does not let a replay under a running deliverer jump the rewound cursor', async () => {
+    const store = await withEvents()
+    const first = await deliver(store, receiver().fetch, { consumer: 'billing' })
+    expect(first.delivered).toBe(3)
+    await store.transaction((tx) => tx.openException({ tenantId: T, code: 'WRONG_ASSET', account: A, detail: 'four' }))
+    const events = await store.listEvents({ tenantId: T })
+
+    let entered!: () => void
+    const enteredPromise = new Promise<void>((resolve) => { entered = resolve })
+    let release!: () => void
+    const releasePromise = new Promise<void>((resolve) => { release = resolve })
+    const bodies: string[] = []
+    const slowFetch = (async (_url: string | URL | Request, init?: RequestInit) => {
+      bodies.push(init!.body as string)
+      entered()
+      await releasePromise
+      return new Response(null, { status: 204 })
+    }) as typeof globalThis.fetch
+
+    const delivering = deliver(store, slowFetch, { consumer: 'billing' })
+    await enteredPromise
+    const rewind = await rewindConsumer(store, {
+      tenantId: T,
+      consumer: 'billing',
+      expectedSeq: first.position,
+      toSeq: events[0]!.seq,
+      actor: 'ops@example.com',
+      at: NOW,
+    })
+    release()
+    expect(await delivering).toMatchObject({ delivered: 0, contended: true, position: events[0]!.seq })
+    expect(await store.getCursor(eventCursorKey(T, 'billing'))).toBe(String(events[0]!.seq))
+    expect(rewind).toMatchObject({ fromSeq: first.position, toSeq: events[0]!.seq, actor: 'ops@example.com' })
+    expect(JSON.parse(bodies[0]!).data.exception.detail).toBe('four')
+
+    const { received, fetch } = receiver()
+    expect(await deliver(store, fetch, { consumer: 'billing' })).toMatchObject({ delivered: 3, failure: null })
+    expect(received.map((r) => JSON.parse(r.body).data.exception.detail)).toEqual(['two', 'three', 'four'])
   })
 
   it('refuses a short secret', async () => {

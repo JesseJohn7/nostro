@@ -11,9 +11,11 @@ import Fastify from 'fastify'
 import type { FastifyError, FastifyInstance, FastifyServerOptions } from 'fastify'
 import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, NewExpectation, Store } from '@nostro-labs/nostro'
 import {
+  ConsumerPositionConflict,
   ConstraintError,
   EventHistoryPrunedError,
   InvalidAssetError,
+  InvalidRewindError,
   Money,
   NATIVE,
   NotFoundError,
@@ -22,9 +24,12 @@ import {
   accountLedger,
   allocationJson,
   balanceSheet,
+  consumerStatusJson,
   decideException,
+  deliveryAttemptJson,
   exceptionJson,
   expectationJson,
+  getConsumerStatus,
   incomeStatement,
   journalCsvRows,
   journalEntryJson,
@@ -35,12 +40,14 @@ import {
   parseAsset,
   postManualEntry,
   resolutionJson,
+  rewindConsumer,
+  rewindJson,
   trialBalance,
 } from '@nostro-labs/nostro'
 import type { Authenticate } from './auth.js'
 import { buildOpenApi } from './openapi.js'
 import { HttpProblem } from './problem.js'
-import { UINT64, amendExpectationBody, cancelExpectationBody, expectationBody, idParams, postJournalBody, query, resolveBody } from './schemas.js'
+import { UINT64, amendExpectationBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, replayBody, resolveBody } from './schemas.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -187,6 +194,10 @@ export function createServer(options: ServerOptions): FastifyInstance {
       problem = new HttpProblem(409, 'muxed_id_taken', 'That muxed id is already used for an expectation on this account.')
     } else if (err instanceof ConstraintError && (err.constraint === 'expectation_not_amendable' || err.constraint === 'amendment_below_allocated' || err.constraint === 'expectation_has_allocations' || err.constraint === 'expectation_not_open')) {
       problem = new HttpProblem(409, 'expectation_conflict', err.message)
+    } else if (err instanceof ConsumerPositionConflict) {
+      problem = new HttpProblem(409, 'consumer_position_conflict', err.message)
+    } else if (err instanceof InvalidRewindError) {
+      problem = new HttpProblem(422, 'invalid_replay', err.message)
     } else if (typeof err.statusCode === 'number' && err.statusCode >= 400 && err.statusCode < 500) {
       problem = new HttpProblem(400, 'invalid_request', err.message)
     } else {
@@ -370,6 +381,65 @@ export function createServer(options: ServerOptions): FastifyInstance {
           throw err
         }
       })
+
+      // ---- Webhook delivery status and replay (issue #89) -----------------
+
+      v1.get('/webhooks', async ({ tenantId }) => {
+        const consumers = await store.listDeliveryConsumers(tenantId)
+        const statuses = await Promise.all(consumers.map((consumer) => getConsumerStatus(store, tenantId, consumer)))
+        return { data: statuses.map(consumerStatusJson) }
+      })
+
+      v1.get<{ Params: { consumer: string } }>(
+        '/webhooks/:consumer/status',
+        { schema: { params: consumerParams } },
+        async ({ tenantId, params }) => consumerStatusJson(await getConsumerStatus(store, tenantId, params.consumer)),
+      )
+
+      v1.get<{ Params: { consumer: string }; Querystring: Paging & { outcome?: 'success' | 'failure' } }>(
+        '/webhooks/:consumer/attempts',
+        { schema: { params: consumerParams, querystring: query.webhookAttempts } },
+        async ({ tenantId, params, query: q }) =>
+          page(
+            await store.listDeliveryAttempts({
+              tenantId,
+              consumer: params.consumer,
+              limit: q.limit,
+              ...(q.after === undefined ? {} : { beforeSeq: q.after }),
+              ...(q.outcome === undefined ? {} : { outcome: q.outcome }),
+            }),
+            q.limit,
+            deliveryAttemptJson,
+          ),
+      )
+
+      v1.post<{ Params: { consumer: string }; Body: { expectedSeq: number; toSeq: number; actor: string } }>(
+        '/webhooks/:consumer/replay',
+        { schema: { params: consumerParams, body: replayBody } },
+        async ({ tenantId, params, body }) => {
+          try {
+            return rewindJson(
+              await rewindConsumer(store, {
+                tenantId,
+                consumer: params.consumer,
+                expectedSeq: body.expectedSeq,
+                toSeq: body.toSeq,
+                actor: body.actor,
+                at: new Date(),
+              }),
+            )
+          } catch (err) {
+            if (err instanceof EventHistoryPrunedError) {
+              throw new HttpProblem(
+                410,
+                'event_history_pruned',
+                `Event history through sequence ${err.prunedThrough} was pruned; resume after that sequence.`,
+              )
+            }
+            throw err
+          }
+        },
+      )
 
       v1.post<{ Params: { id: string }; Body: ExceptionDecision }>(
         '/exceptions/:id/resolve',

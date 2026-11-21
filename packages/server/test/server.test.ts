@@ -3,7 +3,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import type { Store } from '@nostro-labs/nostro'
-import { HorizonEffectsSource, HorizonFeesSource, JOURNAL_CSV_COLUMNS, MemoryStore, Money, NATIVE, reconcile, sync } from '@nostro-labs/nostro'
+import { HorizonEffectsSource, HorizonFeesSource, JOURNAL_CSV_COLUMNS, MemoryStore, Money, NATIVE, eventCursorKey, reconcile, rewindConsumer, sync } from '@nostro-labs/nostro'
 import { FakeHorizon } from 'nostro-testkit'
 import { apiKeys, createServer } from '../src/index.js'
 
@@ -666,6 +666,121 @@ describe('reports and account moves', () => {
     expect(cash.statusCode).toBe(422)
     expect(cash.json()).toMatchObject({ code: 'invalid_request' })
     expect((await move({ from: 1, to: 'x' })).statusCode).toBe(400)
+  })
+})
+
+describe('webhook delivery status and replay', () => {
+  const AT = new Date('2026-11-01T12:00:00Z')
+
+  async function withDeliveryHistory() {
+    const store = new MemoryStore()
+    for (const detail of ['one', 'two']) {
+      await store.transaction((tx) => tx.openException({ tenantId: 'acme', code: 'MEMO_MISSING', account: A, detail }))
+    }
+    const events = await store.listEvents({ tenantId: 'acme' })
+    const attempt = (consumer: string, eventIndex: number, outcome: 'success' | 'failure') =>
+      store.transaction((tx) =>
+        tx.recordDeliveryAttempt({
+          tenantId: 'acme',
+          consumer,
+          eventId: events[eventIndex]!.id,
+          eventSeq: events[eventIndex]!.seq,
+          at: AT,
+          httpStatus: outcome === 'success' ? 200 : 503,
+          error: outcome === 'success' ? null : 'HTTP 503',
+          durationMs: 5,
+          outcome,
+        }),
+      )
+
+    await store.transaction((tx) => tx.setCursor(eventCursorKey('acme', 'webhook'), String(events[0]!.seq)))
+    await attempt('webhook', 0, 'failure')
+    await attempt('webhook', 1, 'success')
+    await attempt('backup', 1, 'success')
+    await store.transaction((tx) => tx.setCursor(eventCursorKey('acme', 'flag'), String(events[0]!.seq)))
+    await store.transaction((tx) => tx.setCursor(eventCursorKey('acme', 'audit'), String(events[1]!.seq)))
+    await rewindConsumer(store, {
+      tenantId: 'acme',
+      consumer: 'audit',
+      expectedSeq: events[1]!.seq,
+      toSeq: events[0]!.seq,
+      actor: 'ops',
+      at: AT,
+    })
+    return { store, events }
+  }
+
+  it('lists consumers from cursors, attempts and replay audits, and reports one before its first round', async () => {
+    const { events } = await withDeliveryHistory()
+    const app = server(new MemoryStore())
+    await app.ready()
+    const list = await app.inject({ url: '/v1/webhooks', headers: auth() })
+    expect(list.json()).toEqual({ data: [] })
+
+    const full = server((await withDeliveryHistory()).store)
+    const body = (await full.inject({ url: '/v1/webhooks', headers: auth() })).json()
+    expect(body.data.map((s: { consumer: string }) => s.consumer)).toEqual(['audit', 'backup', 'flag', 'webhook'])
+
+    const flag = (await full.inject({ url: '/v1/webhooks/flag/status', headers: auth() })).json()
+    expect(flag).toMatchObject({
+      consumer: 'flag',
+      position: events[0]!.seq,
+      latestSeq: events[1]!.seq,
+      lag: 1,
+      lastAttempt: null,
+      lastSuccess: null,
+      lastFailure: null,
+    })
+    expect((await full.inject({ url: '/v1/webhooks/flag/status', headers: auth(OTHER_KEY) })).json()).toMatchObject({
+      tenantId: 'other',
+      position: 0,
+      latestSeq: 0,
+      lag: 0,
+    })
+  })
+
+  it('pages the attempt log and filters it by outcome', async () => {
+    const app = server((await withDeliveryHistory()).store)
+    const get = async (query: string) => (await app.inject({ url: `/v1/webhooks/webhook/attempts${query}`, headers: auth() })).json()
+    const all = await get('')
+    expect(all.data.map((a: { outcome: string; reason: string | null }) => [a.outcome, a.reason])).toEqual([
+      ['success', null],
+      ['failure', 'HTTP 503'],
+    ])
+    expect(all.next).toBeNull()
+    expect((await get('?outcome=failure')).data.map((a: { outcome: string }) => a.outcome)).toEqual(['failure'])
+    const first = await get('?limit=1')
+    expect(first.data).toHaveLength(1)
+    expect(first.next).toBe(all.data[0].seq)
+    expect((await get(`?after=${first.next}`)).data.map((a: { seq: number }) => a.seq)).toEqual([all.data[1].seq])
+    expect((await app.inject({ url: '/v1/webhooks/webhook/attempts?outcome=maybe', headers: auth() })).statusCode).toBe(400)
+  })
+
+  it('rewinds with a compare-and-set, and reports conflicts, invalid replays and pruned history', async () => {
+    const { store, events } = await withDeliveryHistory()
+    const app = server(store)
+    const status = async () => (await app.inject({ url: '/v1/webhooks/webhook/status', headers: auth() })).json()
+    const replay = (payload: unknown) =>
+      app.inject({ method: 'POST', url: '/v1/webhooks/webhook/replay', headers: auth(), payload: payload as object })
+
+    const before = await status()
+    const done = await replay({ expectedSeq: before.position, toSeq: 0, actor: 'operator@example.com' })
+    expect(done.statusCode).toBe(200)
+    expect(done.json()).toMatchObject({ fromSeq: before.position, toSeq: 0, actor: 'operator@example.com' })
+    expect((await status()).position).toBe(0)
+
+    expect((await replay({ expectedSeq: before.position, toSeq: 0, actor: 'late' })).json()).toMatchObject({
+      status: 409,
+      code: 'consumer_position_conflict',
+    })
+    expect((await replay({ expectedSeq: 0, toSeq: 0, actor: 'ops' })).json()).toMatchObject({ status: 422, code: 'invalid_replay' })
+    expect((await replay({ expectedSeq: 'x', toSeq: 0, actor: 'ops' })).statusCode).toBe(400)
+
+    await store.transaction((tx) => tx.setCursor(eventCursorKey('acme', 'webhook'), String(events[1]!.seq)))
+    await store.transaction((tx) => tx.pruneEventsBefore('acme', new Date(Date.now() + 60_000)))
+    const pruned = await replay({ expectedSeq: events[1]!.seq, toSeq: 0, actor: 'ops' })
+    expect(pruned.statusCode).toBe(410)
+    expect(pruned.json().code).toBe('event_history_pruned')
   })
 })
 

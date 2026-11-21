@@ -3,7 +3,7 @@
  * server validates requests with. Served at `GET /v1/openapi.json`.
  */
 import { readFileSync } from 'node:fs'
-import { components, expectationBody, postJournalBody, query, ref, resolveBody } from './schemas.js'
+import { components, expectationBody, postJournalBody, query, ref, replayBody, resolveBody } from './schemas.js'
 
 /** This package's version, which is the API's. */
 const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version
@@ -30,6 +30,7 @@ function parameters(schema: { properties: Record<string, object> }) {
 }
 
 const idParam = (what: string) => ({ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: `The ${what}'s id.` })
+const consumerParam = { name: 'consumer', in: 'path', required: true, schema: { type: 'string' }, description: 'The webhook consumer name.' }
 
 export function buildOpenApi() {
   return {
@@ -175,6 +176,50 @@ export function buildOpenApi() {
           responses: {
             '200': ok('EventPage'),
             '410': problem('The requested `after` position was pruned; resume after the reported sequence (`event_history_pruned`).'),
+            ...errors,
+          },
+        },
+      },
+      '/v1/webhooks': {
+        get: {
+          operationId: 'listWebhookConsumers',
+          summary: 'Every webhook consumer in this tenant and how far behind it is',
+          description:
+            'Consumers are discovered from saved positions, delivery attempts and replay audits, so a consumer configured with `--webhook-url` still appears before its first delivery round.',
+          responses: { '200': ok('WebhookConsumerList'), ...errors },
+        },
+      },
+      '/v1/webhooks/{consumer}/status': {
+        get: {
+          operationId: 'webhookStatus',
+          summary: 'A consumer\'s position, lag and last delivery outcomes',
+          description: '`lag` is `latestSeq - position`. It is zero only after every event has been acknowledged.',
+          parameters: [consumerParam],
+          responses: { '200': ok('ConsumerStatus'), ...errors },
+        },
+      },
+      '/v1/webhooks/{consumer}/attempts': {
+        get: {
+          operationId: 'webhookAttempts',
+          summary: 'The bounded, prunable log of POST attempts for a consumer',
+          description: 'Newest first; page by passing `next` back as `after`. Failures include an `httpStatus` or a transport `error`.',
+          parameters: [consumerParam, ...parameters(query.webhookAttempts)],
+          responses: { '200': ok('DeliveryAttemptPage'), ...errors },
+        },
+      },
+      '/v1/webhooks/{consumer}/replay': {
+        post: {
+          operationId: 'replayWebhook',
+          summary: 'Rewind a consumer so the next delivery round resends events',
+          description:
+            'A compare-and-set on the consumer\'s position: if `expectedSeq` is stale the replay is refused with 409 and the caller must read the status and retry. The event log is never rewritten.',
+          parameters: [consumerParam],
+          requestBody: { required: true, content: { 'application/json': { schema: replayBody } } },
+          responses: {
+            '200': ok('Rewind', 'Rewound'),
+            '409': problem('The position moved since the status was read (`consumer_position_conflict`).'),
+            '410': problem('The requested position was pruned; resume after the reported sequence (`event_history_pruned`).'),
+            '422': problem('The rewind does not move backwards, or is otherwise invalid (`invalid_replay`).'),
             ...errors,
           },
         },

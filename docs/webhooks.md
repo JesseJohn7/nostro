@@ -87,6 +87,39 @@ log at `GET /v1/events` for clients that would rather poll. Secrets must be at l
 (`openssl rand -hex 32`). Each destination keeps its own position (`consumer`, default `webhook`).
 Two deliverers sharing one consumer won't both advance it: the second one notices and stops.
 
+## Watching and replaying delivery
+
+Every POST is recorded whether it worked or not, in a bounded per-consumer attempt log that is
+separate from the append-only event log. The newest 1,000 attempts per consumer are kept, and
+attempts older than 30 days are dropped in the same transaction that appends a new one. No background
+job is needed.
+
+The HTTP API exposes that state:
+
+| Route | What it gives you |
+|---|---|
+| `GET /v1/webhooks` | every consumer in the tenant — including one configured with `--webhook-url` that has not delivered anything yet — with its position, lag and last outcomes |
+| `GET /v1/webhooks/{consumer}/status` | `position`, `latestSeq`, `lag`, and the last attempt, success and failure |
+| `GET /v1/webhooks/{consumer}/attempts` | attempts, newest first; `?outcome=success\|failure`, `?limit=`, `?after=` |
+| `POST /v1/webhooks/{consumer}/replay` | `{ "expectedSeq": 42, "toSeq": 39, "actor": "ops@example.com" }` — rewinds the consumer so the next round resends events after `toSeq` |
+
+`lag` is `latestSeq - position`: it is zero only after every retained event has been acknowledged.
+A consumer with no saved position yet still has a status route; it starts at the retention watermark.
+
+Replay is a compare-and-set, not a rewrite of history. `expectedSeq` must be the `position` you just
+read; if a deliverer moved it in the meantime, the server answers `409 consumer_position_conflict`
+and you should read the status and retry. `toSeq` must be lower than `expectedSeq` and no lower than
+the retention watermark; otherwise the server answers `422 invalid_replay` or `410
+event_history_pruned`. Each rewind is recorded with its actor and time, so an operator can see who
+moved a consumer back. The deliverer checks the cursor both before a POST and when it saves the
+result, so a replay racing a running round cannot advance the rewound position past events that have
+not been sent.
+
+There is deliberately no "resend this one event" operation. Receivers already deduplicate on event
+`id`, so rewinding to just before a run of events is enough and keeps ordering intact. The same
+attempt log is an audit surface a future backoff or parking feature can add its own state beside;
+it does not require changing the event store.
+
 ## Event retention
 
 Webhook consumers retain their own position in the tenant's event log. The `prune-events` command

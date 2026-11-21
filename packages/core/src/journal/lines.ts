@@ -14,6 +14,7 @@ import type {
   ExceptionRecord,
   JournalEntry,
   JournalEntryKind,
+  JournalLine,
   LineRole,
   Movement,
   NewJournalEntry,
@@ -105,7 +106,7 @@ export function desiredLines(
   return lines
 }
 
-const keyOf = (l: { role: LineRole; amount: Money; expectationId: string | null }) =>
+const keyOf = (l: { role: LineRole; amount: Money; expectationId?: string | null }) =>
   `${l.role}|${l.amount.asset}|${l.expectationId ?? ''}`
 
 /**
@@ -207,6 +208,80 @@ export function planPosting(
 ): NewJournalEntry | null {
   const desired = desiredLines(movement, allocations, exceptions, options.refunds)
   if (desired === null) return null
+
+  // Check for trade leg pairs: movements with externalId ending in :sold or :bought
+  // that form a complete trade. When both legs are present, create conversion entries.
+  const tradeLeg = movement.externalId
+  const isTradeLeg = tradeLeg !== null && (/sold$|bought$/.test(tradeLeg))
+  if (isTradeLeg) {
+    const effectId = tradeLeg.replace(/:sold$|:bought$/, '')
+    const partnerSuffix = tradeLeg.endsWith(':sold') ? ':bought' : ':sold'
+    const partnerExternalId = `${effectId}${partnerSuffix}`
+
+    // Look for a matching partner leg in existing entries
+    let partnerLine: JournalLine | null = null
+    for (const entry of existing) {
+      if (entry.description.includes(partnerExternalId)) {
+        partnerLine = entry.lines.find((line) => line.amount.asset !== movement.amount.asset) ?? entry.lines[0] ?? null
+        break
+      }
+    }
+
+    if (partnerLine !== null) {
+      // Conversion pair detected: create conversion entries
+      const soldAmount = movement.amount
+      const boughtAmount = partnerLine.amount
+
+      // Build conversion lines for both assets
+      const conversionLines: NewJournalLine[] = []
+
+      // For the sold leg (debit of sold asset): Cr conversion(sold_asset), Dr cash(sold_asset)
+      // But we need to check the movement direction
+      const isSold = tradeLeg.endsWith(':sold')
+      const soldDirection = isSold ? 'debit' : 'credit'
+      const boughtDirection = isSold ? 'credit' : 'debit'
+
+      // Add conversion line for sold asset
+      conversionLines.push({
+        account: movement.account,
+        role: 'conversion' as const,
+        side: soldDirection,
+        amount: soldAmount,
+        expectationId: null,
+        exceptionId: null,
+      })
+
+      // Add conversion line for bought asset
+      conversionLines.push({
+        account: movement.account,
+        role: 'conversion' as const,
+        side: boughtDirection,
+        amount: boughtAmount,
+        expectationId: null,
+        exceptionId: null,
+      })
+
+      // Check if this entry would be new (different from existing)
+      const existingKey = conversionLines.map((l) => keyOf(l)).join(',')
+      const existingKeys = new Set(
+        existing.flatMap((e) => e.lines.map((l) => keyOf(l)))
+      )
+      if (!existingKeys.has(existingKey)) {
+        const base: NewJournalEntry = {
+          tenantId: movement.tenantId,
+          movementId: movement.id,
+          postingNo: existing.length + 1,
+          kind: 'conversion',
+          description: `Conversion: trade legs ${tradeLeg} and ${partnerExternalId}`,
+          lines: conversionLines,
+        }
+        if (existing.length === 0) {
+          return { ...base, effectiveAt: movement.occurredAt }
+        }
+        return base
+      }
+    }
+  }
 
   const delta = diffLines(desired, existing)
   if (delta.length === 0) return null

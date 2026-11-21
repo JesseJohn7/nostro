@@ -7,6 +7,8 @@
  * same event and nothing is ever delivered out of order or skipped.
  * Delivery is at least once (a crash after the POST but before the position
  * is saved sends that event again), so receivers dedupe on the event id.
+ * Every POST is also recorded in a bounded attempt log per consumer, which
+ * backs the status and replay routes; see `store/delivery.ts`.
  *
  * Each request carries `Nostro-Signature: t=<unix seconds>,v1=<hex>`, the
  * HMAC-SHA256 of `<t>.<body>` under the shared secret. `verifyWebhook()`
@@ -14,7 +16,7 @@
  * so a captured request cannot be replayed later.
  */
 import { createHmac, timingSafeEqual } from 'node:crypto'
-import type { Store } from '../store/index.js'
+import type { DeliveryOutcome, Store } from '../store/index.js'
 import { eventCursorKey, outboxEventJson } from '../store/index.js'
 
 /** Shorter secrets can be guessed; generate them with `openssl rand -hex 32`. */
@@ -87,7 +89,8 @@ export async function deliverWebhooks(options: DeliverOptions): Promise<DeliverR
   }
   const doFetch = options.fetch ?? globalThis.fetch.bind(globalThis)
   const now = options.now ?? (() => new Date())
-  const key = eventCursorKey(tenantId, options.consumer ?? 'webhook')
+  const consumer = options.consumer ?? 'webhook'
+  const key = eventCursorKey(tenantId, consumer)
   const saved = await store.getCursor(key)
   let position = saved === null ? await store.getEventsPrunedThrough(tenantId) : Number(saved)
   if (saved === null) {
@@ -97,8 +100,16 @@ export async function deliverWebhooks(options: DeliverOptions): Promise<DeliverR
 
   const events = await store.listEvents({ tenantId, afterSeq: position, limit: options.limit ?? 100 })
   for (const event of events) {
+    // A replay between rounds moves the cursor back. Notice it before POSTing
+    // so this round does not send an event the rewound consumer has not earned.
+    const current = await store.getCursor(key)
+    if ((current === null ? 0 : Number(current)) !== position) {
+      return { delivered, position: current === null ? 0 : Number(current), failure: null, contended: true }
+    }
     const body = JSON.stringify(outboxEventJson(event))
-    let reason: string | null = null
+    const started = Date.now()
+    let httpStatus: number | null = null
+    let error: string | null = null
     try {
       const response = await doFetch(url, {
         method: 'POST',
@@ -114,22 +125,40 @@ export async function deliverWebhooks(options: DeliverOptions): Promise<DeliverR
         signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
       })
       await response.body?.cancel()
-      if (response.status < 200 || response.status >= 300) reason = `HTTP ${response.status}`
+      httpStatus = response.status
+      if (response.status < 200 || response.status >= 300) error = `HTTP ${response.status}`
     } catch (err) {
-      reason = err instanceof Error ? err.message : String(err)
+      error = err instanceof Error ? err.message : String(err)
     }
-    if (reason !== null) return { delivered, position, failure: { eventId: event.id, reason }, contended: false }
-
-    // Compare-and-set, as sync() does: stop if another deliverer got here first.
+    const outcome: DeliveryOutcome = error === null ? 'success' : 'failure'
+    const durationMs = Math.max(0, Date.now() - started)
     const from = position
-    const moved = await store.transaction(async (tx) => {
+
+    // The attempt is recorded whether or not the POST worked. A successful
+    // POST and the position it earns are written together; on a failed compare
+    // the attempt still lands, but this deliverer stops before the cursor.
+    const result = await store.transaction(async (tx) => {
+      await tx.recordDeliveryAttempt({
+        tenantId,
+        consumer,
+        eventId: event.id,
+        eventSeq: event.seq,
+        at: now(),
+        httpStatus,
+        error,
+        durationMs,
+        outcome,
+      })
+      if (error !== null) return { status: 'failed' as const, position }
       const current = await tx.getCursor(key)
-      if ((current === null ? 0 : Number(current)) !== from) return false
+      const currentPos = current === null ? 0 : Number(current)
+      if (currentPos !== from) return { status: 'contended' as const, position: currentPos }
       await tx.setCursor(key, String(event.seq))
-      return true
+      return { status: 'moved' as const, position: event.seq }
     })
-    if (!moved) return { delivered, position, failure: null, contended: true }
-    position = event.seq
+    if (result.status === 'failed') return { delivered, position, failure: { eventId: event.id, reason: error! }, contended: false }
+    if (result.status === 'contended') return { delivered, position: result.position, failure: null, contended: true }
+    position = result.position
     delivered += 1
   }
   return { delivered, position, failure: null, contended: false }

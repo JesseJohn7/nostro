@@ -32,6 +32,10 @@ await app.listen({ port: 8080 })
 | `GET /v1/journal` | `?from=`, `?to=` (ISO 8601, effective dates) |
 | `GET /v1/journal.csv` | the journal as CSV, streamed |
 | `GET /v1/events` | the event log ([docs/webhooks.md](../../docs/webhooks.md)), for clients that would rather poll than receive webhooks |
+| `GET /v1/webhooks` | every webhook consumer, with position, lag and last outcomes |
+| `GET /v1/webhooks/{consumer}/status` | one consumer's position, lag, last attempt, success and failure |
+| `GET /v1/webhooks/{consumer}/attempts` | `?outcome=success\|failure`, `?limit=`, `?after=`; attempts, newest first |
+| `POST /v1/webhooks/{consumer}/replay` | `{ "expectedSeq": 42, "toSeq": 39, "actor": "ops@example.com" }`; `409` if the position moved, `410` if it was pruned, `422` if the rewind is invalid |
 
 - **Authentication.** `Authorization: Bearer <key>`. The key decides the tenant, so a caller can never
   ask for another tenant's records. `apiKeys()` keeps only SHA-256 digests of the keys, compares in
@@ -44,7 +48,9 @@ await app.listen({ port: 8080 })
 - **Errors** are RFC 9457 problem details (`application/problem+json`) with a stable `code`:
   `unauthorized`, `invalid_request` (400), `not_found`, `reference_taken` (409),
   `invalid_expectation` (422, e.g. an amount with more decimals than the asset has),
-  `invalid_resolution` (422), `resolution_refused` (409, the rules refuse it), `internal`. A
+  `invalid_resolution` (422), `resolution_refused` (409, the rules refuse it),
+  `consumer_position_conflict` (409), `invalid_replay` (422), `event_history_pruned` (410),
+  `internal`. A
   query parameter or body field the API does not know is a 400, not silently ignored. A 500 says
   nothing about the server's insides.
 

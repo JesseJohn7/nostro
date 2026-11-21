@@ -19,6 +19,8 @@ import type {
   Allocation,
   AllocationQuery,
   CursorKey,
+  DeliveryAttempt,
+  DeliveryAttemptQuery,
   Disposition,
   Direction,
   EventQuery,
@@ -42,8 +44,12 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  NewDeliveryAttempt,
   NewOutboxEvent,
   OutboxEvent,
+  Rewind,
+  RewindInput,
+  RewindQuery,
   PruneEventsResult,
   RefundLink,
   RefundQuery,
@@ -70,6 +76,9 @@ import {
   assertValidNewExpectation,
   assertValidNewJournalEntry,
   assertValidNewMovement,
+  DELIVERY_ATTEMPT_LIMIT,
+  DELIVERY_ATTEMPT_TTL_MS,
+  eventCursorKey,
   amendExpectationRecord,
   checkAllocation,
   checkCancel,
@@ -241,6 +250,33 @@ const toEvent = (r: Row): OutboxEvent =>
     createdAt: date(r.created_at)!,
   })
 
+const toDeliveryAttempt = (r: Row): DeliveryAttempt =>
+  Object.freeze({
+    id: r.id as string,
+    seq: r.seq as number,
+    tenantId: r.tenant_id as string,
+    consumer: r.consumer as string,
+    eventId: r.event_id as string,
+    eventSeq: r.event_seq as number,
+    at: date(r.attempt_at)!,
+    httpStatus: r.http_status as number | null,
+    error: r.error as string | null,
+    durationMs: r.duration_ms as number,
+    outcome: r.outcome as DeliveryAttempt['outcome'],
+  })
+
+const toRewind = (r: Row): Rewind =>
+  Object.freeze({
+    id: r.id as string,
+    seq: r.seq as number,
+    tenantId: r.tenant_id as string,
+    consumer: r.consumer as string,
+    fromSeq: r.from_seq as number,
+    toSeq: r.to_seq as number,
+    actor: r.actor as string,
+    at: date(r.at)!,
+  })
+
 const toJournalEntry = (r: Row, lines: readonly Row[]): JournalEntry =>
   Object.freeze({
     id: r.id as string,
@@ -400,6 +436,39 @@ class SqliteReader implements StoreReader {
   async getEventsPrunedThrough(tenantId: string): Promise<number> {
     const row = this.one('SELECT pruned_through FROM event_prune_state WHERE tenant_id = ?', [tenantId])
     return Number(row?.pruned_through ?? 0)
+  }
+
+  async getLatestEventSeq(tenantId: string): Promise<number> {
+    const row = this.one('SELECT max(seq) AS seq FROM events WHERE tenant_id = ?', [tenantId])
+    return Number(row?.seq ?? 0)
+  }
+
+  async listDeliveryAttempts(q: DeliveryAttemptQuery): Promise<DeliveryAttempt[]> {
+    const w = new Where()
+      .add('tenant_id = ?', q.tenantId)
+      .add('consumer = ?', q.consumer)
+      .add('outcome = ?', q.outcome)
+      .add('seq < ?', q.beforeSeq)
+    return this.all(`SELECT * FROM webhook_delivery_attempts${w} ORDER BY seq DESC${w.limit(q.limit)}`, w.params).map(toDeliveryAttempt)
+  }
+
+  async listDeliveryConsumers(tenantId: string): Promise<string[]> {
+    const rows = this.all(
+      `SELECT account FROM cursors
+         WHERE tenant_id = ? AND network = 'nostro' AND source = 'outbox' AND value IS NOT NULL
+       UNION
+       SELECT DISTINCT consumer AS account FROM webhook_delivery_attempts WHERE tenant_id = ?
+       UNION
+       SELECT DISTINCT consumer AS account FROM webhook_rewinds WHERE tenant_id = ?
+       ORDER BY account`,
+      [tenantId, tenantId, tenantId],
+    )
+    return rows.map((r) => r.account as string)
+  }
+
+  async listRewinds(q: RewindQuery): Promise<Rewind[]> {
+    const w = new Where().add('tenant_id = ?', q.tenantId).add('consumer = ?', q.consumer)
+    return this.all(`SELECT * FROM webhook_rewinds${w} ORDER BY seq DESC${w.limit(q.limit ?? DELIVERY_ATTEMPT_LIMIT)}`, w.params).map(toRewind)
   }
 
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
@@ -579,6 +648,41 @@ class SqliteTx extends SqliteReader implements StoreTx {
        ON CONFLICT (tenant_id, network, source, account) DO UPDATE SET value = excluded.value`,
       [k.tenantId, k.network, k.source, k.account, value],
     )
+  }
+
+  async recordDeliveryAttempt(attempt: NewDeliveryAttempt): Promise<DeliveryAttempt> {
+    const id = this.ids()
+    this.exec(
+      `INSERT INTO webhook_delivery_attempts
+         (id, tenant_id, consumer, event_id, event_seq, attempt_at, http_status, error, duration_ms, outcome)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, attempt.tenantId, attempt.consumer, attempt.eventId, attempt.eventSeq, attempt.at.getTime(), attempt.httpStatus, attempt.error, attempt.durationMs, attempt.outcome],
+    )
+    this.exec(
+      `DELETE FROM webhook_delivery_attempts
+         WHERE tenant_id = ? AND consumer = ? AND (
+           seq < (SELECT seq FROM webhook_delivery_attempts
+                  WHERE tenant_id = ? AND consumer = ?
+                  ORDER BY seq DESC LIMIT 1 OFFSET ?)
+           OR attempt_at < ?
+         )`,
+      [attempt.tenantId, attempt.consumer, attempt.tenantId, attempt.consumer, DELIVERY_ATTEMPT_LIMIT - 1, attempt.at.getTime() - DELIVERY_ATTEMPT_TTL_MS],
+    )
+    return toDeliveryAttempt(this.one('SELECT * FROM webhook_delivery_attempts WHERE id = ?', [id])!)
+  }
+
+  async rewindConsumer(input: RewindInput): Promise<Rewind | null> {
+    const key = eventCursorKey(input.tenantId, input.consumer)
+    const current = await this.getCursor(key)
+    if ((current === null ? 0 : Number(current)) !== input.expectedSeq) return null
+    await this.setCursor(key, String(input.toSeq))
+    const id = this.ids()
+    this.exec(
+      `INSERT INTO webhook_rewinds (id, tenant_id, consumer, from_seq, to_seq, actor, at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [id, input.tenantId, input.consumer, input.expectedSeq, input.toSeq, input.actor, input.at.getTime()],
+    )
+    return toRewind(this.one('SELECT * FROM webhook_rewinds WHERE id = ?', [id])!)
   }
 
   async pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult> {
@@ -1011,9 +1115,7 @@ export class SqliteStore extends SqliteReader implements MigratableStore {
     })
   }
 
-
-
-async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
+  async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {
     await this.transaction(tx => tx.postAccrualExpectation(expectationId, tenantId, direction, amount, reference))
   }
 

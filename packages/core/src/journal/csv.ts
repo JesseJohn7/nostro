@@ -42,8 +42,9 @@ export interface JournalCsvOptions {
   /** Entries read per page. Default 500. */
   readonly pageSize?: number
   /** Internal upper bound used to keep a multi-pass export on one journal snapshot. */
-  readonly afterSeq?: number
   readonly throughSeq?: number
+  /** Export entries with a journal sequence greater than this. */
+  readonly afterSeq?: number
   /** Target decimal places for exact, balanced rounding. Omit for unchanged output. */
   readonly decimals?: number
   /** Metadata keys to read as dimensions. Each key becomes a column named after it. */

@@ -36,6 +36,14 @@ import type {
 import type { Money } from '../money/index.js'
 import type { AssetId } from '../money/index.js'
 import type { EventQuery, OutboxEvent, PruneEventsResult } from './events.js'
+import type {
+  DeliveryAttempt,
+  DeliveryAttemptQuery,
+  NewDeliveryAttempt,
+  Rewind,
+  RewindInput,
+  RewindQuery,
+} from './delivery.js'
 
 export interface MovementQuery {
   readonly tenantId: string
@@ -165,6 +173,14 @@ export interface StoreReader extends JournalReader {
   listValuations(query: ValuationQuery): Promise<MovementValuation[]>
   /** Highest event sequence intentionally removed for this tenant, or zero. */
   getEventsPrunedThrough(tenantId: string): Promise<number>
+  /** Highest event sequence written for this tenant, or zero. */
+  getLatestEventSeq(tenantId: string): Promise<number>
+  /** Delivery attempts, newest first. A separate, prunable table; the event log is untouched. */
+  listDeliveryAttempts(query: DeliveryAttemptQuery): Promise<DeliveryAttempt[]>
+  /** Every consumer with an outbox cursor, attempt or rewind in this tenant. */
+  listDeliveryConsumers(tenantId: string): Promise<string[]>
+  /** Rewind audit records, newest first. */
+  listRewinds(query: RewindQuery): Promise<Rewind[]>
 }
 
 /**
@@ -211,6 +227,16 @@ export interface StoreTx extends StoreReader, JournalTx {
   ): Promise<Movement>
 
   setCursor(key: CursorKey, value: string): Promise<void>
+
+  /** Append one delivery attempt, then enforce the per-consumer retention bound. */
+  recordDeliveryAttempt(attempt: NewDeliveryAttempt): Promise<DeliveryAttempt>
+
+  /**
+   * Compare-and-set the consumer's position, recording the rewind in the same
+   * transaction. Returns null when the observed position differs from
+   * `expectedSeq`; the caller must retry with the current position.
+   */
+  rewindConsumer(input: RewindInput): Promise<Rewind | null>
 
   /** Prune an eligible old prefix and record its high-water mark atomically. */
   pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult>
@@ -290,6 +316,7 @@ export interface Store extends StoreReader {
   exportListBatches(tenantId: string): Promise<readonly ExportBatch[]>
   exportGetMark(tenantId: string, destination: string): Promise<string | null>
   exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void>
+  exportListBatches(tenantId: string): Promise<readonly ExportBatch[]>
   accrualGetMode(tenantId: string): Promise<boolean>
   postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
 }

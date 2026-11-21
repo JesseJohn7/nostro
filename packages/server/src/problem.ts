@@ -14,6 +14,8 @@ export type ProblemCode =
   | 'muxed_id_taken'
   | 'expectation_conflict'
   | 'event_history_pruned'
+  | 'consumer_position_conflict'
+  | 'invalid_replay'
   | 'internal'
 
 export interface Problem {

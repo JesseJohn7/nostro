@@ -4,7 +4,7 @@
  * node-postgres returns `numeric` and `bigint` as strings, which is what we
  * want: they become `bigint` here and never pass through `number`.
  */
-import type { Allocation, ExceptionRecord, Expectation, JournalEntry, JournalLine, Json, Memo, Movement, MovementValuation, OutboxEvent, AssetId } from '@nostro-labs/nostro'
+import type { Allocation, AssetId, DeliveryAttempt, ExceptionRecord, Expectation, JournalEntry, JournalLine, Json, Memo, Movement, MovementValuation, OutboxEvent, Rewind } from '@nostro-labs/nostro'
 import { Money, parseAsset } from '@nostro-labs/nostro'
 
 export interface MovementRow {
@@ -55,6 +55,60 @@ export function toEvent(r: EventRow): OutboxEvent {
     subjectId: r.subject_id,
     payload: JSON.parse(r.payload) as Json,
     createdAt: r.created_at,
+  })
+}
+
+export interface DeliveryAttemptRow {
+  seq: string
+  id: string
+  tenant_id: string
+  consumer: string
+  event_id: string
+  event_seq: string
+  attempt_at: Date
+  http_status: number | null
+  error: string | null
+  duration_ms: number
+  outcome: DeliveryAttempt['outcome']
+}
+
+export function toDeliveryAttempt(r: DeliveryAttemptRow): DeliveryAttempt {
+  return Object.freeze({
+    id: r.id,
+    seq: Number(r.seq),
+    tenantId: r.tenant_id,
+    consumer: r.consumer,
+    eventId: r.event_id,
+    eventSeq: Number(r.event_seq),
+    at: r.attempt_at,
+    httpStatus: r.http_status,
+    error: r.error,
+    durationMs: r.duration_ms,
+    outcome: r.outcome,
+  })
+}
+
+export interface RewindRow {
+  seq: string
+  id: string
+  tenant_id: string
+  consumer: string
+  from_seq: string
+  to_seq: string
+  actor: string
+  at: Date
+}
+
+export function toRewind(r: RewindRow): Rewind {
+  return Object.freeze({
+    id: r.id,
+    seq: Number(r.seq),
+    tenantId: r.tenant_id,
+    consumer: r.consumer,
+    fromSeq: Number(r.from_seq),
+    toSeq: Number(r.to_seq),
+    actor: r.actor,
+    at: r.at,
   })
 }
 

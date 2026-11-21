@@ -140,7 +140,7 @@ describe('nostro migrate', () => {
     setVersion(join(cwd, 'nostro.db'), 99)
     const { code, stderr } = await nostro(cwd, ['migrate'])
     expect(code).toBe(1)
-    expect(stderr).toMatch(/schema version 99, newer than this nostro understands \(\d+\)\. Upgrade @nostro-labs\/cli; nothing was changed/)
+    expect(stderr).toMatch(new RegExp(`schema version 99, newer than this nostro understands \\(${SQLITE_MIGRATIONS.length}\\)\\. Upgrade @nostro-labs/cli; nothing was changed`))
   })
 
   it('refuses an in-memory database, which would vanish when it exits', async () => {

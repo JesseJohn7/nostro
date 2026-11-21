@@ -20,6 +20,8 @@ import type {
   Allocation,
   AllocationQuery,
   CursorKey,
+  DeliveryAttempt,
+  DeliveryAttemptQuery,
   Disposition,
   Direction,
   EventQuery,
@@ -42,8 +44,12 @@ import type {
   NewExpectation,
   NewJournalEntry,
   NewMovement,
+  NewDeliveryAttempt,
   NewOutboxEvent,
   OutboxEvent,
+  Rewind,
+  RewindInput,
+  RewindQuery,
   PruneEventsResult,
   RefundLink,
   RefundQuery,
@@ -69,6 +75,9 @@ import {
   assertValidNewExpectation,
   assertValidNewJournalEntry,
   assertValidNewMovement,
+  DELIVERY_ATTEMPT_LIMIT,
+  DELIVERY_ATTEMPT_TTL_MS,
+  eventCursorKey,
   amendExpectationRecord,
   checkAllocation,
   checkCancel,
@@ -88,6 +97,7 @@ import {
 } from '@nostro-labs/nostro'
 import type {
   AllocationRow,
+  DeliveryAttemptRow,
   EventRow,
   ExceptionRow,
   ExpectationRow,
@@ -95,8 +105,9 @@ import type {
   JournalLineRow,
   MovementRow,
   MovementValuationRow,
+  RewindRow,
 } from './rows.js'
-import { memoColumns, toAllocation, toEvent, toException, toExpectation, toJournalEntry, toMovement, toValuation } from './rows.js'
+import { memoColumns, toAllocation, toDeliveryAttempt, toEvent, toException, toExpectation, toJournalEntry, toMovement, toRewind, toValuation } from './rows.js'
 import { MIGRATIONS, quoteSchema } from './schema.js'
 
 export interface PostgresStoreOptions {
@@ -285,6 +296,50 @@ class PgReader implements StoreReader {
     return Number(row?.seq ?? 0)
   }
 
+  async getLatestEventSeq(tenantId: string): Promise<number> {
+    const [row] = await this.run<{ seq: string | number | null }>(
+      `SELECT max(seq) AS seq FROM ${this.s}.events WHERE tenant_id = $1`,
+      [tenantId],
+    )
+    return Number(row?.seq ?? 0)
+  }
+
+  async listDeliveryAttempts(q: DeliveryAttemptQuery): Promise<DeliveryAttempt[]> {
+    const w = new Where()
+      .add((p) => `tenant_id = ${p}`, q.tenantId)
+      .add((p) => `consumer = ${p}`, q.consumer)
+      .add((p) => `outcome = ${p}`, q.outcome)
+      .add((p) => `seq < ${p}`, q.beforeSeq)
+    const rows = await this.run<DeliveryAttemptRow>(
+      `SELECT * FROM ${this.s}.webhook_delivery_attempts${w} ORDER BY seq DESC${w.limit(q.limit)}`,
+      w.params,
+    )
+    return rows.map(toDeliveryAttempt)
+  }
+
+  async listDeliveryConsumers(tenantId: string): Promise<string[]> {
+    const rows = await this.run<{ account: string }>(
+      `SELECT account FROM ${this.s}.cursors
+         WHERE tenant_id = $1 AND network = 'nostro' AND source = 'outbox' AND value IS NOT NULL
+       UNION
+       SELECT DISTINCT consumer AS account FROM ${this.s}.webhook_delivery_attempts WHERE tenant_id = $2
+       UNION
+       SELECT DISTINCT consumer AS account FROM ${this.s}.webhook_rewinds WHERE tenant_id = $3
+       ORDER BY account`,
+      [tenantId, tenantId, tenantId],
+    )
+    return rows.map((r) => r.account)
+  }
+
+  async listRewinds(q: RewindQuery): Promise<Rewind[]> {
+    const w = new Where().add((p) => `tenant_id = ${p}`, q.tenantId).add((p) => `consumer = ${p}`, q.consumer)
+    const rows = await this.run<RewindRow>(
+      `SELECT * FROM ${this.s}.webhook_rewinds${w} ORDER BY seq DESC${w.limit(q.limit ?? DELIVERY_ATTEMPT_LIMIT)}`,
+      w.params,
+    )
+    return rows.map(toRewind)
+  }
+
   async getCursor(k: CursorKey): Promise<string | null> {
     const [row] = await this.run<{ value: string | null }>(
       `SELECT value FROM ${this.s}.cursors WHERE tenant_id = $1 AND network = $2 AND source = $3 AND account = $4`,
@@ -471,6 +526,39 @@ class PgTx extends PgReader implements StoreTx {
        ON CONFLICT (tenant_id, network, source, account) DO UPDATE SET value = EXCLUDED.value`,
       [k.tenantId, k.network, k.source, k.account, value],
     )
+  }
+
+  async recordDeliveryAttempt(attempt: NewDeliveryAttempt): Promise<DeliveryAttempt> {
+    const [row] = await this.run<DeliveryAttemptRow>(
+      `INSERT INTO ${this.s}.webhook_delivery_attempts
+         (id, tenant_id, consumer, event_id, event_seq, attempt_at, http_status, error, duration_ms, outcome)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+      [this.ids(), attempt.tenantId, attempt.consumer, attempt.eventId, attempt.eventSeq, attempt.at, attempt.httpStatus, attempt.error, attempt.durationMs, attempt.outcome],
+    )
+    await this.run(
+      `DELETE FROM ${this.s}.webhook_delivery_attempts
+         WHERE tenant_id = $1 AND consumer = $2 AND (
+           seq < (SELECT seq FROM ${this.s}.webhook_delivery_attempts
+                  WHERE tenant_id = $3 AND consumer = $4
+                  ORDER BY seq DESC LIMIT 1 OFFSET $5)
+           OR attempt_at < $6
+         )`,
+      [attempt.tenantId, attempt.consumer, attempt.tenantId, attempt.consumer, DELIVERY_ATTEMPT_LIMIT - 1, new Date(attempt.at.getTime() - DELIVERY_ATTEMPT_TTL_MS)],
+    )
+    return toDeliveryAttempt(row!)
+  }
+
+  async rewindConsumer(input: RewindInput): Promise<Rewind | null> {
+    const key = eventCursorKey(input.tenantId, input.consumer)
+    const current = await this.getCursor(key)
+    if ((current === null ? 0 : Number(current)) !== input.expectedSeq) return null
+    await this.setCursor(key, String(input.toSeq))
+    const [row] = await this.run<RewindRow>(
+      `INSERT INTO ${this.s}.webhook_rewinds (id, tenant_id, consumer, from_seq, to_seq, actor, at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+      [this.ids(), input.tenantId, input.consumer, input.expectedSeq, input.toSeq, input.actor, input.at],
+    )
+    return toRewind(row!)
   }
 
   async pruneEventsBefore(tenantId: string, olderThan: Date): Promise<PruneEventsResult> {
@@ -999,7 +1087,6 @@ export class PostgresStore extends PgReader implements MigratableStore {
       [tenantId, destination, lastSeq],
     )
   }
-
 
 
   async postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void> {

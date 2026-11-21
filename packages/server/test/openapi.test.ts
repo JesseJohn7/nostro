@@ -126,6 +126,12 @@ describe('the OpenAPI document', () => {
     await call('GET', `/v1/expectations/${expectations.data[0].id}`, '/v1/expectations/{id}')
     await call('GET', '/v1/exceptions?status=open', '/v1/exceptions')
     expect((await call('GET', '/v1/events', '/v1/events')).json().data.length).toBeGreaterThan(0)
+    await call('GET', '/v1/webhooks', '/v1/webhooks')
+    await call('GET', '/v1/webhooks/webhook/status', '/v1/webhooks/{consumer}/status')
+    await call('GET', '/v1/webhooks/webhook/attempts', '/v1/webhooks/{consumer}/attempts')
+    expect((await call('POST', '/v1/webhooks/webhook/replay', '/v1/webhooks/{consumer}/replay', {
+      expectedSeq: 0, toSeq: 0, actor: 'ops',
+    })).statusCode).toBe(422)
     await call('GET', '/v1/journal?limit=1', '/v1/journal')
     const created = await call('POST', '/v1/expectations', '/v1/expectations', {
       reference: 'INV-9', account: A, amount: '3', payers: [B], dueAt: '2026-11-01T00:00:00Z', metadata: { po: '1' },
