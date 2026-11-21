@@ -205,6 +205,7 @@ const toExpectation = (r: Row): Expectation =>
     status: r.status as Expectation['status'],
     cancelReason: r.cancel_reason as string | null,
     metadata: Object.freeze(JSON.parse(r.metadata as string) as Record<string, string>),
+    fingerprintSuffix: r.fingerprint_suffix == null ? null : BigInt(r.fingerprint_suffix as string),
     createdAt: date(r.created_at)!,
     updatedAt: date(r.updated_at)!,
   })
@@ -835,6 +836,20 @@ class SqliteTx extends SqliteReader implements StoreTx {
         throw new ConstraintError('expectation_muxed_id_unique', `muxed id ${muxedId.toString()} is already used on account ${n.account}`)
       }
     }
+    // Resolve fingerprintSuffix: 'allocate' picks the lowest free value.
+    let fingerprintSuffix: bigint | null = null
+    if (n.fingerprintSuffix === 'allocate') {
+      const rows = this.all(
+        "SELECT fingerprint_suffix FROM expectations WHERE tenant_id = ? AND account = ? AND asset = ? AND status = 'open' AND fingerprint_suffix IS NOT NULL ORDER BY CAST(fingerprint_suffix AS INTEGER)",
+        [n.tenantId, n.account, n.amount.asset],
+      ) as Row[]
+      const taken = new Set(rows.map((r) => BigInt(r.fingerprint_suffix as string)))
+      let candidate = 1n
+      while (taken.has(candidate)) candidate++
+      fingerprintSuffix = candidate
+    } else if (n.fingerprintSuffix != null) {
+      fingerprintSuffix = n.fingerprintSuffix
+    }
     const [memoType, memoValue, memoText] = memoColumns(n.memo)
     const now = this.now().getTime()
     const id = this.ids()
@@ -842,8 +857,8 @@ class SqliteTx extends SqliteReader implements StoreTx {
       `INSERT INTO expectations (
          id, tenant_id, reference, account, direction, asset, decimals, amount, muxed_id,
          memo_type, memo_value, memo_text, payers, due_at, expires_at, status, metadata,
-         created_at, updated_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+         fingerprint_suffix, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, ?)
        RETURNING *`,
       [
         id,
@@ -862,6 +877,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
         ms(n.dueAt),
         ms(n.expiresAt),
         JSON.stringify(n.metadata ?? {}),
+        fingerprintSuffix == null ? null : fingerprintSuffix.toString(),
         now,
         now,
       ],

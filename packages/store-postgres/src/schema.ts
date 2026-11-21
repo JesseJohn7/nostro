@@ -493,4 +493,18 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
     );
     CREATE INDEX IF NOT EXISTS webhook_rewinds_consumer ON ${s}.webhook_rewinds (tenant_id, consumer, seq DESC);
   `,
+
+  // 14: amount fingerprints. A nullable sub-unit suffix that makes the
+  // invoiced amount unique per open expectation on a (account, asset) pair.
+  // The partial unique index (WHERE status = 'open') enforces uniqueness only
+  // while the expectation is live; settled, cancelled and expired rows keep
+  // their suffix for the audit trail without blocking reuse.
+  (s) => `
+    ALTER TABLE ${s}.expectations
+      ADD COLUMN IF NOT EXISTS fingerprint_suffix numeric(40, 0)
+        CHECK (fingerprint_suffix > 0);
+    CREATE UNIQUE INDEX IF NOT EXISTS expectations_fingerprint
+      ON ${s}.expectations (tenant_id, account, asset, fingerprint_suffix)
+      WHERE status = 'open' AND fingerprint_suffix IS NOT NULL;
+  `,
 ]

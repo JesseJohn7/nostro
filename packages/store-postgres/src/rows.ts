@@ -132,6 +132,7 @@ export interface ExpectationRow {
   status: Expectation['status']
   cancel_reason: string | null
   metadata: Record<string, string>
+  fingerprint_suffix: string | null
   created_at: Date
   updated_at: Date
 }
@@ -235,6 +236,7 @@ export function toExpectation(r: ExpectationRow): Expectation {
     status: r.status,
     cancelReason: r.cancel_reason,
     metadata: Object.freeze({ ...r.metadata }),
+    fingerprintSuffix: r.fingerprint_suffix === null ? null : BigInt(r.fingerprint_suffix),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   })

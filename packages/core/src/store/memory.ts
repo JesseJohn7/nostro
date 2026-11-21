@@ -724,6 +724,34 @@ class MemoryTx extends MemoryReader implements StoreTx {
         }
       }
     }
+    // Resolve fingerprintSuffix under the transaction's draft state.
+    let fingerprintSuffix: bigint | null = null
+    if (n.fingerprintSuffix === 'allocate') {
+      const taken = new Set<bigint>()
+      for (const e of this.draft.expectations.values()) {
+        if (e.tenantId === n.tenantId && e.account === n.account &&
+            e.amount.asset === n.amount.asset && e.status === 'open' &&
+            e.fingerprintSuffix !== null) {
+          taken.add(e.fingerprintSuffix)
+        }
+      }
+      let candidate = 1n
+      while (taken.has(candidate)) candidate++
+      fingerprintSuffix = candidate
+    } else if (n.fingerprintSuffix != null) {
+      // Check uniqueness among open expectations on the same (account, asset).
+      for (const e of this.draft.expectations.values()) {
+        if (e.tenantId === n.tenantId && e.account === n.account &&
+            e.amount.asset === n.amount.asset && e.status === 'open' &&
+            e.fingerprintSuffix === n.fingerprintSuffix) {
+          throw new ConstraintError(
+            'expectation_fingerprint_unique',
+            `fingerprint suffix ${n.fingerprintSuffix.toString()} is already in use on account ${n.account} / asset ${n.amount.asset}`,
+          )
+        }
+      }
+      fingerprintSuffix = n.fingerprintSuffix
+    }
     const now = this.now()
     const expectation: Expectation = Object.freeze({
       id: this.ids(),
@@ -741,6 +769,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       status: 'open',
       cancelReason: null,
       metadata: Object.freeze({ ...(n.metadata ?? {}) }),
+      fingerprintSuffix,
       createdAt: now,
       updatedAt: now,
     })

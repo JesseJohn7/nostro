@@ -154,6 +154,15 @@ export interface Expectation {
   readonly status: ExpectationStatus
   readonly cancelReason: string | null
   readonly metadata: Readonly<Record<string, string>>
+  /**
+   * A sub-unit suffix appended to the invoice amount so payers who cannot
+   * send a memo can be identified by the exact amount they send. For example,
+   * an invoice for 25 USDC with a suffix of 137 (at 7 decimals) is invoiced
+   * as 25.0000137. The suffix is unique per open expectation on the same
+   * (account, asset) pair; the store enforces uniqueness with a partial index.
+   * Null for expectations created without a fingerprint.
+   */
+  readonly fingerprintSuffix: bigint | null
   readonly createdAt: Date
   readonly updatedAt: Date
 }
@@ -170,6 +179,13 @@ export interface NewExpectation {
   readonly dueAt?: Date | null
   readonly expiresAt?: Date | null
   readonly metadata?: Readonly<Record<string, string>>
+  /**
+   * A unique sub-unit suffix that makes the invoiced amount a fingerprint.
+   * Pass a positive bigint to use a specific suffix, or `'allocate'` to let
+   * the store pick the lowest free value among open expectations on the same
+   * (account, asset) pair. `null` / omitted means no fingerprint.
+   */
+  readonly fingerprintSuffix?: bigint | 'allocate' | null
 }
 
 export interface ExpectationChanges {
@@ -180,6 +196,7 @@ export interface ExpectationChanges {
   readonly dueAt?: Date | null
   readonly expiresAt?: Date | null
   readonly metadata?: Readonly<Record<string, string>>
+  readonly fingerprintSuffix?: bigint | null
 }
 
 export interface Allocation {

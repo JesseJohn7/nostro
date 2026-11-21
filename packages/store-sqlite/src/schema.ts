@@ -514,4 +514,39 @@ PRIMARY KEY (tenant_id, destination)
     );
     CREATE INDEX IF NOT EXISTS webhook_rewinds_consumer ON webhook_rewinds (tenant_id, consumer, seq DESC);
   `,
+
+  // 15: amount fingerprints. A nullable positive-integer suffix stored as
+  // decimal text. SQLite has no partial unique index with a WHERE clause on a
+  // non-indexed column, so uniqueness among open expectations is enforced by
+  // triggers that fire on INSERT and on the status UPDATE that opens a new row.
+  `
+    ALTER TABLE expectations ADD COLUMN fingerprint_suffix TEXT;
+    CREATE TRIGGER expectations_fingerprint_insert
+      BEFORE INSERT ON expectations
+      WHEN NEW.fingerprint_suffix IS NOT NULL AND NEW.status = 'open'
+        AND EXISTS (
+          SELECT 1 FROM expectations
+          WHERE tenant_id = NEW.tenant_id
+            AND account = NEW.account
+            AND asset = NEW.asset
+            AND fingerprint_suffix = NEW.fingerprint_suffix
+            AND status = 'open'
+        )
+      BEGIN SELECT RAISE(ABORT, 'fingerprint_suffix already in use on this account/asset'); END;
+    CREATE TRIGGER expectations_fingerprint_update
+      BEFORE UPDATE ON expectations
+      WHEN NEW.fingerprint_suffix IS NOT NULL AND NEW.status = 'open'
+        AND (NEW.fingerprint_suffix IS NOT OLD.fingerprint_suffix
+             OR NEW.status IS NOT OLD.status)
+        AND EXISTS (
+          SELECT 1 FROM expectations
+          WHERE tenant_id = NEW.tenant_id
+            AND account = NEW.account
+            AND asset = NEW.asset
+            AND fingerprint_suffix = NEW.fingerprint_suffix
+            AND status = 'open'
+            AND id <> NEW.id
+        )
+      BEGIN SELECT RAISE(ABORT, 'fingerprint_suffix already in use on this account/asset'); END;
+  `,
 ]
