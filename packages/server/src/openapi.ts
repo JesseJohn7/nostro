@@ -4,6 +4,7 @@
  */
 import { readFileSync } from 'node:fs'
 import { components, expectationBody, postJournalBody, query, ref, replayBody, resolveBody } from './schemas.js'
+import { ROUTE_SCOPES } from './scopes.js'
 
 /** This package's version, which is the API's. */
 const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version
@@ -21,6 +22,7 @@ const ok = (schemaName: string, description = 'OK') => ({
 const errors = {
   '400': problem('The request was malformed: an unknown or invalid parameter or field (`invalid_request`).'),
   '401': problem('No valid API key (`unauthorized`).'),
+  '403': problem('The API key lacks the scope this operation needs (`forbidden`).'),
   '500': problem('Something failed inside the server (`internal`); the detail says nothing more.'),
 }
 
@@ -32,8 +34,24 @@ function parameters(schema: { properties: Record<string, object> }) {
 const idParam = (what: string) => ({ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: `The ${what}'s id.` })
 const consumerParam = { name: 'consumer', in: 'path', required: true, schema: { type: 'string' }, description: 'The webhook consumer name.' }
 
+/**
+ * Each operation lists the scope it needs under the bearer scheme (OpenAPI 3.1
+ * allows role names on a non-OAuth security requirement). Taken from the same
+ * table the server enforces, so the document cannot drift from it.
+ */
+function withScopes<T extends { paths: Record<string, Record<string, object>> }>(doc: T): T {
+  for (const [path, methods] of Object.entries(doc.paths)) {
+    for (const [method, op] of Object.entries(methods)) {
+      const scope = ROUTE_SCOPES[`${method.toUpperCase()} ${path.replace(/\{(\w+)\}/g, ':$1')}`]
+      if (scope === undefined) continue
+      ;(op as { security?: unknown }).security = [{ apiKey: [scope] }]
+    }
+  }
+  return doc
+}
+
 export function buildOpenApi() {
-  return {
+  const doc = {
     openapi: '3.1.0',
     info: {
       title: 'nostro',
@@ -469,4 +487,5 @@ export function buildOpenApi() {
       },
     },
   }
+  return withScopes(doc)
 }

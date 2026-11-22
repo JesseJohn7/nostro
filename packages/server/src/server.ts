@@ -44,7 +44,8 @@ import {
   rewindJson,
   trialBalance,
 } from '@nostro-labs/nostro'
-import type { Authenticate } from './auth.js'
+import type { Authenticate, Principal } from './auth.js'
+import { ROUTE_SCOPES } from './scopes.js'
 import { buildOpenApi } from './openapi.js'
 import { HttpProblem } from './problem.js'
 import { UINT64, amendExpectationBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, replayBody, resolveBody } from './schemas.js'
@@ -53,6 +54,8 @@ declare module 'fastify' {
   interface FastifyRequest {
     /** Set from the API key before any `/v1` handler runs. */
     tenantId: string
+    /** The key's principal (tenant, scopes, key id); set before any `/v1` handler runs. */
+    principal: Principal | undefined
   }
 }
 
@@ -182,6 +185,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
     ajv: { customOptions: { removeAdditional: false } },
   })
   app.decorateRequest('tenantId', '')
+  app.decorateRequest('principal', undefined)
 
   app.setErrorHandler((err: FastifyError, request, reply) => {
     let problem: HttpProblem
@@ -224,9 +228,15 @@ export function createServer(options: ServerOptions): FastifyInstance {
       v1.addHook('onRequest', async (request) => {
         const header = request.headers.authorization
         const token = header?.startsWith('Bearer ') ? header.slice('Bearer '.length).trim() : ''
-        const tenantId = token === '' ? null : await authenticate(token)
-        if (tenantId === null) throw new HttpProblem(401, 'unauthorized', 'Send Authorization: Bearer <API key>.')
-        request.tenantId = tenantId
+        const principal = token === '' ? null : await authenticate(token)
+        if (principal === null) throw new HttpProblem(401, 'unauthorized', 'Send Authorization: Bearer <API key>.')
+        // Fail closed: a route with no declared scope is refused, not opened.
+        const needed = ROUTE_SCOPES[`${request.method} ${request.routeOptions.url}`]
+        if (needed === undefined || !principal.scopes.has(needed)) {
+          throw new HttpProblem(403, 'forbidden', `This API key lacks the "${needed ?? 'required'}" scope for this route.`)
+        }
+        request.principal = principal
+        request.tenantId = principal.tenantId
       })
 
       v1.get<{ Querystring: Paging & { disposition?: Disposition; account?: string } }>(

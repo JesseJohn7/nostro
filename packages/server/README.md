@@ -40,13 +40,19 @@ await app.listen({ port: 8080 })
 - **Authentication.** `Authorization: Bearer <key>`. The key decides the tenant, so a caller can never
   ask for another tenant's records. `apiKeys()` keeps only SHA-256 digests of the keys, compares in
   constant time, and refuses keys shorter than 32 characters (`openssl rand -hex 32`).
+- **Scopes.** Each key carries scopes, and each route needs one: `read` (every GET except the ones
+  below), `events` (`GET /v1/events`), `webhooks` (consumer status, attempts and replay),
+  `expectations` (create, cancel, amend), `exceptions` (resolve) and `journal` (post, move, chart).
+  A key without the route's scope gets `403 forbidden`. The OpenAPI document names each operation's
+  scope under the bearer scheme. `apiKeys({ key: { tenant, scopes: ['read'] } })` narrows a key; a
+  bare tenant string keeps every scope, as keys did before scopes existed.
 - **Paging.** Lists return `{ "data": [...], "next": <seq> | null }`; pass `next` back as `?after=`.
   `?limit=` is 1 to 500 (default 100).
 - **Amounts** are exact decimal strings beside their asset (`"amount": "25.0000000", "asset":
   "native"`), never JSON numbers, in both directions: a request body containing any number is
   refused, because by the time it is parsed it may already have been rounded.
 - **Errors** are RFC 9457 problem details (`application/problem+json`) with a stable `code`:
-  `unauthorized`, `invalid_request` (400), `not_found`, `reference_taken` (409),
+  `unauthorized` (401), `forbidden` (403), `invalid_request` (400), `not_found`, `reference_taken` (409),
   `invalid_expectation` (422, e.g. an amount with more decimals than the asset has),
   `invalid_resolution` (422), `resolution_refused` (409, the rules refuse it),
   `consumer_position_conflict` (409), `invalid_replay` (422), `event_history_pruned` (410),

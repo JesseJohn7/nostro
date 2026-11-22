@@ -5,6 +5,7 @@
 
 export type ProblemCode =
   | 'unauthorized'
+  | 'forbidden'
   | 'invalid_request'
   | 'invalid_expectation'
   | 'invalid_resolution'
@@ -29,6 +30,7 @@ export interface Problem {
 const TITLES: Readonly<Record<number, string>> = {
   400: 'Bad Request',
   401: 'Unauthorized',
+  403: 'Forbidden',
   404: 'Not Found',
   409: 'Conflict',
   410: 'Gone',

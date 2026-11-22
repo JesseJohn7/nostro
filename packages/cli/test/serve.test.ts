@@ -134,12 +134,39 @@ describe('nostro serve', () => {
     expect(await server.stop()).toBe(0)
   })
 
+  it('reads scoped keys, keeps legacy keys whole, and warns about unscoped ones without printing them', async () => {
+    const cwd = await migrated()
+    const READ = 'r'.repeat(40)
+    const LEGACY = `legacy-${'l'.repeat(40)}`
+    const scopedEnv = { NOSTRO_API_KEYS: `acme[read,events]:${READ},acme:${LEGACY}` }
+    const server = await start(cwd, [], { env: scopedEnv })
+    const as = (key: string, path: string) => fetch(`${server.address}${path}`, { headers: { authorization: `Bearer ${key}` } })
+    expect((await as(READ, '/v1/movements')).status).toBe(200)
+    expect((await as(READ, '/v1/events')).status).toBe(200)
+    expect((await as(READ, '/v1/expectations/none/cancel')).status).toBe(404)
+    const refused = await fetch(`${server.address}/v1/journal`, { method: 'POST', headers: { authorization: `Bearer ${READ}`, 'content-type': 'application/json' }, body: '{}' })
+    expect(refused.status).toBe(403)
+    expect((await as(LEGACY, '/v1/events')).status).toBe(200)
+    expect(server.out.stderr).toContain('API key #2 (tenant acme) has no scopes')
+    expect(server.out.stderr).not.toContain(LEGACY)
+    expect(server.out.stdout + server.out.stderr).not.toContain(READ)
+    expect(await server.stop()).toBe(0)
+  })
+
+  it('refuses a scoped key entry it cannot read', async () => {
+    const cwd = await migrated()
+    const KEY_ = 'x'.repeat(40)
+    expect((await nostro(cwd, ['serve'], { env: { NOSTRO_API_KEYS: `acme[read,admin]:${KEY_}` } })).stderr).toContain('Unknown scope admin')
+    expect((await nostro(cwd, ['serve'], { env: { NOSTRO_API_KEYS: `ac me[read]:${KEY_}` } })).stderr).toContain('Scoped API keys are tenant[scope,...]:key')
+    expect((await nostro(cwd, ['serve'], { env: { NOSTRO_API_KEYS: `acme[]:${KEY_}` } })).stderr).toContain('Unknown scope')
+  })
+
   it('refuses to start without usable keys, a usable port, or an up-to-date database', async () => {
     const cwd = await migrated()
     const run = (argv: string[], e: Record<string, string> = env) => nostro(cwd, ['serve', ...argv], { env: e })
     expect(await run([], {})).toMatchObject({ code: 2 })
     expect((await run([], {})).stderr).toContain('serve needs API keys')
-    expect((await run([], { NOSTRO_API_KEYS: KEY })).stderr).toContain('Each API key is tenant:key.')
+    expect((await run([], { NOSTRO_API_KEYS: KEY })).stderr).toContain('Each API key is tenant:key, or tenant[scope,...]:key.')
     expect(await run([], { NOSTRO_API_KEYS: 'acme:short' })).toMatchObject({ code: 1, stderr: 'nostro: API keys must be at least 32 characters.\n' })
     expect((await run(['--keys-file', 'missing'])).stderr).toContain('Cannot read --keys-file')
     expect((await run(['--port', '70000'])).code).toBe(2)

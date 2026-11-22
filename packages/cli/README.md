@@ -34,7 +34,10 @@ nostro export --output journal.csv                   # the journal, a row per li
 | `serve` | Runs the HTTP API ([@nostro-labs/server](../server/README.md)). With `--account`s to watch, syncs and reconciles them every `--interval` seconds; with `--webhook-url`, delivers each decision there, signed ([docs/webhooks.md](../../docs/webhooks.md)). Stops cleanly on Ctrl-C or SIGTERM. |
 
 `serve` reads API keys as `tenant:key` pairs from `NOSTRO_API_KEYS` (comma-separated) or
-`--keys-file` (one per line), never from the command line, where `ps` would show them. It listens on
+`--keys-file` (one per line), never from the command line, where `ps` would show them. To narrow a key,
+write its scopes in brackets: `tenant[read,events]:key` (scopes: `read`, `events`, `webhooks`,
+`expectations`, `exceptions`, `journal`). A key written without brackets keeps every scope, and `serve`
+warns at startup about each such key by its number and tenant, never by its value. It listens on
 127.0.0.1:8080 unless told otherwise (`--host`, `--port`, or `NOSTRO_HOST`, `NOSTRO_PORT`). The
 worker syncs one tenant's accounts (`--tenant`); the API serves every tenant that has a key.
 

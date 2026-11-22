@@ -5,6 +5,13 @@ before 1.0, a minor version may change the API.
 
 ## Unreleased
 
+- **Breaking: API keys have scopes.** `apiKeys()` now returns a `Principal` (tenant, scopes and key
+  id) where it returned a tenant id, and `Authenticate` follows. A route the key lacks the scope for
+  answers `403 forbidden`, a new problem code. Keys written without scopes keep every scope, so
+  existing deployments keep working, but `serve` warns about each one at startup. To narrow a key,
+  write `tenant[read,events]:key` in `NOSTRO_API_KEYS` or `--keys-file`; brackets are only read
+  before the first colon, so existing keys, including keys that contain colons, parse as they did.
+  Tenant ids may not contain `[`, `]`, `:` or whitespace.
 - Webhook delivery is observable and replayable. Every POST is recorded in a bounded, prunable
   attempt log, and consumers can be listed and inspected before their first delivery round.
 - `GET /v1/webhooks`, `GET /v1/webhooks/{consumer}/status`,

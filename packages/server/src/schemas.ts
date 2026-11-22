@@ -270,6 +270,7 @@ const record = (properties: Record<string, object>) => ({
 
 const PROBLEM_CODES: readonly ProblemCode[] = [
   'unauthorized',
+  'forbidden',
   'invalid_request',
   'invalid_expectation',
   'invalid_resolution',

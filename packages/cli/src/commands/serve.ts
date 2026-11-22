@@ -4,7 +4,8 @@ import { resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import type { Store } from '@nostro-labs/nostro'
 import { MIN_WEBHOOK_SECRET_LENGTH, StreamWatcher, deliverWebhooks, sweepExpectations } from '@nostro-labs/nostro'
-import { apiKeys, createServer } from '@nostro-labs/server'
+import type { KeyGrant, Scope } from '@nostro-labs/server'
+import { SCOPES, apiKeys, createServer } from '@nostro-labs/server'
 import type { Args } from '../args.js'
 import { CliError, NETWORK, RATE_LIMIT, UsageError, accounts, database, flag, integer, network, positionals, rateLimit, string, strings, tenant } from '../args.js'
 import type { Command } from '../command.js'
@@ -14,12 +15,60 @@ import { clean, write } from '../io.js'
 import { assertCurrent, openStore, redact } from '../store.js'
 import { reconcileAll, syncAll } from '../work.js'
 
+/** Tenant ids cannot hold the characters the key syntax uses. */
+const TENANT_ID = /^[^[\]:\s]+$/
+
 /**
- * API keys as `tenant:key` pairs: comma-separated in NOSTRO_API_KEYS, or one
- * per line in --keys-file (blank lines and `#` comments skipped). Never on
- * the command line, where `ps` would show them.
+ * One API key entry: `tenant:key`, or `tenant[scope,scope]:key` to narrow it.
+ * The key is everything after the first colon, so keys may contain colons.
+ * A bracket counts only before that first colon, so `tenant:key` reads as
+ * it always did, with every scope.
  */
-function keys(args: Args, io: Io): Record<string, string> {
+function parseKeyEntry(entry: string): { key: string; tenant: string; scopes?: Scope[] } {
+  const colon = entry.indexOf(':')
+  if (colon < 1) throw new UsageError('Each API key is tenant:key, or tenant[scope,...]:key.')
+  const head = entry.slice(0, colon)
+  const key = entry.slice(colon + 1)
+  const open = head.indexOf('[')
+  if (open === -1) {
+    if (!TENANT_ID.test(head)) throw new UsageError(`Tenant ids cannot contain [ ] : or spaces: ${clean(head)}.`)
+    return { key, tenant: head }
+  }
+  const tenant = head.slice(0, open)
+  if (!TENANT_ID.test(tenant) || !head.endsWith(']')) throw new UsageError('Scoped API keys are tenant[scope,...]:key.')
+  const names = head.slice(open + 1, -1).split(',').map((n) => n.trim())
+  for (const name of names) {
+    if (!(SCOPES as readonly string[]).includes(name)) {
+      throw new UsageError(`Unknown scope ${clean(name)}; scopes are ${SCOPES.join(', ')}.`)
+    }
+  }
+  return { key, tenant, scopes: names as Scope[] }
+}
+
+/** Split NOSTRO_API_KEYS on commas that are not inside a tenant[scope,...] bracket. */
+function splitEntries(text: string): string[] {
+  const out: string[] = []
+  let depth = 0
+  let current = ''
+  for (const ch of text) {
+    if (ch === '[') depth++
+    else if (ch === ']') depth = Math.max(0, depth - 1)
+    if (ch === ',' && depth === 0) {
+      out.push(current.trim())
+      current = ''
+    } else current += ch
+  }
+  out.push(current.trim())
+  return out.filter((e) => e !== '')
+}
+
+/**
+ * API keys: comma-separated in NOSTRO_API_KEYS, or one per line in --keys-file
+ * (blank lines and `#` comments skipped). Never on the command line, where `ps`
+ * would show them. Keys written without scopes keep every scope, and their
+ * numbers are returned so serve can warn about them without printing a key.
+ */
+function keys(args: Args, io: Io): { grants: Record<string, KeyGrant>; unscoped: { n: number; tenant: string }[] } {
   const file = string(args, 'keys-file')
   let entries: string[]
   if (file !== undefined) {
@@ -31,18 +80,19 @@ function keys(args: Args, io: Io): Record<string, string> {
     }
     entries = text.split('\n').map((l) => l.trim()).filter((l) => l !== '' && !l.startsWith('#'))
   } else {
-    entries = (io.env.NOSTRO_API_KEYS ?? '').split(',').map((e) => e.trim()).filter((e) => e !== '')
+    entries = splitEntries(io.env.NOSTRO_API_KEYS ?? '')
   }
   if (entries.length === 0) {
     throw new UsageError('serve needs API keys: set NOSTRO_API_KEYS=tenant:key[,tenant:key...] or pass --keys-file.')
   }
-  const out: Record<string, string> = {}
-  for (const entry of entries) {
-    const at = entry.indexOf(':')
-    if (at < 1) throw new UsageError('Each API key is tenant:key.')
-    out[entry.slice(at + 1)] = entry.slice(0, at)
-  }
-  return out
+  const grants: Record<string, KeyGrant> = {}
+  const unscoped: { n: number; tenant: string }[] = []
+  entries.forEach((entry, i) => {
+    const parsed = parseKeyEntry(entry)
+    grants[parsed.key] = parsed.scopes === undefined ? parsed.tenant : { tenant: parsed.tenant, scopes: parsed.scopes }
+    if (parsed.scopes === undefined) unscoped.push({ n: i + 1, tenant: parsed.tenant })
+  })
+  return { grants, unscoped }
 }
 
 export const serve: Command = {
@@ -57,12 +107,14 @@ the round it is in.
 
 API keys decide the tenant each request may read. They come from NOSTRO_API_KEYS
 (tenant:key,tenant:key) or --keys-file (one tenant:key per line), never the command line. Each key
-must be at least 32 characters: openssl rand -hex 32.
+must be at least 32 characters: openssl rand -hex 32. A key can be narrowed to scopes:
+tenant[read,events]:key. Scopes: read, events, webhooks, expectations, exceptions, journal. A key
+without brackets keeps every scope, and serve warns about it at startup.
 
 Options:
   --port <n>          Port to listen on (env NOSTRO_PORT; default 8080; 0 picks a free one)
   --host <address>    Address to listen on (env NOSTRO_HOST; default 127.0.0.1; 0.0.0.0 in a container)
-  --keys-file <file>  API keys, one tenant:key per line
+  --keys-file <file>  API keys, one tenant:key (or tenant[scope,...]:key) per line
   --interval <s>      Seconds between rounds (default 30)
   --sse               Enable Horizon SSE stream to wake the sync loop early (off by default; ADR 0005)
   --webhook-url <url> Deliver events here (env NOSTRO_WEBHOOK_URL); the secret comes only from
@@ -94,9 +146,12 @@ SSE accelerator (--sse):
   async run(args, io) {
     positionals(args, 0)
     const tenantId = tenant(args, io)
+    let unscoped: { n: number; tenant: string }[] = []
     const authenticate = (() => {
       try {
-        return apiKeys(keys(args, io))
+        const parsed = keys(args, io)
+        unscoped = parsed.unscoped
+        return apiKeys(parsed.grants)
       } catch (err) {
         if (err instanceof UsageError) throw err
         throw new CliError((err as Error).message)
@@ -119,6 +174,12 @@ SSE accelerator (--sse):
     const { store } = opened
     try {
       await assertCurrent(opened)
+      for (const u of unscoped) {
+        await write(
+          io.stderr,
+          `Warning: API key #${u.n} (tenant ${clean(u.tenant)}) has no scopes and keeps every scope. Scope it as ${clean(u.tenant)}[read,...]:key.\n`,
+        )
+      }
       const app = createServer({ store, authenticate })
       await app.listen({ port, host })
       // Fastify reports one loopback address even when bound to every interface; say what was asked for.
