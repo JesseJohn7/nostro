@@ -8,8 +8,9 @@
  * - `expectations`: create, cancel and amend expectations.
  * - `exceptions`: resolve exceptions.
  * - `journal`: post manual journal entries, close and reopen periods, and move account balances.
+ * - `accounts`: start and stop watching an account. Reading the watch list needs `read`.
  */
-export const SCOPES = ['read', 'events', 'webhooks', 'expectations', 'exceptions', 'journal'] as const
+export const SCOPES = ['read', 'events', 'webhooks', 'expectations', 'exceptions', 'journal', 'accounts'] as const
 export type Scope = (typeof SCOPES)[number]
 
 /** `METHOD /v1/path` (Fastify's route path, `:param` form) to the scope it needs. Unlisted routes are refused. */
@@ -36,4 +37,7 @@ export const ROUTE_SCOPES: Readonly<Record<string, Scope>> = {
   'GET /v1/reports/balance-sheet': 'read',
   'GET /v1/reports/income': 'read',
   'POST /v1/chart/move': 'journal',
+  'GET /v1/accounts': 'read',
+  'POST /v1/accounts': 'accounts',
+  'DELETE /v1/accounts/:account': 'accounts',
 }

@@ -48,7 +48,7 @@ import type { Authenticate, Principal } from './auth.js'
 import { ROUTE_SCOPES } from './scopes.js'
 import { buildOpenApi } from './openapi.js'
 import { HttpProblem } from './problem.js'
-import { UINT64, amendExpectationBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, replayBody, resolveBody } from './schemas.js'
+import { UINT64, accountBody, accountParams, amendExpectationBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -81,6 +81,28 @@ function page<T extends { seq: number }, J>(rows: readonly T[], limit: number, j
 }
 
 const after = (q: Paging) => (q.after === undefined ? {} : { afterSeq: q.after })
+
+/** A watched account, with what its worker last did for it on each network and source. */
+function watchedAccountJson(
+  row: { account: string; source: string; addedAt: Date },
+  states: readonly { network: string; source: string; cursor: string | null; lastAttemptAt: Date; lastSuccessAt: Date | null; caughtUp: boolean; lastError: string | null; lastErrorAt: Date | null }[],
+) {
+  return {
+    account: row.account,
+    source: row.source,
+    addedAt: row.addedAt.toISOString(),
+    sync: states.map((s) => ({
+      network: s.network,
+      source: s.source,
+      cursor: s.cursor,
+      lastAttemptAt: s.lastAttemptAt.toISOString(),
+      lastSuccessAt: s.lastSuccessAt?.toISOString() ?? null,
+      caughtUp: s.caughtUp,
+      lastError: s.lastError,
+      lastErrorAt: s.lastErrorAt?.toISOString() ?? null,
+    })),
+  }
+}
 
 interface PostJournalBody {
   description: string
@@ -238,6 +260,48 @@ export function createServer(options: ServerOptions): FastifyInstance {
         request.principal = principal
         request.tenantId = principal.tenantId
       })
+
+      v1.get('/accounts', async ({ tenantId }) => {
+        const [watched, states] = await Promise.all([store.listWatchedAccounts(tenantId), store.listSyncState(tenantId)])
+        return {
+          data: watched.map((w) => watchedAccountJson(w, states.filter((s) => s.account === w.account))),
+        }
+      })
+
+      v1.post<{ Body: { account: string } }>('/accounts', { schema: { body: accountBody } }, async ({ tenantId, body }, reply) => {
+        const already = (await store.listWatchedAccounts(tenantId)).some((w) => w.account === body.account)
+        const row = await store.transaction((tx) =>
+          tx.addWatchedAccount({ tenantId, account: body.account, source: 'api', addedAt: new Date() }),
+        )
+        const json = watchedAccountJson(row, [])
+        if (already) return reply.code(200).send(json)
+        return reply.code(201).header('location', `/v1/accounts/${body.account}`).send(json)
+      })
+
+      v1.delete<{ Params: { account: string }; Querystring: { force?: boolean } }>(
+        '/accounts/:account',
+        { schema: { params: accountParams, querystring: removeAccountQuery } },
+        async (request, reply) => {
+          const { tenantId, params, query: q } = request
+          const watched = (await store.listWatchedAccounts(tenantId)).find((w) => w.account === params.account)
+          if (watched === undefined) throw new HttpProblem(404, 'not_found', `Account ${params.account} is not on the watch list.`)
+          if (watched.source === 'config') {
+            throw new HttpProblem(409, 'config_managed', `${params.account} comes from the service configuration; remove it there.`)
+          }
+          if (q.force !== true) {
+            const open = await store.listExpectations({ tenantId, account: params.account, status: ['open', 'partially_paid'], limit: 1 })
+            if (open.length > 0) {
+              throw new HttpProblem(
+                409,
+                'has_open_expectations',
+                `${params.account} has open expectations; pass force=true to stop watching it anyway. Its movements and expectations are kept.`,
+              )
+            }
+          }
+          await store.transaction((tx) => tx.removeWatchedAccount(tenantId, params.account))
+          return reply.code(204).send()
+        },
+      )
 
       v1.get<{ Querystring: Paging & { disposition?: Disposition; account?: string } }>(
         '/movements',

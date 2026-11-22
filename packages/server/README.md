@@ -32,6 +32,9 @@ await app.listen({ port: 8080 })
 | `GET /v1/journal` | `?from=`, `?to=` (ISO 8601, effective dates) |
 | `GET /v1/journal.csv` | the journal as CSV, streamed |
 | `GET /v1/events` | the event log ([docs/webhooks.md](../../docs/webhooks.md)), for clients that would rather poll than receive webhooks |
+| `GET /v1/accounts` | the watched accounts, each with its sync state per network and source: saved cursor, last attempt and success, whether caught up, and the last error |
+| `POST /v1/accounts` | `{ "account": "G..." }` starts syncing it on the next round; `201`, or `200` if already watched |
+| `DELETE /v1/accounts/{account}` | stops syncing it; its movements, expectations and cursor are kept. `409` `config_managed` for an account from the service configuration; `409` `has_open_expectations` unless `?force=true` |
 | `GET /v1/webhooks` | every webhook consumer, with position, lag and last outcomes |
 | `GET /v1/webhooks/{consumer}/status` | one consumer's position, lag, last attempt, success and failure |
 | `GET /v1/webhooks/{consumer}/attempts` | `?outcome=success\|failure`, `?limit=`, `?after=`; attempts, newest first |
@@ -45,7 +48,8 @@ await app.listen({ port: 8080 })
   A wrong key and a revoked key get the same `401`. `firstOf()` tries several of these in turn.
 - **Scopes.** Each key carries scopes, and each route needs one: `read` (every GET except the ones
   below), `events` (`GET /v1/events`), `webhooks` (consumer status, attempts and replay),
-  `expectations` (create, cancel, amend), `exceptions` (resolve) and `journal` (post, move, chart).
+  `expectations` (create, cancel, amend), `exceptions` (resolve), `journal` (post, move, chart) and
+  `accounts` (start and stop watching an account; reading the watch list needs `read`).
   A key without the route's scope gets `403 forbidden`. The OpenAPI document names each operation's
   scope under the bearer scheme. `apiKeys({ key: { tenant, scopes: ['read'] } })` narrows a key; a
   bare tenant string keeps every scope, as keys did before scopes existed.

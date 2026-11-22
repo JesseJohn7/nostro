@@ -38,7 +38,7 @@ nostro export --output journal.csv                   # the journal, a row per li
 `NOSTRO_API_KEYS` (comma-separated) or
 `--keys-file` (one per line), never from the command line, where `ps` would show them. To narrow a key,
 write its scopes in brackets: `tenant[read,events]:key` (scopes: `read`, `events`, `webhooks`,
-`expectations`, `exceptions`, `journal`). A key written without brackets keeps every scope, and `serve`
+`expectations`, `exceptions`, `journal`, `accounts`). A key written without brackets keeps every scope, and `serve`
 warns at startup about each such key by its number and tenant, never by its value. It listens on
 127.0.0.1:8080 unless told otherwise (`--host`, `--port`, or `NOSTRO_HOST`, `NOSTRO_PORT`). With
 `--config <file>` it serves several tenants, each with its own accounts, network and webhook; each

@@ -17,6 +17,7 @@ import type { Loop } from '../serve-loops.js'
 import { tenantPlans } from '../serve-tenants.js'
 import type { TenantPlan, Webhook } from '../serve-tenants.js'
 import { assertCurrent, openStore, redact } from '../store.js'
+import type { StreamProgress } from '../work.js'
 import { reconcileAll, syncAll } from '../work.js'
 
 /** Tenant ids cannot hold the characters the key syntax uses. */
@@ -104,7 +105,8 @@ export const serve: Command = {
 with --config, each tenant in the file has its own accounts, network and webhook; without it, the
 single-tenant flags describe one tenant (--tenant, --account, --webhook-url), as they always have.
 
-Each tenant runs two timers, so one never waits for the other: a sync round (sync and reconcile its
+Accounts come from the configuration and from the watch list in the store: POST /v1/accounts adds
+one, and it is synced on the next round. Each tenant runs two timers, so one never waits for the other: a sync round (sync and reconcile its
 accounts every --interval seconds, as "nostro sync" and "nostro reconcile" would) and a delivery
 round (its events to its webhook every --delivery-interval seconds, signed with that webhook's
 secret, docs/webhooks.md). A delivery round also runs right after a sync round that decided
@@ -279,6 +281,15 @@ async function runTenants(o: RunOptions): Promise<void> {
     return sources
   }
 
+  // The configured accounts seed the watch list; accounts added over the API join it on the next round.
+  for (const plan of o.plans) {
+    await store.transaction(async (tx) => {
+      for (const account of plan.accounts) {
+        await tx.addWatchedAccount({ tenantId: plan.id, account, source: 'config', addedAt: new Date() })
+      }
+    })
+  }
+
   const loops: Loop[] = []
   const watchers: StreamWatcher[] = []
   for (const plan of o.plans) {
@@ -309,7 +320,7 @@ async function runTenants(o: RunOptions): Promise<void> {
           if (plan.network === null) {
             await sweepExpectations({ store, tenantId: id })
           } else {
-            await syncRound(store, plan, sourcesFor(plan.network), io)
+            await syncRound(store, plan, plan.network, sourcesFor(plan.network), io)
           }
           // New events are delivered now, not at the next delivery round.
           delivery?.wake()
@@ -352,10 +363,15 @@ async function waitUpTo(promise: Promise<unknown>, seconds: number): Promise<boo
   return result
 }
 
-/** One sync and reconcile round for a tenant's accounts, reporting each stream's failures. */
-async function syncRound(store: Store, plan: TenantPlan, sources: readonly MovementSource[], io: Io): Promise<void> {
+/**
+ * One sync and reconcile round for a tenant's watched accounts, reporting each
+ * stream's failures. What each pull did is recorded, so the API can show it.
+ */
+async function syncRound(store: Store, plan: TenantPlan, net: Network, sources: readonly MovementSource[], io: Io): Promise<void> {
   const id = plan.id
-  const streams = await syncAll({ store, tenantId: id, accounts: plan.accounts, sources: [...sources] })
+  const accounts = (await store.listWatchedAccounts(id)).map((w) => w.account)
+  const streams = accounts.length === 0 ? [] : await syncAll({ store, tenantId: id, accounts, sources: [...sources] })
+  if (streams.length > 0) await recordSync(store, id, net, streams)
   const totals = await reconcileAll(store, id, 100)
   const inserted = streams.reduce((n, s) => n + s.inserted, 0)
   if (inserted > 0 || totals.decided > 0) {
@@ -365,6 +381,31 @@ async function syncRound(store: Store, plan: TenantPlan, sources: readonly Movem
     if (s.error !== null) await line(io.stderr, id, `${s.source} ${s.account}: ${clean(s.error.message)}`)
   }
   for (const [movementId, error] of totals.errors) await line(io.stderr, id, `Failed on movement ${movementId}: ${clean(error)}`)
+}
+
+/** Record where each stream stands after this round. A failed pull keeps the last time it succeeded. */
+async function recordSync(store: Store, tenantId: string, net: Network, streams: readonly StreamProgress[]): Promise<void> {
+  const now = new Date()
+  const before = new Map(
+    (await store.listSyncState(tenantId)).map((r) => [`${r.network}\n${r.source}\n${r.account}`, r] as const),
+  )
+  await store.transaction(async (tx) => {
+    for (const s of streams) {
+      const prior = before.get(`${net.name}\n${s.source}\n${s.account}`)
+      await tx.recordSyncState({
+        tenantId,
+        network: net.name,
+        source: s.source,
+        account: s.account,
+        cursor: s.cursor,
+        lastAttemptAt: now,
+        lastSuccessAt: s.error === null ? now : (prior?.lastSuccessAt ?? null),
+        caughtUp: s.error === null && s.caughtUp,
+        lastError: s.error === null ? null : s.error.message,
+        lastErrorAt: s.error === null ? null : now,
+      })
+    }
+  })
 }
 
 /** Deliver until caught up or a delivery fails; a failed event is retried next round. */

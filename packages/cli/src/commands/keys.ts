@@ -22,7 +22,7 @@ A revoked key is refused on the next request, with no restart.
   nostro keys list [--tenant <id>]
   nostro keys revoke <id>
 
-Scopes: read, events, webhooks, expectations, exceptions, journal (see packages/server/README.md).
+Scopes: read, events, webhooks, expectations, exceptions, journal, accounts (see packages/server/README.md).
 Keys from NOSTRO_API_KEYS or --keys-file are not in the store, so this command does not list or
 revoke them; change those in the environment and restart.
 

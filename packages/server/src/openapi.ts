@@ -3,7 +3,7 @@
  * server validates requests with. Served at `GET /v1/openapi.json`.
  */
 import { readFileSync } from 'node:fs'
-import { components, expectationBody, postJournalBody, query, ref, replayBody, resolveBody } from './schemas.js'
+import { accountParams, components, expectationBody, postJournalBody, query, ref, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
 import { ROUTE_SCOPES } from './scopes.js'
 
 /** This package's version, which is the API's. */
@@ -83,6 +83,43 @@ export function buildOpenApi() {
           summary: 'This document',
           security: [],
           responses: { '200': { description: 'OK', content: { 'application/json': { schema: { type: 'object' } } } } },
+        },
+      },
+      '/v1/accounts': {
+        get: {
+          operationId: 'listAccounts',
+          summary: 'Watched accounts, each with its sync state per network and source',
+          responses: { '200': ok('WatchedAccountList'), ...errors },
+        },
+        post: {
+          operationId: 'watchAccount',
+          summary: 'Start watching a G... account; idempotent',
+          requestBody: { required: true, content: { 'application/json': { schema: ref('AccountBody') } } },
+          responses: {
+            '200': ok('WatchedAccount', 'Already watched'),
+            '201': {
+              description: 'Now watched; sync starts on the next round',
+              headers: { location: { schema: { type: 'string' } } },
+              content: { 'application/json': { schema: ref('WatchedAccount') } },
+            },
+            ...errors,
+          },
+        },
+      },
+      '/v1/accounts/{account}': {
+        delete: {
+          operationId: 'unwatchAccount',
+          summary: 'Stop syncing an account. Its movements, expectations and cursor are kept.',
+          parameters: [
+            { name: 'account', in: 'path', required: true, schema: accountParams.properties.account, description: 'The G... account.' },
+            ...parameters(removeAccountQuery as unknown as { properties: Record<string, object> }),
+          ],
+          responses: {
+            '204': { description: 'No longer watched' },
+            '404': problem('The account is not on the watch list (`not_found`).'),
+            '409': problem('The account comes from the service configuration (`config_managed`), or has open expectations and `force` was not set (`has_open_expectations`).'),
+            ...errors,
+          },
         },
       },
       '/v1/movements': {

@@ -11,6 +11,15 @@ before 1.0, a minor version may change the API.
   restart. Only a SHA-256 digest is stored. Keys from `NOSTRO_API_KEYS` and `--keys-file` still work
   next to stored ones. **Run `nostro migrate` before upgrading**: the store gains an `api_keys` table.
   Keys from the store look like `nstk_` followed by 43 characters, so secret scanners can find a leak.
+- **Watched accounts over the API.** `GET /v1/accounts` lists the accounts a tenant syncs, with each
+  one's sync state: the saved cursor, when it last synced, whether it is caught up, and the last
+  error (cleared by the next good round). `POST /v1/accounts` starts syncing an account on the next
+  round, with no restart, and `DELETE /v1/accounts/{account}` stops it. Removing keeps its movements,
+  expectations and cursor, and adding it again resumes from that cursor. An account from the
+  service configuration cannot be removed over the API (`config_managed`), and one with open
+  expectations needs `?force=true` (`has_open_expectations`). The `accounts` scope covers writes.
+  The watch list and sync state are kept in the store, so they work across processes. **Run
+  `nostro migrate` before upgrading.**
 - **Breaking: API keys have scopes.** `apiKeys()` now returns a `Principal` (tenant, scopes and key
   id) where it returned a tenant id, and `Authenticate` follows. A route the key lacks the scope for
   answers `403 forbidden`, a new problem code. Keys written without scopes keep every scope, so

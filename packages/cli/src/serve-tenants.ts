@@ -97,10 +97,13 @@ function plansFromConfig(file: string, io: Io): TenantPlan[] {
     const list = t.accounts ?? []
     if (!Array.isArray(list) || list.some((a) => typeof a !== 'string')) fail(`${where} (${id})`, 'needs "accounts" as a list of G... strings')
     for (const a of list as string[]) if (!isAccountId(a)) fail(`${where} (${id})`, `has an account that is not a G... address: ${JSON.stringify(a)}`)
+    // A network is needed to sync; a tenant may name one with no accounts, so accounts added over the API sync.
     let net: Network | null = null
-    if ((list as string[]).length > 0) {
+    if (t.network !== undefined) {
       if (typeof t.network !== 'string' || !NETWORK_NAME.test(t.network)) fail(`${where} (${id})`, 'needs a "network" such as testnet or public')
       net = networkNamed(t.network as string, undefined, io)
+    } else if ((list as string[]).length > 0) {
+      fail(`${where} (${id})`, 'needs a "network" such as testnet or public, for its accounts')
     }
 
     let webhook: Webhook | null = null

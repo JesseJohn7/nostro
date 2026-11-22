@@ -17,6 +17,8 @@ export type ProblemCode =
   | 'event_history_pruned'
   | 'consumer_position_conflict'
   | 'invalid_replay'
+  | 'config_managed'
+  | 'has_open_expectations'
   | 'internal'
 
 export interface Problem {
