@@ -28,7 +28,8 @@ async function twoTenants(config: unknown = undefined) {
       },
     ),
   )
-  return { cwd, h, env: { NOSTRO_API_KEYS: 'acme:' + 'k'.repeat(64), SECRET_ACME, SECRET_BETA } }
+  const env: Record<string, string> = { NOSTRO_API_KEYS: 'acme:' + 'k'.repeat(64), SECRET_ACME, SECRET_BETA }
+  return { cwd, h, env }
 }
 
 /** Receivers by host, and a fetch that sends Horizon to the fake and webhooks to the receivers. */

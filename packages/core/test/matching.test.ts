@@ -58,6 +58,7 @@ function expectation(over: Partial<Expectation> = {}): Expectation {
     direction: 'credit',
     amount: usdc('10'),
     muxedId: null,
+    fingerprintSuffix: null,
     memo: null,
     payers: [],
     dueAt: null,
