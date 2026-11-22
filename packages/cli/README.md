@@ -31,9 +31,11 @@ nostro export --output journal.csv                   # the journal, a row per li
 | `post` | Posts to the journal any decision it does not reflect yet, such as one made outside `reconcile`. Idempotent. |
 | `doctor` | Checks invariants I1 and I3 over every record, and with `--attest` I2: each account's recorded movements against its on-chain balance in every asset. Exits 1 if any does not hold. |
 | `export` | Writes the journal as CSV (RFC 4180), with a date range; to stdout, or to `--output`, which it will not overwrite without `--force` and never leaves half-written. |
+| `keys` | Creates (`keys create --tenant <id> --label <text> --scopes <list>`, printing the key once), lists (`keys list`, never keys) and revokes (`keys revoke <id>`) the API keys `serve` accepts from the store. A revoked key is refused on its next request, with no restart. |
 | `serve` | Runs the HTTP API ([@nostro-labs/server](../server/README.md)). With `--account`s to watch, syncs and reconciles them every `--interval` seconds; with `--webhook-url`, delivers each decision there, signed ([docs/webhooks.md](../../docs/webhooks.md)). Stops cleanly on Ctrl-C or SIGTERM. |
 
-`serve` reads API keys as `tenant:key` pairs from `NOSTRO_API_KEYS` (comma-separated) or
+`serve` accepts keys from the store (`nostro keys create`), and also reads `tenant:key` pairs from
+`NOSTRO_API_KEYS` (comma-separated) or
 `--keys-file` (one per line), never from the command line, where `ps` would show them. To narrow a key,
 write its scopes in brackets: `tenant[read,events]:key` (scopes: `read`, `events`, `webhooks`,
 `expectations`, `exceptions`, `journal`). A key written without brackets keeps every scope, and `serve`

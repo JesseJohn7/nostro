@@ -4,7 +4,8 @@ import { resolve } from 'node:path'
 import type { HorizonRateLimit, MovementSource, Store } from '@nostro-labs/nostro'
 import { StreamWatcher, deliverWebhooks, sweepExpectations } from '@nostro-labs/nostro'
 import type { KeyGrant, Scope } from '@nostro-labs/server'
-import { SCOPES, apiKeys, createServer } from '@nostro-labs/server'
+import { SCOPES, apiKeys, createServer, firstOf, storedKeys } from '@nostro-labs/server'
+import type { StoredKeys } from '@nostro-labs/server'
 import type { Args, Network } from '../args.js'
 import { CliError, NETWORK, RATE_LIMIT, UsageError, database, flag, integer, positionals, rateLimit, string } from '../args.js'
 import type { Command } from '../command.js'
@@ -85,9 +86,6 @@ function keys(args: Args, io: Io): { grants: Record<string, KeyGrant>; unscoped:
   } else {
     entries = splitEntries(io.env.NOSTRO_API_KEYS ?? '')
   }
-  if (entries.length === 0) {
-    throw new UsageError('serve needs API keys: set NOSTRO_API_KEYS=tenant:key[,tenant:key...] or pass --keys-file.')
-  }
   const grants: Record<string, KeyGrant> = {}
   const unscoped: { n: number; tenant: string }[] = []
   entries.forEach((entry, i) => {
@@ -123,8 +121,10 @@ A webhook names the environment variable that holds its secret; the secret is ne
 The file replaces --tenant, --account, --network, --horizon and --webhook-url, and their environment
 variables. API keys still come from NOSTRO_API_KEYS or --keys-file.
 
-API keys decide the tenant and the scopes each request may use. They come from NOSTRO_API_KEYS
-(tenant:key,tenant:key) or --keys-file (one tenant:key per line), never the command line. A key can be
+API keys decide the tenant and the scopes each request may use. They come from the store
+(nostro keys create: a key created or revoked while serve runs takes effect on its next request),
+and from NOSTRO_API_KEYS (tenant:key,tenant:key) or --keys-file (one tenant:key per line), never the
+command line. A key can be
 narrowed: tenant[read,events]:key. Each key must be at least 32 characters: openssl rand -hex 32.
 
 Options:
@@ -169,16 +169,15 @@ SSE accelerator (--sse):
   async run(args, io) {
     positionals(args, 0)
     let unscoped: { n: number; tenant: string }[] = []
-    const authenticate = (() => {
-      try {
-        const parsed = keys(args, io)
-        unscoped = parsed.unscoped
-        return apiKeys(parsed.grants)
-      } catch (err) {
-        if (err instanceof UsageError) throw err
-        throw new CliError((err as Error).message)
-      }
-    })()
+    let fileGrants: Record<string, KeyGrant> = {}
+    try {
+      const parsed = keys(args, io)
+      unscoped = parsed.unscoped
+      fileGrants = parsed.grants
+    } catch (err) {
+      if (err instanceof UsageError) throw err
+      throw new CliError((err as Error).message)
+    }
     const rawPort = string(args, 'port') ?? io.env.NOSTRO_PORT
     if (rawPort !== undefined && (!/^\d{1,5}$/.test(rawPort) || Number(rawPort) > 65_535)) {
       throw new UsageError('--port must be a whole number from 0 to 65535.')
@@ -195,8 +194,25 @@ SSE accelerator (--sse):
 
     const opened = await openStore(database(args, io), io, { create: false })
     const { store } = opened
+    let stored: StoredKeys | null = null
     try {
       await assertCurrent(opened)
+      // Keys from the environment or a file are checked first (a constant-time scan); then keys in the store.
+      stored = storedKeys(store)
+      const hasFileKeys = Object.keys(fileGrants).length > 0
+      if (!hasFileKeys && (await store.listApiKeys()).length === 0) {
+        throw new UsageError(
+          'serve needs API keys: create one with "nostro keys create", or set NOSTRO_API_KEYS=tenant:key[,tenant:key...] or pass --keys-file.',
+        )
+      }
+      let authenticate = stored.authenticate
+      if (hasFileKeys) {
+        try {
+          authenticate = firstOf(apiKeys(fileGrants), stored.authenticate)
+        } catch (err) {
+          throw new CliError((err as Error).message)
+        }
+      }
       const app = createServer({ store, authenticate })
       await app.listen({ port, host })
       // Fastify reports one loopback address even when bound to every interface; say what was asked for.
@@ -220,6 +236,8 @@ SSE accelerator (--sse):
       await write(io.stdout, 'Stopped.\n')
       return 0
     } finally {
+      // Last-used times that have not been written yet go to the store before it closes.
+      await stored?.flush()
       await store.close()
     }
   },

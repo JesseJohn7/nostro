@@ -507,4 +507,41 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       ON ${s}.expectations (tenant_id, account, asset, fingerprint_suffix)
       WHERE status = 'open' AND fingerprint_suffix IS NOT NULL;
   `,
+  // 15: API keys, watched accounts and sync state. Keys hold only a SHA-256
+  // digest; scopes are a JSON array the server interprets.
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.api_keys (
+      id           text PRIMARY KEY,
+      tenant_id    text NOT NULL,
+      label        text NOT NULL,
+      digest       text NOT NULL CONSTRAINT api_keys_digest_unique UNIQUE CHECK (length(digest) = 64),
+      scopes       jsonb NOT NULL,
+      created_at   timestamptz NOT NULL,
+      revoked_at   timestamptz,
+      last_used_at timestamptz
+    );
+    CREATE INDEX IF NOT EXISTS api_keys_tenant ON ${s}.api_keys (tenant_id, created_at);
+
+    CREATE TABLE IF NOT EXISTS ${s}.watched_accounts (
+      tenant_id text NOT NULL,
+      account   text NOT NULL,
+      source    text NOT NULL CHECK (source IN ('config', 'api')),
+      added_at  timestamptz NOT NULL,
+      PRIMARY KEY (tenant_id, account)
+    );
+
+    CREATE TABLE IF NOT EXISTS ${s}.sync_state (
+      tenant_id       text NOT NULL,
+      network         text NOT NULL,
+      source          text NOT NULL,
+      account         text NOT NULL,
+      cursor          text,
+      last_attempt_at timestamptz NOT NULL,
+      last_success_at timestamptz,
+      caught_up       boolean NOT NULL,
+      last_error      text,
+      last_error_at   timestamptz,
+      PRIMARY KEY (tenant_id, network, source, account)
+    );
+  `,
 ]

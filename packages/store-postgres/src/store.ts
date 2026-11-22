@@ -17,6 +17,10 @@ import pg from 'pg'
 import type { Pool, PoolClient, QueryResultRow } from 'pg'
 import { EventHistoryPrunedError } from '@nostro-labs/nostro'
 import type {
+  ApiKeyRow,
+  NewApiKeyRow,
+  SyncStateRow,
+  WatchedAccountRow,
   Allocation,
   AllocationQuery,
   CursorKey,
@@ -348,6 +352,29 @@ class PgReader implements StoreReader {
     return row?.value ?? null
   }
 
+  async findApiKeyByDigest(digest: string): Promise<ApiKeyRow | null> {
+    const [row] = await this.run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE digest = $1`, [digest])
+    return row === undefined ? null : toApiKey(row)
+  }
+
+  async listApiKeys(tenantId?: string): Promise<ApiKeyRow[]> {
+    const rows =
+      tenantId === undefined
+        ? await this.run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys ORDER BY created_at, id`)
+        : await this.run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE tenant_id = $1 ORDER BY created_at, id`, [tenantId])
+    return rows.map(toApiKey)
+  }
+
+  async listWatchedAccounts(tenantId: string): Promise<WatchedAccountRow[]> {
+    const rows = await this.run<WatchedDbRow>(`SELECT * FROM ${this.s}.watched_accounts WHERE tenant_id = $1 ORDER BY added_at, account`, [tenantId])
+    return rows.map(toWatched)
+  }
+
+  async listSyncState(tenantId: string): Promise<SyncStateRow[]> {
+    const rows = await this.run<SyncDbRow>(`SELECT * FROM ${this.s}.sync_state WHERE tenant_id = $1 ORDER BY account, source, network`, [tenantId])
+    return rows.map(toSyncState)
+  }
+
   async getJournalPeriod(tenantId: string): Promise<JournalPeriod | null> {
     const [row] = await this.run<{
       action: string
@@ -410,6 +437,59 @@ class PgReader implements StoreReader {
     return rows.map(toValuation)
   }
 }
+
+interface ApiKeyDbRow {
+  id: string
+  tenant_id: string
+  label: string
+  digest: string
+  scopes: string[]
+  created_at: Date
+  revoked_at: Date | null
+  last_used_at: Date | null
+}
+interface WatchedDbRow {
+  tenant_id: string
+  account: string
+  source: 'config' | 'api'
+  added_at: Date
+}
+interface SyncDbRow {
+  tenant_id: string
+  network: string
+  source: string
+  account: string
+  cursor: string | null
+  last_attempt_at: Date
+  last_success_at: Date | null
+  caught_up: boolean
+  last_error: string | null
+  last_error_at: Date | null
+}
+
+const toApiKey = (r: ApiKeyDbRow): ApiKeyRow => ({
+  id: r.id,
+  tenantId: r.tenant_id,
+  label: r.label,
+  digest: r.digest,
+  scopes: r.scopes,
+  createdAt: r.created_at,
+  revokedAt: r.revoked_at,
+  lastUsedAt: r.last_used_at,
+})
+const toWatched = (r: WatchedDbRow): WatchedAccountRow => ({ tenantId: r.tenant_id, account: r.account, source: r.source, addedAt: r.added_at })
+const toSyncState = (r: SyncDbRow): SyncStateRow => ({
+  tenantId: r.tenant_id,
+  network: r.network,
+  source: r.source,
+  account: r.account,
+  cursor: r.cursor,
+  lastAttemptAt: r.last_attempt_at,
+  lastSuccessAt: r.last_success_at,
+  caughtUp: r.caught_up,
+  lastError: r.last_error,
+  lastErrorAt: r.last_error_at,
+})
 
 const isUniqueViolation = (err: unknown, constraint: string): boolean =>
   err instanceof Error &&
@@ -525,6 +605,82 @@ class PgTx extends PgReader implements StoreTx {
       `INSERT INTO ${this.s}.cursors (tenant_id, network, source, account, value) VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (tenant_id, network, source, account) DO UPDATE SET value = EXCLUDED.value`,
       [k.tenantId, k.network, k.source, k.account, value],
+    )
+  }
+
+  async insertApiKey(input: NewApiKeyRow): Promise<ApiKeyRow> {
+    const savepoint = `nostro_${++this.savepoints}`
+    await this.run(`SAVEPOINT ${savepoint}`)
+    try {
+      await this.run(
+        `INSERT INTO ${this.s}.api_keys (id, tenant_id, label, digest, scopes, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
+        [input.id, input.tenantId, input.label, input.digest, JSON.stringify([...input.scopes]), input.createdAt],
+      )
+      await this.run(`RELEASE SAVEPOINT ${savepoint}`)
+    } catch (err) {
+      await this.run(`ROLLBACK TO SAVEPOINT ${savepoint}`)
+      if (isUniqueViolation(err, 'api_keys_digest_unique')) {
+        throw new ConstraintError('api_key_digest_unique', 'that key is already stored')
+      }
+      throw err
+    }
+    const [row] = await this.run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE id = $1`, [input.id])
+    return toApiKey(row!)
+  }
+
+  async revokeApiKey(id: string, at: Date): Promise<ApiKeyRow> {
+    const [row] = await this.run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE id = $1 FOR UPDATE`, [id])
+    if (row === undefined) throw new NotFoundError('api_key', id)
+    if (row.revoked_at === null) {
+      await this.run(`UPDATE ${this.s}.api_keys SET revoked_at = $2 WHERE id = $1`, [id, at])
+    }
+    const [updated] = await this.run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE id = $1`, [id])
+    return toApiKey(updated!)
+  }
+
+  async recordApiKeyUse(uses: readonly { readonly id: string; readonly at: Date }[]): Promise<void> {
+    for (const { id, at } of uses) {
+      await this.run(`UPDATE ${this.s}.api_keys SET last_used_at = GREATEST(COALESCE(last_used_at, 'epoch'), $2) WHERE id = $1`, [id, at])
+    }
+  }
+
+  async addWatchedAccount(row: WatchedAccountRow): Promise<WatchedAccountRow> {
+    const [stored] = await this.run<WatchedDbRow>(
+      `INSERT INTO ${this.s}.watched_accounts (tenant_id, account, source, added_at) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (tenant_id, account) DO UPDATE SET tenant_id = EXCLUDED.tenant_id
+       RETURNING *`,
+      [row.tenantId, row.account, row.source, row.addedAt],
+    )
+    return toWatched(stored!)
+  }
+
+  async removeWatchedAccount(tenantId: string, account: string): Promise<boolean> {
+    const removed = await this.run<{ account: string }>(
+      `DELETE FROM ${this.s}.watched_accounts WHERE tenant_id = $1 AND account = $2 RETURNING account`,
+      [tenantId, account],
+    )
+    return removed.length > 0
+  }
+
+  async recordSyncState(state: SyncStateRow): Promise<void> {
+    await this.run(
+      `INSERT INTO ${this.s}.sync_state (tenant_id, network, source, account, cursor, last_attempt_at, last_success_at, caught_up, last_error, last_error_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+       ON CONFLICT (tenant_id, network, source, account) DO UPDATE SET
+         cursor = EXCLUDED.cursor, last_attempt_at = EXCLUDED.last_attempt_at, last_success_at = EXCLUDED.last_success_at,
+         caught_up = EXCLUDED.caught_up, last_error = EXCLUDED.last_error, last_error_at = EXCLUDED.last_error_at`,
+      [
+        state.tenantId,
+        state.network,
+        state.source,
+        state.account,
+        state.cursor,
+        state.lastAttemptAt,
+        state.lastSuccessAt,
+        state.caughtUp,
+        state.lastError,
+        state.lastErrorAt,
+      ],
     )
   }
 

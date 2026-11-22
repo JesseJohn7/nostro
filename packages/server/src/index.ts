@@ -1,6 +1,7 @@
 export { createServer } from './server.js'
 export type { ServerOptions } from './server.js'
-export { MIN_KEY_LENGTH, apiKeys } from './auth.js'
+export { MIN_KEY_LENGTH, apiKeys, firstOf, keyDigest, storedKeys } from './auth.js'
+export type { StoredKeys } from './auth.js'
 export type { Authenticate, KeyGrant, Principal } from './auth.js'
 export { SCOPES, ROUTE_SCOPES } from './scopes.js'
 export type { Scope } from './scopes.js'

@@ -27,7 +27,7 @@ export interface TenantPlan {
   readonly webhook: Webhook | null
 }
 
-const TENANT_ID = /^[^[\]:\s]+$/
+export const TENANT_ID = /^[^[\]:\s]+$/
 const NETWORK_NAME = /^[a-z0-9][a-z0-9-]*$/
 const CONFIG_KEYS = ['tenants'] as const
 const TENANT_KEYS = ['id', 'network', 'accounts', 'webhook'] as const

@@ -5,6 +5,12 @@ before 1.0, a minor version may change the API.
 
 ## Unreleased
 
+- **API keys live in the database.** `nostro keys create --tenant <id> --label <text> --scopes <list>`
+  prints a new key once; `nostro keys list` shows ids, labels, scopes and last use, never keys; and
+  `nostro keys revoke <id>` revokes one. A revoked key is refused on its next request, with no
+  restart. Only a SHA-256 digest is stored. Keys from `NOSTRO_API_KEYS` and `--keys-file` still work
+  next to stored ones. **Run `nostro migrate` before upgrading**: the store gains an `api_keys` table.
+  Keys from the store look like `nstk_` followed by 43 characters, so secret scanners can find a leak.
 - **Breaking: API keys have scopes.** `apiKeys()` now returns a `Principal` (tenant, scopes and key
   id) where it returned a tenant id, and `Authenticate` follows. A route the key lacks the scope for
   answers `403 forbidden`, a new problem code. Keys written without scopes keep every scope, so

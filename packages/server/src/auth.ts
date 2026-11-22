@@ -6,6 +6,7 @@
  * routes that need it (see `scopes.ts`).
  */
 import { createHash, timingSafeEqual } from 'node:crypto'
+import type { Store } from '@nostro-labs/nostro'
 import { SCOPES, type Scope } from './scopes.js'
 
 export { SCOPES, type Scope } from './scopes.js'
@@ -52,5 +53,71 @@ export function apiKeys(keys: Readonly<Record<string, KeyGrant>>): Authenticate 
     let found: Principal | null = null
     for (const e of entries) if (timingSafeEqual(hash, e.hash)) found = e.principal
     return found
+  }
+}
+
+/** A key's digest as the store keeps it: lowercase hex SHA-256 of the plain key. */
+export const keyDigest = (plain: string): string => digest(plain).toString('hex')
+
+const isScope = (name: string): name is Scope => (SCOPES as readonly string[]).includes(name)
+
+export interface StoredKeys {
+  readonly authenticate: Authenticate
+  /** Write last-used times not yet stored, and stop the timer. Call on shutdown. */
+  flush(): Promise<void>
+}
+
+/**
+ * Authenticate with keys kept in the store. Each request looks its key up by
+ * digest, so a revoked key is refused on the very next request: there is no
+ * cache to wait out. Last-used times are kept in memory, the latest per key,
+ * and written in one batch every `flushEveryMs` (a minute by default), so a
+ * busy key costs one write a minute, not one per request.
+ */
+export function storedKeys(store: Store, options: { readonly flushEveryMs?: number } = {}): StoredKeys {
+  const pending = new Map<string, Date>()
+
+  const flush = async (): Promise<void> => {
+    if (pending.size === 0) return
+    const uses = [...pending].map(([id, at]) => ({ id, at }))
+    pending.clear()
+    try {
+      await store.transaction((tx) => tx.recordApiKeyUse(uses))
+    } catch (err) {
+      // Keep what did not reach the store, unless a later use has already replaced it.
+      for (const use of uses) if (!pending.has(use.id)) pending.set(use.id, use.at)
+      throw err
+    }
+  }
+
+  const timer = setInterval(() => {
+    flush().catch(() => undefined)
+  }, options.flushEveryMs ?? 60_000)
+  timer.unref()
+
+  const authenticate: Authenticate = async (token) => {
+    const row = await store.findApiKeyByDigest(keyDigest(token))
+    if (row === null || row.revokedAt !== null) return null
+    pending.set(row.id, new Date())
+    return { tenantId: row.tenantId, scopes: new Set(row.scopes.filter(isScope)), keyId: row.id }
+  }
+
+  return {
+    authenticate,
+    flush: async () => {
+      clearInterval(timer)
+      await flush()
+    },
+  }
+}
+
+/** Try each authenticator in turn; the first that knows the key decides. */
+export function firstOf(...authenticators: Authenticate[]): Authenticate {
+  return async (token) => {
+    for (const authenticate of authenticators) {
+      const principal = await authenticate(token)
+      if (principal !== null) return principal
+    }
+    return null
   }
 }

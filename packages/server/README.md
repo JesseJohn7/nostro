@@ -38,8 +38,11 @@ await app.listen({ port: 8080 })
 | `POST /v1/webhooks/{consumer}/replay` | `{ "expectedSeq": 42, "toSeq": 39, "actor": "ops@example.com" }`; `409` if the position moved, `410` if it was pruned, `422` if the rewind is invalid |
 
 - **Authentication.** `Authorization: Bearer <key>`. The key decides the tenant, so a caller can never
-  ask for another tenant's records. `apiKeys()` keeps only SHA-256 digests of the keys, compares in
-  constant time, and refuses keys shorter than 32 characters (`openssl rand -hex 32`).
+  ask for another tenant's records. Keys come from two places. `storedKeys(store)` looks each key up
+  by its SHA-256 digest in the store, so a revoked key is refused on the next request, with no cache;
+  `nostro keys` manages them. `apiKeys()` takes keys from configuration, keeps only their digests,
+  compares in constant time, and refuses keys shorter than 32 characters (`openssl rand -hex 32`).
+  A wrong key and a revoked key get the same `401`. `firstOf()` tries several of these in turn.
 - **Scopes.** Each key carries scopes, and each route needs one: `read` (every GET except the ones
   below), `events` (`GET /v1/events`), `webhooks` (consumer status, attempts and replay),
   `expectations` (create, cancel, amend), `exceptions` (resolve) and `journal` (post, move, chart).
