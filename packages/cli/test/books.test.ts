@@ -111,7 +111,7 @@ describe('nostro doctor', () => {
     expect((await nostro(cwd, ['post'])).stdout).toBe('The journal reflects every decision (3 movement(s) examined).\n')
     expect(JSON.parse((await nostro(cwd, ['post', '--json'])).stdout)).toEqual({
       examined: 3,
-      posted: { initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0 },
+      posted: { initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0, opening: 0 },
       errors: [],
     })
     expect((await nostro(cwd, ['doctor'])).stdout).not.toContain('journal_stale')
@@ -282,5 +282,55 @@ describe('manual journal CLI', () => {
     expect(db.prepare('SELECT account FROM journal_lines ORDER BY line_no').all()).toEqual([{account:'assets:adjustments'},{account:'equity:opening'}])
     expect((db.prepare('SELECT description FROM journal_entries').get() as {description:string}).description).toContain('Verified statement')
     db.close()
+  })
+})
+
+describe('nostro open', () => {
+  const argv = ['open', '--account', A, '--network', 'testnet', '--horizon', 'https://horizon.test']
+
+  it('posts opening balances and syncs only movements after the opening ledger', async () => {
+    const h = new FakeHorizon()
+    h.latestLedger = 100
+    h.accounts.set(A, { id: A, last_modified_ledger: 100, balances: [{ balance: '10', asset_type: 'native' }] })
+    const cwd = await migrated()
+    const run = await nostro(cwd, [...argv, '--note', 'Opening', '--json'], { fetch: h.fetch })
+    expect(run).toMatchObject({ code: 0, stderr: '' })
+    expect(JSON.parse(run.stdout)).toEqual({
+      account: A,
+      network: 'testnet',
+      ledger: 100,
+      occurredAt: expect.any(String),
+      balances: [{ asset: 'native', amount: '10.0000000', lastModifiedLedger: 100 }],
+    })
+
+    const store = new SqliteStore({ filename: join(cwd, 'nostro.db') })
+    expect(await store.getAccountOpening('default', 'testnet', A)).toMatchObject({ ledger: 100, note: 'Opening' })
+    expect(await store.getCursor({ tenantId: 'default', network: 'testnet', source: 'horizon-fees', account: A }))
+      .toBe('433791696895')
+    expect((await store.listJournalEntries({ tenantId: 'default' })).map((e) => e.kind)).toEqual(['opening'])
+    await store.close()
+
+    h.payment(101, B, A, '5')
+    const synced = await nostro(cwd, ['sync', '--account', A, '--network', 'testnet', '--horizon', 'https://horizon.test'], { fetch: h.fetch })
+    expect(synced.code).toBe(0)
+    const after = new SqliteStore({ filename: join(cwd, 'nostro.db') })
+    expect(await after.listMovements({ tenantId: 'default' })).toHaveLength(1)
+    await after.close()
+  })
+
+  it('refuses pool shares rather than silently dropping them', async () => {
+    const h = new FakeHorizon()
+    h.latestLedger = 100
+    h.accounts.set(A, {
+      id: A,
+      last_modified_ledger: 100,
+      balances: [
+        { balance: '10', asset_type: 'native' },
+        { balance: '1', asset_type: 'liquidity_pool_shares', liquidity_pool_id: 'pool-1' },
+      ],
+    })
+    const run = await nostro(await migrated(), argv, { fetch: h.fetch })
+    expect(run.code).toBe(2)
+    expect(run.stderr).toContain('liquidity pool shares')
   })
 })

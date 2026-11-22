@@ -56,6 +56,7 @@ export const query = {
   movements: listQuery({
     disposition: { enum: [...DISPOSITIONS] },
     account: { type: 'string', pattern: ACCOUNT },
+    entityId: { type: 'string', minLength: 1, maxLength: 100 },
   }),
   expectations: listQuery({
     status: { type: 'string', pattern: `^(${statuses})(,(${statuses}))*$`, description: 'One or more, comma separated.' },
@@ -75,8 +76,12 @@ export const query = {
       outcome: { enum: ['success', 'failure'] },
     },
   },
-  journal: listQuery(range),
-  journalCsv: { type: 'object', additionalProperties: false, properties: range },
+  journal: listQuery({ ...range, entityId: { type: 'string', minLength: 1, maxLength: 100 } }),
+  journalCsv: {
+    type: 'object',
+    additionalProperties: false,
+    properties: { ...range, entityId: { type: 'string', minLength: 1, maxLength: 100 } },
+  },
 } as const
 
 export const expectationBody = {
@@ -298,6 +303,7 @@ export const components = {
     externalId: str,
     revision: int,
     account: str,
+    entityId: nullable(str),
     direction: { enum: ['credit', 'debit'] },
     kind: { enum: [...MOVEMENT_KINDS] },
     amount,
@@ -361,6 +367,7 @@ export const components = {
   }),
   JournalLine: record({
     account: str,
+    entityId: nullable(str),
     role: { enum: [...LINE_ROLES] },
     side: { enum: ['debit', 'credit'] },
     amount,

@@ -18,7 +18,7 @@
  */
 import type { MovementSource } from '../ingest/index.js'
 import { sync } from '../ingest/index.js'
-import type { Movement } from '../model/index.js'
+import type { AccountOpening, Movement } from '../model/index.js'
 import { signedAmount } from '../model/index.js'
 import type { AssetId } from '../money/index.js'
 import { Money, issuerOf } from '../money/index.js'
@@ -36,6 +36,7 @@ export interface BalanceSnapshot {
   readonly ledger: number | null
   /** At most one line per asset. An account that does not exist has none. */
   readonly balances: readonly BalanceLine[]
+  readonly poolShares?: readonly string[]
 }
 
 /** Where on-chain balances come from. */
@@ -69,12 +70,20 @@ export interface BalanceCheck {
  * Compare a snapshot with recorded movements. Movements of other accounts
  * are skipped; the caller passes only movements from the snapshot's network.
  */
-export function compareBalances(snapshot: BalanceSnapshot, movements: readonly Movement[]): BalanceCheck[] {
+export function compareBalances(
+  snapshot: BalanceSnapshot,
+  movements: readonly Movement[],
+  opening: AccountOpening | null = null,
+): BalanceCheck[] {
   const { account } = snapshot
   const pins = new Map(snapshot.balances.map((b) => [b.amount.asset, b.lastModifiedLedger]))
   const recorded = new Map<AssetId, Money>()
+  if (opening !== null) {
+    for (const b of opening.balances) recorded.set(b.amount.asset, b.amount)
+  }
   for (const m of movements) {
     if (m.account !== account) continue
+    if (opening !== null && m.ledger <= opening.ledger) continue
     const pin = pins.get(m.amount.asset) ?? snapshot.ledger
     if (pin !== null && m.ledger > pin) continue
     const sum = recorded.get(m.amount.asset)
@@ -135,7 +144,8 @@ export async function attestBalances(options: AttestOptions): Promise<BalanceChe
     const snapshot = await balances.snapshot(account)
     for (let attempt = 1; ; attempt++) {
       for (const source of sources) await catchUp(store, source, tenantId, account)
-      const found = compareBalances(snapshot, await recorded(store, tenantId, balances.network, account))
+      const opening = await store.getAccountOpening(tenantId, balances.network, account)
+      const found = compareBalances(snapshot, await recorded(store, tenantId, balances.network, account), opening)
       if (attempt >= attempts || found.every((c) => c.status !== 'mismatch')) {
         checks.push(...found)
         break

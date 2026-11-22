@@ -80,6 +80,7 @@ export class JournalRounder {
       if (imbalance !== 0n) {
         lines.push({
           account: ROUNDING_ACCOUNT,
+          entityId: null,
           role: 'conversion',
           side: imbalance > 0n ? 'credit' : 'debit',
           amount: Money.fromRaw(imbalance > 0n ? imbalance : -imbalance, asset, this.decimals),

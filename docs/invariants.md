@@ -50,7 +50,7 @@ its lock before it is reported.
 | `disposition_unsupported` | I1 | error | The disposition no longer matches the movement's allocations and exceptions. Typically a `partial` movement whose only exception was resolved. | Use `applyMovement()` for the rest, or `ignoreMovement()` ([docs/matching.md](./matching.md)). Those never leave a movement in this state; closing the exception directly can. |
 | `allocation_asset` | I1 | error | An allocation is in a different asset from its movement. | Only possible by editing the database directly; investigate. |
 | `allocation_over_movement` | I1 | error | Allocations add up to more than the movement. | As above. |
-| `balance_mismatch` | I2 | error | The chain balance and the recorded movements disagree at the ledger the balance last changed in, after retries. | A source has missed something. Check that both the effects and fees sources run for the account, and that its history is within Horizon's retention. |
+| `balance_mismatch` | I2 | error | The chain balance and the recorded movements disagree at the ledger the balance last changed in, after retries. | For an account with pre-nostro history, open it from its current balances with `nostro open`. Otherwise a source has missed something: check that both the effects and fees sources run for the account, and that its history is within Horizon's retention. |
 | `journal_unbalanced` | I3 | error | An entry's debits and credits differ in some asset. | SQLite cannot refuse this itself; someone wrote to the database directly. |
 | `journal_posting_sequence` | I3 | error | A movement's posting numbers are not 1, 2, 3… | As above. |
 | `journal_asset` | I3 | error | A line is in a different asset from its movement. | As above. |
@@ -64,9 +64,11 @@ the date of the oldest.
 
 Each balance is compared at the ledger it last changed in, using the `last_modified_ledger` Horizon
 reports. The balance has been exactly that value ever since, so recorded movements up to and
-including that ledger must add up to it, however busy the account is. The balances are read first and
-the sources caught up afterwards. A mismatch is checked again about a ledger later, a few times,
-before it is reported, in case a source answered from a Horizon server that was a moment behind.
+including that ledger must add up to it, however busy the account is. If the account was opened with
+`nostro open`, the opening balances are the starting point and movements through the opening ledger
+are not counted again. The balances are read first and the sources caught up afterwards. A mismatch
+is checked again about a ledger later, a few times, before it is reported, in case a source answered
+from a Horizon server that was a moment behind.
 [ADR 0008](./adr/0008-balance-attestation-at-a-ledger.md) has the reasoning.
 
 Not covered yet:

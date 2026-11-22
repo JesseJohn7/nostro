@@ -176,10 +176,37 @@ describe('nostro export formats', () => {
     expect(await nostro(cwd, ['export', '--format', 'quickbooks'])).toMatchObject({ code: 2 })
     expect(await nostro(cwd, ['export', '--format', 'xero'])).toMatchObject({ code: 2 })
     expect(await nostro(cwd, ['export', '--format', 'beancount'])).toMatchObject({ code: 2 })
+    expect(await nostro(cwd, ['export', '--format', 'ofx'])).toMatchObject({ code: 2 })
 
     writeFileSync(join(cwd, 'commodities.json'), '{}')
     const beancount = await nostro(cwd, ['export', '--format', 'beancount', '--commodity-map', 'commodities.json'])
     expect(beancount).toMatchObject({ code: 0, stdout: '' })
+  })
+
+  it('exports a wallet statement as OFX 2.2 for a bank-style import', async () => {
+    const h = paid()
+    const cwd = await migrated()
+    for (const argv of [
+      ['sync', '--account', A],
+      ['reconcile'],
+    ]) {
+      const run = await nostro(cwd, argv, { fetch: h.fetch })
+      if (run.code !== 0) throw new Error(run.stderr)
+    }
+    const run = await nostro(cwd, [
+      'export', '--format', 'ofx',
+      '--account', `assets:stellar:testnet:${A}`,
+      '--asset', 'native',
+      '--currency', 'USD',
+      '--from', '2000-01-01', '--to', '2100-01-01',
+    ])
+    expect(run).toMatchObject({ code: 0, stderr: '' })
+    expect(run.stdout.startsWith('OFXHEADER:100\r\nDATA:OFXSGML\r\nVERSION:202\r\n')).toBe(true)
+    expect(run.stdout).toContain('<CURDEF>USD\r\n')
+    expect(run.stdout).toContain(`<ACCTID>assets:stellar:testnet:${A}\r\n`)
+    expect(run.stdout).toContain('<TRNTYPE>CREDIT\r\n')
+    expect(run.stdout).toContain('<TRNTYPE>DEBIT\r\n')
+    expect(run.stdout).toContain('<LEDGERBAL>\r\n')
   })
 })
 
@@ -412,5 +439,26 @@ describe('nostro reconcile', () => {
     for (const argv of [['--batch', '0'], ['--batch', '1.5'], ['--batch', '10001'], ['--tenant', ' ']]) {
       expect((await nostro(cwd, ['reconcile', ...argv])).code).toBe(2)
     }
+  })
+
+  it('manages entities and filters exports by entity', async () => {
+    const cwd = await migrated()
+    expect((await nostro(cwd, ['entity', 'create', '--id', 'alpha', '--name', 'Alpha', '--json'])).code).toBe(0)
+    expect((await nostro(cwd, ['entity', 'create', '--id', 'beta', '--name', 'Beta'])).code).toBe(0)
+    expect((await nostro(cwd, ['entity', 'assign', '--account', A, '--entity-id', 'alpha'])).code).toBe(0)
+
+    const list = await nostro(cwd, ['entity', 'list', '--json'])
+    expect(list.code).toBe(0)
+    expect(JSON.parse(list.stdout).map((e: { id: string }) => e.id)).toEqual(['alpha', 'beta'])
+    const accounts = JSON.parse((await nostro(cwd, ['entity', 'accounts', '--json'])).stdout)
+    expect(accounts).toMatchObject([{ account: A, entityId: 'alpha', network: 'testnet' }])
+
+    expect((await nostro(cwd, ['entity', 'assign', '--account', A, '--entity-id', 'beta'])).code).toBe(0)
+    const moved = JSON.parse((await nostro(cwd, ['entity', 'accounts', '--json'])).stdout)
+    expect(moved).toMatchObject([{ account: A, entityId: 'beta' }])
+
+    const exported = await nostro(cwd, ['export', '--entity', 'alpha'])
+    expect(exported.code).toBe(0)
+    expect(exported.stdout).toContain('entity')
   })
 })

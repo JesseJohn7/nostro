@@ -351,7 +351,7 @@ export function checkJournalEntry(
       throw new ConstraintError('journal_unbalanced', `${key.split('/')[0]} is out by ${total} raw units`)
     }
   }
-  if (movement === null || entry.kind === 'manual') {
+  if ((movement === null && entry.kind !== 'opening') || entry.kind === 'manual') {
     for (const line of entry.lines) {
       if (BALANCE_ROLES.has(line.role)) {
         throw new ConstraintError(
@@ -361,11 +361,23 @@ export function checkJournalEntry(
       }
     }
   }
-  if (entry.kind === 'manual' || movement === null) {
+  if (entry.kind === 'manual' || (movement === null && entry.kind !== 'opening')) {
     if (entry.kind === 'manual' && movement !== null) {
       throw new ConstraintError('journal_manual_slot', 'manual entries cannot name a movement; use the movement resolution API')
     }
-    if (entry.lines.some(line => ['unapplied', 'customer_credit', 'unexplained'].includes(line.role))) {
+    const movementOnly: ReadonlySet<LineRole> = new Set([
+      'unapplied',
+      'customer_credit',
+      'unexplained',
+      'deposit_clearing',
+      'redemption_payable',
+      'clawback',
+      'due_to',
+      'due_from',
+      'in_transit',
+      'opening_balance',
+    ])
+    if (entry.lines.some(line => movementOnly.has(line.role))) {
       throw new ConstraintError('journal_manual_slot', 'movement balance roles require a movement; use other for independent adjustments')
     }
   }

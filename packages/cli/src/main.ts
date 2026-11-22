@@ -8,6 +8,7 @@ import { CliError, UsageError, parse } from './args.js'
 import type { Command } from './command.js'
 import { chart } from './commands/chart.js'
 import { doctor } from './commands/doctor.js'
+import { entity } from './commands/entity.js'
 import { exceptions } from './commands/exceptions.js'
 import { expect } from './commands/expect.js'
 import { expectations } from './commands/expectations.js'
@@ -16,6 +17,7 @@ import { amend } from './commands/amend.js'
 import { exportJournal } from './commands/export.js'
 import { journalCommand } from './commands/journal.js'
 import { migrate } from './commands/migrate.js'
+import { open } from './commands/open.js'
 import { post } from './commands/post.js'
 import { pruneEventsCommand } from './commands/prune-events.js'
 import { period } from './commands/period.js'
@@ -30,6 +32,8 @@ import { clean, write } from './io.js'
 export const COMMANDS: readonly Command[] = [
   migrate,
   sync,
+  entity,
+  open,
   expect,
   expectations,
   cancel,

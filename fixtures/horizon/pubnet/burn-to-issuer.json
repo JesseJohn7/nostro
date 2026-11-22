@@ -1,0 +1,95 @@
+{
+  "scenario": "burn-to-issuer",
+  "network": "public",
+  "horizon": "https://horizon.stellar.org",
+  "capturedAt": "2026-11-22T15:08:58+00:00",
+  "sources": [
+    "https://horizon.stellar.org/operations/281795471465676801?join=transactions",
+    "https://horizon.stellar.org/operations/281795471465676801/effects"
+  ],
+  "operation": {
+    "id": "281795471465676801",
+    "paging_token": "281795471465676801",
+    "transaction_successful": true,
+    "source_account": "GAFK7XFZHMLSNV7OJTBO7BAIZA66X6QIBV5RMZZYXK4Q7ZSO52J5C3WQ",
+    "type": "payment",
+    "type_i": 1,
+    "created_at": "2026-11-22T09:19:11Z",
+    "transaction_hash": "070648d36a3bbebe0bb63c27e86ecec3ca39415e5732d2a26039ce4ef4bf314d",
+    "transaction": {
+      "memo": "internal",
+      "memo_bytes": "aW50ZXJuYWw=",
+      "id": "070648d36a3bbebe0bb63c27e86ecec3ca39415e5732d2a26039ce4ef4bf314d",
+      "paging_token": "281795471465676800",
+      "successful": true,
+      "hash": "070648d36a3bbebe0bb63c27e86ecec3ca39415e5732d2a26039ce4ef4bf314d",
+      "ledger": 65610621,
+      "created_at": "2026-11-22T09:19:11Z",
+      "source_account": "GA4U6AISFYHWLO6OWO4YQOFW32SFASKJ52AWJZOSL632XLDC3WWV2ZJI",
+      "source_account_sequence": "194781096200634960",
+      "fee_account": "GAFK7XFZHMLSNV7OJTBO7BAIZA66X6QIBV5RMZZYXK4Q7ZSO52J5C3WQ",
+      "fee_charged": "200",
+      "max_fee": "10112",
+      "operation_count": 1,
+      "envelope_xdr": "AAAABQAAAAAKr9y5Oxcm1+5Mwu+ECMg96/oIDXsWZzi6uQ/mTu6T0QAAAAAAACeAAAAAAgAAAAA5TwESLg9lu86zuYg4tt6kUElJ7oFk5dJft6usYt2tXQAAE8ACtABgAAACUAAAAAEAAAAAAAAAAAAAAABrArS5AAAAAQAAAAhpbnRlcm5hbAAAAAEAAAABAAAAAAqv3Lk7FybX7kzC74QIyD3r+ggNexZnOLq5D+ZO7pPRAAAAAQAAAAA7mRE4Dv6Yi6CokA6xz+RPNm99vpRr7QdyQPf2JN8VxQAAAAFVU0RDAAAAADuZETgO/piLoKiQDrHP5E82b32+lGvtB3JA9/Yk3xXFAAADo0eo1wAAAAAAAAAAAmLdrV0AAABA3wZAbeNQkYx2tRyEZ2odjelGuTDlqDupFXcEf7fQTPiYaoQi9ftYZ1zRsZ0Ue9icWGE+QvcHur5TcDwRAfFqCU7uk9EAAABAPkOxvLB12CdjJQ4ZGJBZVk0q452fMUCnnLrmvRY6AxXWMzLDRkUl0BZ52yh1wXhR3o8qSpW5PkAuF1FWeRIQAAAAAAAAAAABTu6T0QAAAEDjI7Vk5MvUsselFYURpXetPpJ1eTaY82GlPJgN/tPhhO7G/JcfiHWjXnK4/QZlXsKXjMHEhW8coBNxSSfkz1EF",
+      "result_xdr": "AAAAAAAAAMgAAAABchgljc7i+ZdrvC/0mWKbLQTbHNxvmcqK2qdYChc2IkUAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAEAAAAAAAAAAAAAAAA=",
+      "fee_meta_xdr": "AAAAAgAAAAMD6SNxAAAAAAAAAAAKr9y5Oxcm1+5Mwu+ECMg96/oIDXsWZzi6uQ/mTu6T0QAAAfa7ArBUAgEWlQAAeeYAAAAEAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAADAAAAAAK0DIMAAAAAZA+OAwAAAAAAAAABA+kjfQAAAAAAAAAACq/cuTsXJtfuTMLvhAjIPev6CA17Fmc4urkP5k7uk9EAAAH2uwKvjAIBFpUAAHnmAAAABAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAwAAAAACtAyDAAAAAGQPjgMAAAAA",
+      "memo_type": "text",
+      "signatures": [
+        "4yO1ZOTL1LLHpRWFEaV3rT6SdXk2mPNhpTyYDf7T4YTuxvyXH4h1o15yuP0GZV7Cl4zBxIVvHKATcUkn5M9RBQ=="
+      ],
+      "preconditions": {
+        "timebounds": {
+          "min_time": "0",
+          "max_time": "1795339449"
+        }
+      },
+      "fee_bump_transaction": {
+        "hash": "070648d36a3bbebe0bb63c27e86ecec3ca39415e5732d2a26039ce4ef4bf314d",
+        "signatures": [
+          "4yO1ZOTL1LLHpRWFEaV3rT6SdXk2mPNhpTyYDf7T4YTuxvyXH4h1o15yuP0GZV7Cl4zBxIVvHKATcUkn5M9RBQ=="
+        ]
+      },
+      "inner_transaction": {
+        "hash": "7218258dcee2f9976bbc2ff499629b2d04db1cdc6f99ca8adaa7580a17362245",
+        "signatures": [
+          "3wZAbeNQkYx2tRyEZ2odjelGuTDlqDupFXcEf7fQTPiYaoQi9ftYZ1zRsZ0Ue9icWGE+QvcHur5TcDwRAfFqCQ==",
+          "PkOxvLB12CdjJQ4ZGJBZVk0q452fMUCnnLrmvRY6AxXWMzLDRkUl0BZ52yh1wXhR3o8qSpW5PkAuF1FWeRIQAA=="
+        ],
+        "max_fee": "5056"
+      }
+    },
+    "asset_type": "credit_alphanum4",
+    "asset_code": "USDC",
+    "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    "from": "GAFK7XFZHMLSNV7OJTBO7BAIZA66X6QIBV5RMZZYXK4Q7ZSO52J5C3WQ",
+    "to": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    "amount": "399981.6800000"
+  },
+  "effects": [
+    {
+      "id": "0281795471465676801-0000000001",
+      "paging_token": "281795471465676801-1",
+      "account": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      "type": "account_credited",
+      "type_i": 2,
+      "created_at": "2026-11-22T09:19:11Z",
+      "asset_type": "credit_alphanum4",
+      "asset_code": "USDC",
+      "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      "amount": "399981.6800000"
+    },
+    {
+      "id": "0281795471465676801-0000000002",
+      "paging_token": "281795471465676801-2",
+      "account": "GAFK7XFZHMLSNV7OJTBO7BAIZA66X6QIBV5RMZZYXK4Q7ZSO52J5C3WQ",
+      "type": "account_debited",
+      "type_i": 3,
+      "created_at": "2026-11-22T09:19:11Z",
+      "asset_type": "credit_alphanum4",
+      "asset_code": "USDC",
+      "asset_issuer": "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+      "amount": "399981.6800000"
+    }
+  ]
+}

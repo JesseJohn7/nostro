@@ -102,8 +102,8 @@ describe('JSON for records', () => {
     expect(allocationJson(a)).toMatchObject({ amount: HUGE.toString(), asset: USDC, strategy: 'muxed_id', score: 1 })
     expect(exceptionJson(x)).toMatchObject({ amount: null, asset: null, evidence: { why: ['x'] }, resolvedAt: null })
     expect(journalEntryJson(j).lines).toEqual([
-      { account: 'cash', role: 'cash', side: 'debit', amount: HUGE.toString(), asset: USDC, expectationId: null, exceptionId: null },
-      { account: 'ar', role: 'receivable', side: 'credit', amount: HUGE.toString(), asset: USDC, expectationId: e.id, exceptionId: null },
+      { account: 'cash', entityId: null, role: 'cash', side: 'debit', amount: HUGE.toString(), asset: USDC, expectationId: null, exceptionId: null },
+      { account: 'ar', entityId: null, role: 'receivable', side: 'credit', amount: HUGE.toString(), asset: USDC, expectationId: e.id, exceptionId: null },
     ])
   })
 

@@ -25,6 +25,7 @@ import {
   failureReason,
   getConsumerStatus,
   normalizeReference,
+  postJournal,
   reconcile,
   rewindConsumer,
   sweepExpectations,
@@ -193,6 +194,50 @@ export function describeStoreConformance(name: string, makeStore: () => Store | 
         expect(forAccount.map((m) => m.id)).toEqual([b.id])
         const page = await store.listMovements({ tenantId: T, afterSeq: a.seq, limit: 1 })
         expect(page.map((m) => m.id)).toEqual([b.id])
+      })
+    })
+
+    describe('entities (conformance)', () => {
+      const addEntity = (tenantId: string, id: string, name: string) =>
+        store.transaction((tx) => tx.insertEntity({ tenantId, id, name }))
+
+      const assign = (tenantId: string, account: string, entityId: string) =>
+        store.transaction((tx) =>
+          tx.assignAccountEntity({ tenantId, network: 'testnet', account, entityId }),
+        )
+
+      it('scopes entities and account ownership by tenant', async () => {
+        await addEntity(T, 'alpha', 'Alpha')
+        expect((await store.listEntities({ tenantId: T })).map((e) => e.id)).toEqual(['alpha'])
+        expect(await store.listEntities({ tenantId: T2 })).toEqual([])
+        expect(await store.getEntity(T2, 'alpha')).toBeNull()
+
+        await assign(T, ACCOUNT, 'alpha')
+        expect(await store.getAccountEntity(T2, 'testnet', ACCOUNT)).toBeNull()
+        expect((await store.listAccountEntities({ tenantId: T, entityId: 'alpha' })).map((a) => a.account)).toEqual([ACCOUNT])
+        await expect(assign(T, ACCOUNT, 'missing')).rejects.toMatchObject(constraint('entity_unknown'))
+      })
+
+      it('stamps movements and journal lines, and moves change future stamps only', async () => {
+        await addEntity(T, 'alpha', 'Alpha')
+        await addEntity(T, 'beta', 'Beta')
+        await assign(T, ACCOUNT, 'alpha')
+        const before = await record()
+        await assign(T, ACCOUNT, 'beta')
+        const after = await record()
+
+        expect((await store.getMovement(T, before.id))!.entityId).toBe('alpha')
+        expect((await store.getMovement(T, after.id))!.entityId).toBe('beta')
+        expect((await store.listMovements({ tenantId: T, entityId: 'alpha' })).map((m) => m.id)).toEqual([before.id])
+        expect((await store.listMovements({ tenantId: T, entityId: 'beta' })).map((m) => m.id)).toEqual([after.id])
+
+        await reconcile({ store, tenantId: T, limit: 1000 })
+        expect((await postJournal({ store, tenantId: T })).errors).toEqual([])
+        const lineFor = async (movementId: string) =>
+          (await store.listJournalEntries({ tenantId: T, movementId })).flatMap((e) => e.lines)[0]
+        expect((await lineFor(before.id))?.entityId).toBe('alpha')
+        expect((await lineFor(after.id))?.entityId).toBe('beta')
+        expect((await store.listJournalEntries({ tenantId: T, entityId: 'alpha' })).flatMap((e) => e.lines).every((l) => l.entityId === 'alpha')).toBe(true)
       })
     })
 

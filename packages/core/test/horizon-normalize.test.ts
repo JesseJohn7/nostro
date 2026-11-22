@@ -1,8 +1,8 @@
 /**
  * Normalisation against real Horizon records captured from the public
- * network (fixtures/horizon/pubnet). A handful of cases could not be found
- * live in reasonable time; those are built by editing a real record and are
- * marked "constructed".
+ * network (fixtures/horizon/pubnet and fixtures/horizon/testnet). A few cases
+ * could not be found live in reasonable time; those are built by editing a real
+ * record and are marked "constructed".
  */
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
@@ -248,16 +248,19 @@ describe('normalizeEffects: accounts, balances and contracts', () => {
     expect(forAccount(f, f.operation.source_account)).toEqual([])
   })
 
-  it('classifies a clawback on both sides (constructed)', () => {
-    const f = load('payment-text-memo')
-    const issuer = f.effects[0]!.asset_issuer!
-    const victim = f.operation.to!
-    const op: HorizonOperation = { ...f.operation, type: 'clawback', source_account: issuer, from: victim }
-    const effects = f.effects.map((e) => ({ ...e, account: e.type === 'account_credited' ? issuer : victim }))
-    const credit = normalizeEffects(effects, new Map([[op.id, op]]), ctx(issuer))
-    const debit = normalizeEffects(effects, new Map([[op.id, op]]), ctx(victim))
-    expect(credit[0]).toMatchObject({ kind: 'clawback', counterparty: victim })
-    expect(debit[0]).toMatchObject({ kind: 'clawback', counterparty: issuer })
+  it('classifies a clawback on both sides from a real record', () => {
+    const f = JSON.parse(
+      readFileSync(
+        fileURLToPath(new URL('../../../fixtures/horizon/testnet/clawback-eurox.json', import.meta.url)),
+        'utf8',
+      ),
+    ) as OperationFixture
+    const issuer = f.operation.source_account!
+    const holder = f.operation.from!
+    const credit = forAccount(f, issuer)
+    const debit = forAccount(f, holder)
+    expect(credit).toMatchObject([{ kind: 'clawback', direction: 'credit', counterparty: holder }])
+    expect(debit).toMatchObject([{ kind: 'clawback', direction: 'debit', counterparty: issuer }])
   })
 })
 

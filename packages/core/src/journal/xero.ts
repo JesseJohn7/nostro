@@ -31,6 +31,7 @@ async function validate(options: JournalXeroOptions): Promise<ExportSnapshot> {
   for await (const entry of journalEntries(options)) {
     throughSeq = entry.seq
     for (const line of entry.lines) {
+      if (options.entityId !== undefined && line.entityId !== options.entityId) continue
       lines += 1
       assets.add(line.amount.asset)
       const mapped = options.accountMap[line.account]
@@ -55,9 +56,10 @@ function entryRows(
   entry: JournalEntry,
   accountMap: Readonly<Record<string, string>>,
   taxRate: string,
+  entityId?: string,
 ): string[] {
   const narration = `${entry.id} ${entry.description}`
-  return entry.lines.map((line) =>
+  return entry.lines.filter((line) => entityId === undefined || line.entityId === entityId).map((line) =>
     journalCsvRow([
       journalCsvCell(narration, true),
       journalCsvCell(entry.effectiveAt.toISOString().slice(0, 10)),
@@ -76,6 +78,6 @@ export async function* journalXeroRows(options: JournalXeroOptions): AsyncGenera
   yield journalCsvRow(JOURNAL_XERO_COLUMNS.map((column) => column))
   const taxRate = options.taxRate ?? 'No Tax'
   for await (const entry of journalEntries({ ...options, throughSeq: snapshot.throughSeq })) {
-    yield* entryRows(entry, options.accountMap, taxRate)
+    yield* entryRows(entry, options.accountMap, taxRate, options.entityId)
   }
 }

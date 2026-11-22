@@ -9,9 +9,13 @@
  */
 import type {
   Memo,
+  NewAccountEntity,
+  NewAccountOpening,
   NewAllocation,
+  NewEntity,
   NewException,
   NewExpectation,
+  NewInternalTransferLink,
   NewJournalEntry,
   NewMovement,
 } from "./types.js";
@@ -147,6 +151,38 @@ export function assertValidMemo(field: string, memo: Memo): void {
   }
 }
 
+export function assertValidNewEntity(e: NewEntity): void {
+  text("tenantId", e.tenantId);
+  text("id", e.id, 100);
+  text("name", e.name);
+}
+
+export function assertValidNewAccountEntity(a: NewAccountEntity): void {
+  text("tenantId", a.tenantId);
+  text("network", a.network);
+  account("account", a.account);
+  text("entityId", a.entityId, 100);
+}
+
+export function assertValidNewInternalTransferLink(link: NewInternalTransferLink): void {
+  text("tenantId", link.tenantId);
+  text("network", link.network);
+  if (!HEX32_RE.test(link.txHash)) {
+    throw new ValidationError("txHash", "must be 64 lowercase hex characters");
+  }
+  if (
+    !Array.isArray(link.movementIds) ||
+    link.movementIds.length !== 2 ||
+    link.movementIds.some((id) => typeof id !== "string" || id.trim() === "") ||
+    link.movementIds[0] === link.movementIds[1]
+  ) {
+    throw new ValidationError("movementIds", "must name two different movements");
+  }
+  if (typeof link.sameEntity !== "boolean") {
+    throw new ValidationError("sameEntity", "must be a boolean");
+  }
+}
+
 export function assertValidNewMovement(m: NewMovement): void {
   text("tenantId", m.tenantId);
   text("network", m.network);
@@ -159,6 +195,7 @@ export function assertValidNewMovement(m: NewMovement): void {
     throw new ValidationError("revision", "must be a positive integer");
   }
   account("account", m.account);
+  if (m.entityId != null) text("entityId", m.entityId, 100);
   direction("direction", m.direction);
   if (!MOVEMENT_KINDS.includes(m.kind)) {
     throw new ValidationError(
@@ -196,6 +233,36 @@ export function assertValidNewMovement(m: NewMovement): void {
   ) {
     throw new ValidationError("enrichment", 'must be "complete" or "missing"');
   }
+}
+
+export function assertValidNewAccountOpening(o: NewAccountOpening): void {
+  text("tenantId", o.tenantId);
+  text("network", o.network);
+  account("account", o.account);
+  if (!Number.isSafeInteger(o.ledger) || o.ledger < 1) {
+    throw new ValidationError("ledger", "must be a positive integer");
+  }
+  if (o.occurredAt !== undefined) date("occurredAt", o.occurredAt);
+  if (o.note != null) {
+    text("note", o.note);
+    assertStorableText("note", o.note);
+  }
+  if (!Array.isArray(o.balances) || o.balances.length === 0) {
+    throw new ValidationError("balances", "must cover at least one asset");
+  }
+  const assets = new Set<string>();
+  o.balances.forEach((line, i) => {
+    if (line.amount === undefined || !line.amount.isPositive()) {
+      throw new ValidationError(`balances[${i}].amount`, "must be positive");
+    }
+    if (assets.has(line.amount.asset)) {
+      throw new ValidationError(`balances[${i}].amount`, `duplicate asset ${line.amount.asset}`);
+    }
+    assets.add(line.amount.asset);
+    if (line.lastModifiedLedger != null && (!Number.isSafeInteger(line.lastModifiedLedger) || line.lastModifiedLedger < 1)) {
+      throw new ValidationError(`balances[${i}].lastModifiedLedger`, "must be a positive integer or null");
+    }
+  });
 }
 
 export function assertValidNewExpectation(e: NewExpectation): void {
@@ -299,6 +366,7 @@ export function assertValidNewJournalEntry(e: NewJournalEntry): void {
   const decimals = new Map<string, number>();
   e.lines.forEach((line, i) => {
     text(`lines[${i}].account`, line.account);
+    if (line.entityId != null) text(`lines[${i}].entityId`, line.entityId, 100);
     if (!LINE_ROLES.includes(line.role)) {
       throw new ValidationError(
         `lines[${i}].role`,

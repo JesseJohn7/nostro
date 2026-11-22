@@ -63,6 +63,13 @@ export interface ChartOfAccounts {
   readonly uncategorized_income: string
   readonly conversion: string
   readonly refund_clearing: string
+  readonly deposit_clearing: string
+  readonly redemption_payable: string
+  readonly clawback: string
+  readonly due_to: string
+  readonly due_from: string
+  readonly in_transit: string
+  readonly opening_balance: string
   readonly other: string
   readonly uncategorized_expense: string
 }
@@ -81,6 +88,13 @@ export const DEFAULT_CHART: ChartOfAccounts = {
   conversion: 'equity:conversion',
   other: 'equity:adjustments',
   refund_clearing: 'liabilities:refund-clearing',
+  deposit_clearing: 'liabilities:deposits-received',
+  redemption_payable: 'liabilities:redemptions-payable',
+  clawback: 'equity:clawback',
+  due_to: 'liabilities:due-to',
+  due_from: 'assets:due-from',
+  in_transit: 'assets:in-transit',
+  opening_balance: 'equity:opening-balances',
 }
 
 /** The account a role posts to for a movement on `account` in `network`. */

@@ -21,6 +21,6 @@ It refuses to overwrite an existing file. `sources` lists the operation URL and 
 effects page fetched. The scenario name is kebab-case. `FixtureSource` in `nostro-testkit` replays
 any of these files through the normaliser in tests.
 
-These are public ledger records. Scenarios that could not be found live in reasonable time
-(clawback, a CAP-73 account-creating SAC transfer, a pool trade from an offer) are built in the
-tests by editing one of these records, and the tests say so.
+These are public ledger records. A real clawback is kept under `testnet/`. Scenarios that could not
+be found live in reasonable time (a CAP-73 account-creating SAC transfer, a pool trade from an
+offer) are built in the tests by editing one of these records, and the tests say so.

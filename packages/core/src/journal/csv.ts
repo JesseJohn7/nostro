@@ -20,6 +20,7 @@ export const JOURNAL_CSV_COLUMNS = [
   'description',
   'line_no',
   'account',
+  'entity',
   'role',
   'asset',
   'debit',
@@ -35,6 +36,8 @@ export const JOURNAL_CSV_COLUMNS = [
 export interface JournalCsvOptions {
   readonly store: Store
   readonly tenantId: string
+  /** Export only lines belonging to this entity. */
+  readonly entityId?: string
   /** Entries effective on or after this instant. */
   readonly from?: Date
   /** Entries effective strictly before this instant. */
@@ -70,6 +73,7 @@ async function* journalEntryPages(options: JournalCsvOptions, includeBeforeFrom 
   for (;;) {
     const page = await store.listJournalEntries({
       tenantId,
+      ...(options.entityId === undefined ? {} : { entityId: options.entityId }),
       limit: pageSize,
       ...(afterSeq === undefined ? {} : { afterSeq }),
       ...(includeBeforeFrom || options.from === undefined ? {} : { effectiveFrom: options.from }),
@@ -123,6 +127,7 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
       if (options.afterSeq !== undefined && original.seq <= options.afterSeq) continue
       if (rounder !== null && options.from !== undefined && original.effectiveAt < options.from) continue
       for (const [i, line] of entry.lines.entries()) {
+        if (options.entityId !== undefined && line.entityId !== options.entityId) continue
         const expectationId = line.expectationId ?? null
         const amount = line.amount.toString()
         const dimCells: string[] = []
@@ -140,6 +145,7 @@ export async function* journalCsvRows(options: JournalCsvOptions): AsyncGenerato
           journalCsvCell(entry.description, true),
           journalCsvCell(i + 1),
           journalCsvCell(line.account, true),
+          journalCsvCell(line.entityId ?? null),
           journalCsvCell(line.role),
           journalCsvCell(line.amount.asset),
           journalCsvCell(line.side === 'debit' ? amount : null),

@@ -101,12 +101,69 @@ async function candidatesFor(tx: StoreTx, movement: Movement): Promise<Candidate
 
 type Outcome = 'allocated' | 'partial' | 'ignored' | 'skipped' | ExceptionCode
 
+const INTERNAL_TRANSFER_REASON = 'internal transfer between watched accounts'
+
+async function recogniseInternalTransfer(
+  tx: StoreTx,
+  movement: Movement,
+  options: ReconcileOptions,
+): Promise<number | null> {
+  if (movement.txHash === null || movement.kind !== 'transfer') return null
+  const tenantId = movement.tenantId
+  if ((await candidatesFor(tx, movement)).length > 0) return null
+  if ((await tx.listAllocations({ tenantId, movementId: movement.id })).length > 0) return null
+  if ((await tx.listInternalTransferLinks({ tenantId, movementIds: [movement.id] })).length > 0) return null
+  const partners = (await tx.listMovements({ tenantId, txHash: movement.txHash })).filter(
+    (m) =>
+      m.id !== movement.id &&
+      m.kind === 'transfer' &&
+      (m.disposition === 'pending' || m.disposition === 'ignored' || m.disposition === 'exception') &&
+      m.network === movement.network &&
+      m.account === movement.counterparty &&
+      m.counterparty === movement.account &&
+      m.direction !== movement.direction &&
+      m.amount.asset === movement.amount.asset &&
+      m.amount.decimals === movement.amount.decimals &&
+      m.amount.equals(movement.amount),
+  )
+  if (partners.length !== 1) return null
+  const partner = partners[0]!
+  if ((await candidatesFor(tx, partner)).length > 0) return null
+  if ((await tx.listAllocations({ tenantId, movementId: partner.id })).length > 0) return null
+  if ((await tx.listInternalTransferLinks({ tenantId, movementIds: [partner.id] })).length > 0) return null
+
+  await tx.linkInternalTransfer({
+    tenantId,
+    network: movement.network,
+    txHash: movement.txHash,
+    movementIds: [movement.id, partner.id],
+    sameEntity: movement.entityId === partner.entityId,
+  })
+  await tx.setDisposition(tenantId, movement.id, 'ignored', INTERNAL_TRANSFER_REASON)
+  await tx.setDisposition(tenantId, partner.id, 'ignored', INTERNAL_TRANSFER_REASON)
+  for (const id of [movement.id, partner.id]) {
+    const open = (await tx.listExceptions({ tenantId, movementId: id })).filter((e) => e.status === 'open')
+    for (const exception of open) {
+      await tx.resolveException(tenantId, exception.id, { status: 'dismissed', note: INTERNAL_TRANSFER_REASON })
+    }
+  }
+  let posted = 0
+  if ((await postMovement(tx, tenantId, movement.id, options)) !== null) posted++
+  if ((await postMovement(tx, tenantId, partner.id, options)) !== null) posted++
+  return posted
+}
+
 async function reconcileOne(
   tx: StoreTx,
   tenantId: string,
   id: string,
   options: ReconcileOptions,
 ): Promise<{ outcome: Outcome; posted: number }> {
+  const movement = await tx.getMovement(tenantId, id)
+  if (movement === null || movement.disposition !== 'pending') return { outcome: 'skipped', posted: 0 }
+  const internal = await recogniseInternalTransfer(tx, movement, options)
+  if (internal !== null) return { outcome: 'ignored', posted: internal }
+
   let extraPostings = 0
   const outcome = await decideOne(tx, tenantId, id, options, () => {
     extraPostings++

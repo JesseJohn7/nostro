@@ -14,6 +14,7 @@ import type {
   ExceptionRecord,
   JournalEntry,
   JournalEntryKind,
+  InternalTransferLink,
   JournalLine,
   LineRole,
   Movement,
@@ -54,6 +55,7 @@ export function desiredLines(
   allocations: readonly Allocation[],
   exceptions: readonly ExceptionRecord[],
   refunds: readonly RefundLink[] = [],
+  transfers: readonly InternalTransferLink[] = [],
 ): DesiredLine[] | null {
   if (movement.disposition === 'pending') return null
 
@@ -72,6 +74,12 @@ export function desiredLines(
       exceptionId: null,
     },
   ]
+  const transfer = transfers.find((link) => link.movementIds.includes(movement.id))
+  if (transfer !== null && transfer !== undefined && allocations.length === 0 && refunds.length === 0) {
+    const role: LineRole = transfer.sameEntity ? 'in_transit' : credit ? 'due_to' : 'due_from'
+    lines.push({ role, side: other, amount: movement.amount, expectationId: null, exceptionId: null })
+    return lines
+  }
   const refund = refunds.find(link => link.refundMovementId === movement.id)
   if (refund) {
     if (refund.residualAmount.isPositive()) lines.push({role:'refund_clearing',side:'debit',amount:refund.residualAmount,expectationId:null,exceptionId:null})
@@ -94,7 +102,13 @@ export function desiredLines(
   }
   if (left.isPositive()) {
     let role: LineRole
-    if (movement.disposition === 'ignored') {
+    if (movement.kind === 'mint') {
+      role = 'deposit_clearing'
+    } else if (movement.kind === 'burn') {
+      role = 'redemption_payable'
+    } else if (movement.kind === 'clawback') {
+      role = 'clawback'
+    } else if (movement.disposition === 'ignored') {
       role = movement.kind === 'fee' ? 'network_fees' : credit ? 'uncategorized_income' : 'uncategorized_expense'
     } else if (credit) {
       role = latest !== null && OWED_BACK.has(latest.code) ? 'customer_credit' : 'unapplied'
@@ -177,6 +191,7 @@ function describe(kind: JournalEntryKind, movement: Movement): string {
 
 export interface PostingPlanOptions {
   readonly refunds?: readonly RefundLink[]
+  readonly transfers?: readonly InternalTransferLink[]
   readonly chart?: ChartOfAccounts
   /**
    * Ordered posting rules checked before the chart. The first matching rule
@@ -206,7 +221,7 @@ export function planPosting(
   existing: readonly JournalEntry[],
   options: PostingPlanOptions = {},
 ): NewJournalEntry | null {
-  const desired = desiredLines(movement, allocations, exceptions, options.refunds)
+  const desired = desiredLines(movement, allocations, exceptions, options.refunds, options.transfers)
   if (desired === null) return null
 
   // Check for trade leg pairs: movements with externalId ending in :sold or :bought
@@ -242,9 +257,10 @@ export function planPosting(
       const boughtDirection = isSold ? 'credit' : 'debit'
 
       // Add conversion line for sold asset
-      conversionLines.push({
-        account: movement.account,
-        role: 'conversion' as const,
+        conversionLines.push({
+          account: movement.account,
+          entityId: movement.entityId ?? null,
+          role: 'conversion' as const,
         side: soldDirection,
         amount: soldAmount,
         expectationId: null,
@@ -252,9 +268,10 @@ export function planPosting(
       })
 
       // Add conversion line for bought asset
-      conversionLines.push({
-        account: movement.account,
-        role: 'conversion' as const,
+        conversionLines.push({
+          account: movement.account,
+          entityId: movement.entityId ?? null,
+          role: 'conversion' as const,
         side: boughtDirection,
         amount: boughtAmount,
         expectationId: null,
@@ -337,6 +354,7 @@ export function planPosting(
 
   const lines: NewJournalLine[] = delta.map((l) => ({
     account: pickAccount(l),
+    entityId: movement.entityId ?? null,
     role: l.role,
     side: l.side,
     amount: l.amount,

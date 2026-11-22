@@ -4,7 +4,7 @@
  * node-postgres returns `numeric` and `bigint` as strings, which is what we
  * want: they become `bigint` here and never pass through `number`.
  */
-import type { Allocation, AssetId, DeliveryAttempt, ExceptionRecord, Expectation, JournalEntry, JournalLine, Json, Memo, Movement, MovementValuation, OutboxEvent, Rewind } from '@nostro-labs/nostro'
+import type { AccountEntity, AccountOpening, Allocation, AssetId, DeliveryAttempt, Entity, ExceptionRecord, Expectation, InternalTransferLink, JournalEntry, JournalLine, Json, Memo, Movement, MovementValuation, OpeningBalance, OutboxEvent, Rewind } from '@nostro-labs/nostro'
 import { Money, parseAsset } from '@nostro-labs/nostro'
 
 export interface MovementRow {
@@ -16,6 +16,7 @@ export interface MovementRow {
   external_id: string
   revision: number
   account: string
+  entity_id: string | null
   direction: Movement['direction']
   kind: Movement['kind']
   asset: string
@@ -34,6 +35,104 @@ export interface MovementRow {
   disposition: Movement['disposition']
   ignored_reason: string | null
   created_at: Date
+}
+
+export interface EntityRow {
+  id: string
+  tenant_id: string
+  name: string
+  created_at: Date
+}
+
+export function toEntity(r: EntityRow): Entity {
+  return Object.freeze({
+    id: r.id,
+    tenantId: r.tenant_id,
+    name: r.name,
+    createdAt: r.created_at,
+  })
+}
+
+export interface AccountEntityRow {
+  tenant_id: string
+  network: string
+  account: string
+  entity_id: string
+  created_at: Date
+}
+
+export function toAccountEntity(r: AccountEntityRow): AccountEntity {
+  return Object.freeze({
+    tenantId: r.tenant_id,
+    network: r.network,
+    account: r.account,
+    entityId: r.entity_id,
+    createdAt: r.created_at,
+  })
+}
+
+export interface InternalTransferLinkRow {
+  id: string
+  tenant_id: string
+  network: string
+  tx_hash: string
+  movement_a: string
+  movement_b: string
+  same_entity: boolean
+  created_at: Date
+}
+
+export function toInternalTransferLink(r: InternalTransferLinkRow): InternalTransferLink {
+  return Object.freeze({
+    id: r.id,
+    tenantId: r.tenant_id,
+    network: r.network,
+    txHash: r.tx_hash,
+    movementIds: Object.freeze([r.movement_a, r.movement_b]) as readonly [string, string],
+    sameEntity: r.same_entity,
+    createdAt: r.created_at,
+  })
+}
+
+export interface AccountOpeningRow {
+  id: string
+  tenant_id: string
+  network: string
+  account: string
+  ledger: string
+  occurred_at: Date
+  balances_json: string
+  note: string | null
+  created_at: Date
+}
+
+interface StoredOpeningBalance {
+  raw: string
+  asset: string
+  decimals: number
+  lastModifiedLedger: number | null
+}
+
+export function storedOpeningBalance(b: OpeningBalance): StoredOpeningBalance {
+  return { ...b.amount.toJSON(), lastModifiedLedger: b.lastModifiedLedger }
+}
+
+export function toAccountOpening(r: AccountOpeningRow): AccountOpening {
+  const balances = JSON.parse(r.balances_json) as StoredOpeningBalance[]
+  return Object.freeze({
+    id: r.id,
+    tenantId: r.tenant_id,
+    network: r.network,
+    account: r.account,
+    ledger: Number(r.ledger),
+    occurredAt: r.occurred_at,
+    balances: Object.freeze(balances.map((b) => Object.freeze({
+      amount: Money.fromRaw(BigInt(b.raw), parseAsset(b.asset), b.decimals),
+      lastModifiedLedger: b.lastModifiedLedger,
+    }))),
+    note: r.note,
+    createdAt: r.created_at,
+  })
 }
 
 export interface EventRow {
@@ -202,6 +301,7 @@ export function toMovement(r: MovementRow): Movement {
     externalId: r.external_id,
     revision: r.revision,
     account: r.account,
+    entityId: r.entity_id,
     direction: r.direction,
     kind: r.kind,
     amount: money(r.amount, r.asset, r.decimals),
@@ -290,6 +390,7 @@ export interface JournalLineRow {
   entry_id: string
   line_no: number
   account: string
+  entity_id: string | null
   role: JournalLine['role']
   side: JournalLine['side']
   asset: string
@@ -314,6 +415,7 @@ export function toJournalEntry(r: JournalEntryRow, lines: readonly JournalLineRo
       lines.map((l) =>
         Object.freeze({
           account: l.account,
+          entityId: l.entity_id,
           role: l.role,
           side: l.side,
           amount: money(l.amount, l.asset, l.decimals),

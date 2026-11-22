@@ -16,16 +16,27 @@
  * a SQL store for anything long-lived.
  */
 import type {
+  AccountEntity,
+  AccountEntityQuery,
+  AccountOpening,
   Allocation,
   CursorKey,
+  Entity,
+  EntityQuery,
   Disposition,
   Direction,
   ExceptionRecord,
   Expectation,
   ExpectationChanges,
+  InternalTransferLink,
+  InternalTransferQuery,
   JournalEntry,
   Movement,
+  NewAccountEntity,
+  NewAccountOpening,
   NewAllocation,
+  NewEntity,
+  NewInternalTransferLink,
   NewException,
   NewExpectation,
   NewJournalEntry,
@@ -33,15 +44,21 @@ import type {
   MovementValuation,
   NewMovementValuation,
   ValuationQuery,
+  OpeningBalance,
 } from '../model/index.js'
 import {
   assertValidNewJournalEntry,
+  assertValidNewAccountEntity,
+  assertValidNewAccountOpening,
+  assertValidNewEntity,
+  assertValidNewInternalTransferLink,
   assertValidNewAllocation,
   assertValidNewException,
   assertValidNewExpectation,
   assertValidNewMovement,
 } from '../model/index.js'
 import type {
+  AccountOpeningQuery,
   RefundLink,
   RefundQuery,
   ExportBatch,
@@ -99,6 +116,10 @@ export interface MemoryStoreOptions {
 
 interface State {
   seq: number
+  readonly entities: Map<string, Entity>
+  readonly accountEntities: Map<string, AccountEntity>
+  readonly internalTransferLinks: Map<string, InternalTransferLink>
+  readonly accountOpenings: Map<string, AccountOpening>
   readonly movements: Map<string, Movement>
   /** Dedupe key → movement id. */
   readonly movementKeys: Map<string, string>
@@ -136,6 +157,10 @@ interface State {
 function emptyState(): State {
   return {
     seq: 0,
+    entities: new Map(),
+    accountEntities: new Map(),
+    internalTransferLinks: new Map(),
+    accountOpenings: new Map(),
     movements: new Map(),
     movementKeys: new Map(),
     expectations: new Map(),
@@ -164,6 +189,10 @@ function emptyState(): State {
 function cloneState(s: State): State {
   return {
     seq: s.seq,
+    entities: new Map(s.entities),
+    accountEntities: new Map(s.accountEntities),
+    internalTransferLinks: new Map(s.internalTransferLinks),
+    accountOpenings: new Map(s.accountOpenings),
     movements: new Map(s.movements),
     movementKeys: new Map(s.movementKeys),
     expectations: new Map(s.expectations),
@@ -192,7 +221,15 @@ const key = (...parts: readonly string[]): string => JSON.stringify(parts)
 const movementKey = (m: { tenantId: string; network: string; source: string; externalId: string }) =>
   key(m.tenantId, m.network, m.source, m.externalId)
 const cursorKey = (k: CursorKey) => key(k.tenantId, k.network, k.source, k.account)
+const openingKey = (o: Pick<AccountOpening, 'tenantId' | 'network' | 'account'>) =>
+  key(o.tenantId, o.network, o.account)
+const entityKey = (e: Pick<Entity, 'tenantId' | 'id'>) => key(e.tenantId, e.id)
+const accountEntityKey = (a: Pick<AccountEntity, 'tenantId' | 'network' | 'account'>) =>
+  key(a.tenantId, a.network, a.account)
+const internalTransferKey = (l: Pick<InternalTransferLink, 'tenantId' | 'network' | 'txHash' | 'movementIds'>) =>
+  key(l.tenantId, l.network, l.txHash, [...l.movementIds].sort().join(':'))
 const copyDate = (d: Date): Date => new Date(d.getTime())
+const copyOpeningBalance = (b: OpeningBalance): OpeningBalance => Object.freeze({ amount: b.amount, lastModifiedLedger: b.lastModifiedLedger })
 
 const addReferenceKeys = (state: State, e: Expectation): void => {
   for (const normalized of expectationReferenceKeys(e.reference, e.memo)) {
@@ -243,6 +280,7 @@ abstract class MemoryReader implements StoreReader {
       if (ids !== null && !ids.has(m.id)) continue
       if (q.disposition !== undefined && m.disposition !== q.disposition) continue
       if (q.account !== undefined && m.account !== q.account) continue
+      if (q.entityId !== undefined && m.entityId !== q.entityId) continue
       if (q.txHash !== undefined && m.txHash !== q.txHash) continue
       if (q.afterSeq !== undefined && m.seq <= q.afterSeq) continue
       out.push(m)
@@ -409,6 +447,71 @@ abstract class MemoryReader implements StoreReader {
       .slice(0, q.limit ?? DELIVERY_ATTEMPT_LIMIT)
   }
 
+  async getEntity(tenantId: string, id: string): Promise<Entity | null> {
+    this.check()
+    return this.snapshot().entities.get(entityKey({ tenantId, id })) ?? null
+  }
+
+  async listEntities(q: EntityQuery): Promise<Entity[]> {
+    this.check()
+    const out = [...this.snapshot().entities.values()].filter((e) => e.tenantId === q.tenantId)
+    out.sort((a, b) => a.id.localeCompare(b.id))
+    return q.limit === undefined ? out : out.slice(0, q.limit)
+  }
+
+  async getAccountEntity(tenantId: string, network: string, account: string): Promise<AccountEntity | null> {
+    this.check()
+    return this.snapshot().accountEntities.get(accountEntityKey({ tenantId, network, account })) ?? null
+  }
+
+  async listAccountEntities(q: AccountEntityQuery): Promise<AccountEntity[]> {
+    this.check()
+    const out = [...this.snapshot().accountEntities.values()].filter((a) =>
+      a.tenantId === q.tenantId &&
+      (q.network === undefined || a.network === q.network) &&
+      (q.account === undefined || a.account === q.account) &&
+      (q.entityId === undefined || a.entityId === q.entityId)
+    )
+    out.sort((a, b) => a.account.localeCompare(b.account) || a.network.localeCompare(b.network))
+    return q.limit === undefined ? out : out.slice(0, q.limit)
+  }
+
+  async getInternalTransferLink(tenantId: string, id: string): Promise<InternalTransferLink | null> {
+    this.check()
+    const link = this.snapshot().internalTransferLinks.get(id)
+    return link !== undefined && link.tenantId === tenantId ? link : null
+  }
+
+  async listInternalTransferLinks(q: InternalTransferQuery): Promise<InternalTransferLink[]> {
+    this.check()
+    if (q.movementIds?.length === 0) return []
+    const movementIds = q.movementIds === undefined ? null : new Set(q.movementIds)
+    const out = [...this.snapshot().internalTransferLinks.values()].filter((l) =>
+      l.tenantId === q.tenantId &&
+      (q.network === undefined || l.network === q.network) &&
+      (q.txHash === undefined || l.txHash === q.txHash) &&
+      (movementIds === null || l.movementIds.some((id) => movementIds.has(id)))
+    )
+    out.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
+    return q.limit === undefined ? out : out.slice(0, q.limit)
+  }
+
+  async getAccountOpening(tenantId: string, network: string, account: string): Promise<AccountOpening | null> {
+    this.check()
+    return this.snapshot().accountOpenings.get(openingKey({ tenantId, network, account })) ?? null
+  }
+
+  async listAccountOpenings(q: AccountOpeningQuery): Promise<AccountOpening[]> {
+    this.check()
+    const out = [...this.snapshot().accountOpenings.values()].filter((o) =>
+      o.tenantId === q.tenantId &&
+      (q.network === undefined || o.network === q.network) &&
+      (q.account === undefined || o.account === q.account)
+    )
+    out.sort((a, b) => a.ledger - b.ledger || a.id.localeCompare(b.id))
+    return q.limit === undefined ? out : out.slice(0, q.limit)
+  }
+
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
     this.check()
     if (q.movementIds?.length === 0) return []
@@ -425,6 +528,7 @@ abstract class MemoryReader implements StoreReader {
       if (q.effectiveFrom !== undefined && e.effectiveAt.getTime() < q.effectiveFrom.getTime()) continue
       if (q.effectiveBefore !== undefined && e.effectiveAt.getTime() >= q.effectiveBefore.getTime()) continue
       if (q.account !== undefined && !e.lines.some((l) => l.account === q.account)) continue
+      if (q.entityId !== undefined && !e.lines.some((l) => l.entityId === q.entityId)) continue
       out.push(e)
     }
     out.sort((a, b) => a.seq - b.seq)
@@ -548,6 +652,85 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.draft.events.set(record.id, record)
   }
 
+  async insertEntity(n: NewEntity): Promise<Entity> {
+    this.check()
+    assertValidNewEntity(n)
+    const k = entityKey(n)
+    if (this.draft.entities.has(k)) {
+      throw new ConstraintError('entity_duplicate', `entity ${n.id} already exists in this tenant`)
+    }
+    const record: Entity = Object.freeze({ ...n, createdAt: this.now() })
+    this.draft.entities.set(k, record)
+    return record
+  }
+
+  async assignAccountEntity(n: NewAccountEntity): Promise<AccountEntity> {
+    this.check()
+    assertValidNewAccountEntity(n)
+    if (!this.draft.entities.has(entityKey({ tenantId: n.tenantId, id: n.entityId }))) {
+      throw new ConstraintError('entity_unknown', `entity ${n.entityId} does not exist in this tenant`)
+    }
+    const k = accountEntityKey(n)
+    const record: AccountEntity = Object.freeze({ ...n, createdAt: this.now() })
+    this.draft.accountEntities.set(k, record)
+    return record
+  }
+
+  async linkInternalTransfer(n: NewInternalTransferLink): Promise<InternalTransferLink> {
+    this.check()
+    assertValidNewInternalTransferLink(n)
+    const [a, b] = n.movementIds.map((id) => this.movement(n.tenantId, id)) as [Movement, Movement]
+    if (a.network !== n.network || b.network !== n.network) {
+      throw new ConstraintError('internal_transfer_invalid', 'both movements must be on the transfer network')
+    }
+    const sameEntity = a.entityId === b.entityId
+    if (sameEntity !== n.sameEntity) {
+      throw new ConstraintError('internal_transfer_invalid', 'sameEntity disagrees with the linked movements')
+    }
+    const k = internalTransferKey(n)
+    if (this.draft.internalTransferLinks.has(k)) {
+      throw new ConstraintError('internal_transfer_duplicate', 'these movements are already linked')
+    }
+    const existing = [...this.draft.internalTransferLinks.values()].find((l) =>
+      l.movementIds.some((id) => n.movementIds.includes(id)))
+    if (existing !== undefined) {
+      throw new ConstraintError('internal_transfer_duplicate', 'a movement is already part of another internal transfer')
+    }
+    const record: InternalTransferLink = Object.freeze({
+      ...n,
+      id: this.ids(),
+      movementIds: Object.freeze([n.movementIds[0]!, n.movementIds[1]!]) as readonly [string, string],
+      sameEntity,
+      createdAt: this.now(),
+    })
+    this.draft.internalTransferLinks.set(record.id, record)
+    return record
+  }
+
+  async insertAccountOpening(opening: NewAccountOpening): Promise<AccountOpening> {
+    this.check()
+    assertValidNewAccountOpening(opening)
+    const k = openingKey(opening)
+    if (this.draft.accountOpenings.has(k)) {
+      throw new ConstraintError('account_opening_duplicate', `${opening.network}:${opening.account} already has an opening`)
+    }
+    const hasMovements = [...this.draft.movements.values()].some((m) =>
+      m.tenantId === opening.tenantId && m.network === opening.network && m.account === opening.account)
+    if (hasMovements) {
+      throw new ConstraintError('account_opening_has_movements', `${opening.network}:${opening.account} already has movements`)
+    }
+    const record: AccountOpening = Object.freeze({
+      ...opening,
+      id: this.ids(),
+      occurredAt: copyDate(opening.occurredAt ?? this.now()),
+      balances: Object.freeze(opening.balances.map(copyOpeningBalance)),
+      note: opening.note ?? null,
+      createdAt: this.now(),
+    })
+    this.draft.accountOpenings.set(k, record)
+    return record
+  }
+
   async insertMovements(batch: readonly NewMovement[]): Promise<InsertMovementsResult> {
     this.check()
     batch.forEach(assertValidNewMovement)
@@ -555,6 +738,11 @@ class MemoryTx extends MemoryReader implements StoreTx {
     const duplicates: Movement[] = []
     const conflicts: MovementConflict[] = []
     for (const n of batch) {
+      const assignment = this.draft.accountEntities.get(accountEntityKey(n))
+      const entityId = n.entityId ?? assignment?.entityId ?? null
+      if (entityId !== null && !this.draft.entities.has(entityKey({ tenantId: n.tenantId, id: entityId }))) {
+        throw new ConstraintError('entity_unknown', `entity ${entityId} does not exist in this tenant`)
+      }
       const candidate: Movement = Object.freeze({
         id: '',
         tenantId: n.tenantId,
@@ -564,6 +752,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
         externalId: n.externalId,
         revision: n.revision ?? 1,
         account: n.account,
+        entityId,
         direction: n.direction,
         kind: n.kind,
         amount: n.amount,
@@ -878,6 +1067,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
         n.lines.map((l) =>
           Object.freeze({
             account: l.account,
+            entityId: l.entityId ?? movement?.entityId ?? null,
             role: l.role,
             side: l.side,
             amount: l.amount,

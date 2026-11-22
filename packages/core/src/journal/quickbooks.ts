@@ -25,6 +25,7 @@ async function validate(options: JournalQuickBooksOptions): Promise<ExportSnapsh
   for await (const entry of journalEntries(options)) {
     throughSeq = entry.seq
     for (const line of entry.lines) {
+      if (options.entityId !== undefined && line.entityId !== options.entityId) continue
       assets.add(line.amount.asset)
       const mapped = options.accountMap[line.account]
       if (!Object.hasOwn(options.accountMap, line.account) || typeof mapped !== 'string' || mapped.trim() === '') {
@@ -38,8 +39,8 @@ async function validate(options: JournalQuickBooksOptions): Promise<ExportSnapsh
   return { throughSeq }
 }
 
-function entryRows(entry: JournalEntry, accountMap: Readonly<Record<string, string>>): string[] {
-  return entry.lines.map((line) =>
+function entryRows(entry: JournalEntry, accountMap: Readonly<Record<string, string>>, entityId?: string): string[] {
+  return entry.lines.filter((line) => entityId === undefined || line.entityId === entityId).map((line) =>
     journalCsvRow([
       journalCsvCell(entry.id),
       journalCsvCell(entry.effectiveAt.toISOString().slice(0, 10)),
@@ -56,6 +57,6 @@ export async function* journalQuickBooksRows(options: JournalQuickBooksOptions):
   const snapshot = await validate(options)
   yield journalCsvRow(JOURNAL_QUICKBOOKS_COLUMNS.map((column) => column))
   for await (const entry of journalEntries({ ...options, throughSeq: snapshot.throughSeq })) {
-    yield* entryRows(entry, options.accountMap)
+    yield* entryRows(entry, options.accountMap, options.entityId)
   }
 }

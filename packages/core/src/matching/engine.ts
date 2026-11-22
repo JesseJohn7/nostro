@@ -5,7 +5,7 @@
  * always give the same decision, every decision can be replayed from a
  * fixture, and the reasons behind it are recorded as evidence.
  *
- * 1. Fees are never matched: they are posted to expense.
+ * 1. Fees and clawbacks are never matched: they are posted by kind.
  * 2. Every strategy scores every candidate. Within a signal family only the
  *    strongest signal counts; across families scores combine as
  *    `1 − Π(1 − sᵢ)`, so independent evidence corroborates.
@@ -116,6 +116,9 @@ export function decide(
 
   if (movement.kind === 'fee') {
     return { outcome: 'ignore', reason: 'network fee: posted to expense, never matched' }
+  }
+  if (movement.kind === 'clawback') {
+    return { outcome: 'ignore', reason: 'clawback: posted to its own account, never matched' }
   }
 
   const scored = candidates

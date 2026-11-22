@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { FakeHorizon } from 'nostro-testkit'
-import type { BalanceSnapshot, BalanceSource, Movement, MovementSource, NewMovement, PullRequest } from '../src/index.js'
+import type { AccountOpening, BalanceSnapshot, BalanceSource, Movement, MovementSource, NewMovement, PullRequest } from '../src/index.js'
 import {
   HorizonBalanceSource,
   HorizonClient,
@@ -74,6 +74,26 @@ describe('compareBalances', () => {
       recorded(fact(10, xlm('10')), fact(20, xlm('5')), fact(21, xlm('99'))),
     )
     expect(statuses(checks)).toEqual([[NATIVE, 'match', '15.0000000', '15.0000000', 20]])
+  })
+
+  it('starts from an opening balance and skips movements before and at its ledger', () => {
+    const opening: AccountOpening = {
+      id: 'opening-1',
+      tenantId: T,
+      network: 'testnet',
+      account: A,
+      ledger: 20,
+      occurredAt: new Date('2026-10-01T00:00:00Z'),
+      balances: [{ amount: xlm('10'), lastModifiedLedger: 19 }],
+      note: null,
+      createdAt: new Date('2026-10-01T00:00:00Z'),
+    }
+    const checks = compareBalances(
+      snapshot([{ amount: xlm('15'), lastModifiedLedger: 25 }]),
+      recorded(fact(10, xlm('999')), fact(20, xlm('888')), fact(21, xlm('5'))),
+      opening,
+    )
+    expect(statuses(checks)).toEqual([[NATIVE, 'match', '15.0000000', '15.0000000', 25]])
   })
 
   it('reports a mismatch when something is missing', () => {

@@ -260,6 +260,7 @@ export function buildOpenApi() {
             'The `balanced` flag is `true` when every asset balances across all accounts.',
           parameters: [
             { name: 'asOf', in: 'query', required: false, schema: { type: 'string', format: 'date-time' }, description: 'Balance as of this instant; omit for all-time.' },
+            { name: 'entityId', in: 'query', required: false, schema: { type: 'string', minLength: 1, maxLength: 100 }, description: 'Only lines belonging to this entity.' },
           ],
           responses: { '200': ok('TrialBalanceReport'), ...errors },
         },
@@ -274,6 +275,7 @@ export function buildOpenApi() {
             { name: 'asset', in: 'query', required: true, schema: { type: 'string' }, description: 'Asset id, e.g. "native" or "USDC:GA5Z...".' },
             { name: 'from', in: 'query', required: false, schema: { type: 'string', format: 'date-time' }, description: 'Range start (inclusive).' },
             { name: 'to', in: 'query', required: false, schema: { type: 'string', format: 'date-time' }, description: 'Range end (exclusive).' },
+            { name: 'entityId', in: 'query', required: false, schema: { type: 'string', minLength: 1, maxLength: 100 }, description: 'Only lines belonging to this entity.' },
           ],
           responses: { '200': ok('AccountLedgerReport'), ...errors },
         },
@@ -288,6 +290,7 @@ export function buildOpenApi() {
             '`receivable` and `payable` normally run credit balances inside nostro; see docs/journal.md.',
           parameters: [
             { name: 'asOf', in: 'query', required: false, schema: { type: 'string', format: 'date-time' }, description: 'Balance as of this instant; omit for all-time.' },
+            { name: 'entityId', in: 'query', required: false, schema: { type: 'string', minLength: 1, maxLength: 100 }, description: 'Only lines belonging to this entity.' },
           ],
           responses: { '200': ok('BalanceSheetReport'), ...errors },
         },
@@ -300,6 +303,7 @@ export function buildOpenApi() {
           parameters: [
             { name: 'from', in: 'query', required: false, schema: { type: 'string', format: 'date-time' }, description: 'Period start (inclusive).' },
             { name: 'to', in: 'query', required: false, schema: { type: 'string', format: 'date-time' }, description: 'Period end (exclusive).' },
+            { name: 'entityId', in: 'query', required: false, schema: { type: 'string', minLength: 1, maxLength: 100 }, description: 'Only lines belonging to this entity.' },
           ],
           responses: { '200': ok('IncomeStatementReport'), ...errors },
         },
