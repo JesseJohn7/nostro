@@ -671,4 +671,39 @@ PRIMARY KEY (tenant_id, destination)
       )
       BEGIN SELECT RAISE(ABORT, 'a movement is already part of another internal transfer'); END;
   `,
+  `
+    CREATE TABLE api_keys (
+      id           TEXT PRIMARY KEY,
+      tenant_id    TEXT NOT NULL,
+      label        TEXT NOT NULL,
+      digest       TEXT NOT NULL UNIQUE CHECK (length(digest) = 64),
+      scopes       TEXT NOT NULL,
+      created_at   INTEGER NOT NULL,
+      revoked_at   INTEGER,
+      last_used_at INTEGER
+    );
+    CREATE INDEX api_keys_tenant ON api_keys (tenant_id, created_at);
+
+    CREATE TABLE watched_accounts (
+      tenant_id TEXT NOT NULL,
+      account   TEXT NOT NULL,
+      source    TEXT NOT NULL CHECK (source IN ('config', 'api')),
+      added_at  INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, account)
+    );
+
+    CREATE TABLE sync_state (
+      tenant_id       TEXT NOT NULL,
+      network         TEXT NOT NULL,
+      source          TEXT NOT NULL,
+      account         TEXT NOT NULL,
+      cursor          TEXT,
+      last_attempt_at INTEGER NOT NULL,
+      last_success_at INTEGER,
+      caught_up       INTEGER NOT NULL CHECK (caught_up IN (0, 1)),
+      last_error      TEXT,
+      last_error_at   INTEGER,
+      PRIMARY KEY (tenant_id, network, source, account)
+    );
+  `,
 ]

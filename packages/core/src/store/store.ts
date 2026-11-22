@@ -164,6 +164,57 @@ export interface RefundQuery {
   readonly movementIds?: readonly string[]
 }
 
+/**
+ * An API key as the store keeps it. The plain key is never here: only its
+ * SHA-256 digest, as lowercase hex. Scopes are opaque to the store; the
+ * server defines what they mean.
+ */
+export interface ApiKeyRow {
+  readonly id: string
+  readonly tenantId: string
+  readonly label: string
+  readonly digest: string
+  readonly scopes: readonly string[]
+  readonly createdAt: Date
+  readonly revokedAt: Date | null
+  readonly lastUsedAt: Date | null
+}
+
+export interface NewApiKeyRow {
+  readonly id: string
+  readonly tenantId: string
+  readonly label: string
+  readonly digest: string
+  readonly scopes: readonly string[]
+  readonly createdAt: Date
+}
+
+/** An account the tenant's worker syncs: from the config file (`config`) or added through the API. */
+export interface WatchedAccountRow {
+  readonly tenantId: string
+  readonly account: string
+  readonly source: 'config' | 'api'
+  readonly addedAt: Date
+}
+
+/**
+ * Where sync stands for one (tenant, network, source, account). Written by
+ * the worker after each pull, so it works across processes. `caughtUp` means
+ * the last pull returned everything there was, without an error.
+ */
+export interface SyncStateRow {
+  readonly tenantId: string
+  readonly network: string
+  readonly source: string
+  readonly account: string
+  readonly cursor: string | null
+  readonly lastAttemptAt: Date
+  readonly lastSuccessAt: Date | null
+  readonly caughtUp: boolean
+  readonly lastError: string | null
+  readonly lastErrorAt: Date | null
+}
+
 /** Read access. Every lookup is scoped by tenant; ids from another tenant read as absent. */
 export interface StoreReader extends JournalReader {
   getEntity(tenantId: string, id: string): Promise<Entity | null>
@@ -174,6 +225,12 @@ export interface StoreReader extends JournalReader {
   listInternalTransferLinks(query: InternalTransferQuery): Promise<InternalTransferLink[]>
   getAccountOpening(tenantId: string, network: string, account: string): Promise<AccountOpening | null>
   listAccountOpenings(query: AccountOpeningQuery): Promise<AccountOpening[]>
+  /** The key with this digest, revoked or not, or null. Used by the server's authentication. */
+  findApiKeyByDigest(digest: string): Promise<ApiKeyRow | null>
+  /** Every key, or only one tenant's, oldest first. Never returns a plain key. */
+  listApiKeys(tenantId?: string): Promise<ApiKeyRow[]>
+  listWatchedAccounts(tenantId: string): Promise<WatchedAccountRow[]>
+  listSyncState(tenantId: string): Promise<SyncStateRow[]>
   listRefundLinks(query: RefundQuery): Promise<RefundLink[]>
   accrualGetMode(tenantId: string): Promise<boolean>
   getMovement(tenantId: string, id: string): Promise<Movement | null>
@@ -258,6 +315,23 @@ export interface StoreTx extends StoreReader, JournalTx {
   ): Promise<Movement>
 
   setCursor(key: CursorKey, value: string): Promise<void>
+
+  /** Fails with `api_key_digest_unique` if the digest is already stored. */
+  insertApiKey(key: NewApiKeyRow): Promise<ApiKeyRow>
+  /**
+   * Revoke a key. Revoking one already revoked keeps its first time. Fails
+   * with `NotFoundError` for an unknown id.
+   */
+  revokeApiKey(id: string, at: Date): Promise<ApiKeyRow>
+  /** Record that each key was used at its time, keeping the latest per key. Unknown ids are ignored. */
+  recordApiKeyUse(uses: readonly { readonly id: string; readonly at: Date }[]): Promise<void>
+
+  /** Add a watched account. Idempotent: an account already watched keeps its original row. */
+  addWatchedAccount(row: WatchedAccountRow): Promise<WatchedAccountRow>
+  /** Stop watching an account. Returns false if it was not watched. Its movements and cursor stay. */
+  removeWatchedAccount(tenantId: string, account: string): Promise<boolean>
+  /** Insert or replace the sync state for one (tenant, network, source, account). */
+  recordSyncState(state: SyncStateRow): Promise<void>
 
   /** Append one delivery attempt, then enforce the per-consumer retention bound. */
   recordDeliveryAttempt(attempt: NewDeliveryAttempt): Promise<DeliveryAttempt>
@@ -417,6 +491,7 @@ export type ConstraintName =
   | 'journal_period_closed'
   | 'journal_period_not_closed'
   | 'journal_cash_without_movement'
+  | 'api_key_digest_unique'
 
 export class StoreError extends Error {
   constructor(
@@ -430,7 +505,7 @@ export class StoreError extends Error {
 
 export class NotFoundError extends StoreError {
   constructor(
-    public readonly entity: 'movement' | 'expectation' | 'exception' | 'account_opening' | 'entity' | 'account_entity' | 'internal_transfer_link',
+    public readonly entity: 'movement' | 'expectation' | 'exception' | 'account_opening' | 'entity' | 'account_entity' | 'internal_transfer_link' | 'api_key',
     public readonly id: string,
   ) {
     super('NOT_FOUND', `${entity} ${id} not found`)

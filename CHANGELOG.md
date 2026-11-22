@@ -5,6 +5,28 @@ before 1.0, a minor version may change the API.
 
 ## Unreleased
 
+- **API keys live in the database.** `nostro keys create --tenant <id> --label <text> --scopes <list>`
+  prints a new key once; `nostro keys list` shows ids, labels, scopes and last use, never keys; and
+  `nostro keys revoke <id>` revokes one. A revoked key is refused on its next request, with no
+  restart. Only a SHA-256 digest is stored. Keys from `NOSTRO_API_KEYS` and `--keys-file` still work
+  next to stored ones. **Run `nostro migrate` before upgrading**: the store gains an `api_keys` table.
+  Keys from the store look like `nstk_` followed by 43 characters, so secret scanners can find a leak.
+- **Watched accounts over the API.** `GET /v1/accounts` lists the accounts a tenant syncs, with each
+  one's sync state: the saved cursor, when it last synced, whether it is caught up, and the last
+  error (cleared by the next good round). `POST /v1/accounts` starts syncing an account on the next
+  round, with no restart, and `DELETE /v1/accounts/{account}` stops it. Removing keeps its movements,
+  expectations and cursor, and adding it again resumes from that cursor. An account from the
+  service configuration cannot be removed over the API (`config_managed`), and one with open
+  expectations needs `?force=true` (`has_open_expectations`). The `accounts` scope covers writes.
+  The watch list and sync state are kept in the store, so they work across processes. **Run
+  `nostro migrate` before upgrading.**
+- **Breaking: API keys have scopes.** `apiKeys()` now returns a `Principal` (tenant, scopes and key
+  id) where it returned a tenant id, and `Authenticate` follows. A route the key lacks the scope for
+  answers `403 forbidden`, a new problem code. Keys written without scopes keep every scope, so
+  existing deployments keep working, but `serve` warns about each one at startup. To narrow a key,
+  write `tenant[read,events]:key` in `NOSTRO_API_KEYS` or `--keys-file`; brackets are only read
+  before the first colon, so existing keys, including keys that contain colons, parse as they did.
+  Tenant ids may not contain `[`, `]`, `:` or whitespace.
 - Webhook delivery is observable and replayable. Every POST is recorded in a bounded, prunable
   attempt log, and consumers can be listed and inspected before their first delivery round.
 - `GET /v1/webhooks`, `GET /v1/webhooks/{consumer}/status`,
@@ -12,6 +34,12 @@ before 1.0, a minor version may change the API.
   API; replay is a compare-and-set on the consumer's position and is recorded with its actor.
 - The deliverer stops before a POST, as well as at its cursor compare, when a replay has moved the
   consumer underneath it.
+- `nostro serve --config <file>` serves every tenant in a JSON file, each with its own accounts,
+  network and webhook. Each tenant runs a sync loop and a delivery loop on their own timers
+  (`--interval`, `--delivery-interval`), and a failing tenant backs off without holding up the
+  others. `--concurrency` bounds the rounds that run at once; `--shutdown-timeout` bounds the wait
+  on Ctrl-C. A webhook names the environment variable that holds its secret. The single-tenant flags
+  keep working unchanged. Log lines carry `[tenant=<id>]`.
 
 ## 0.1.0 (2026-11-06)
 
@@ -92,4 +120,3 @@ webhooks.
   that Horizon no longer keeps.
 - **Sources:** Horizon only. There is no Stellar RPC source, and no SEP-41 contract tokens.
 - **Accounting:** generic CSV export only, with no accounting periods.
-- `nostro serve` syncs one tenant's accounts. The API serves every tenant that has a key.

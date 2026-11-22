@@ -5,7 +5,7 @@ import type { Candidate, MatchStrategy } from '../types.js'
 const EARLY_PAYMENT_MS = 7 * 24 * 60 * 60 * 1000
 
 function fits(movement: Movement, { expectation, remaining }: Candidate): boolean {
-  if (expectation.fingerprintSuffix === null) return false
+  if (expectation.fingerprintSuffix == null) return false
   if (remaining.asset !== movement.amount.asset || remaining.decimals !== movement.amount.decimals) return false
   // The fingerprinted amount is the full invoiced amount (base + suffix).
   // The movement must match the remaining owed exactly.

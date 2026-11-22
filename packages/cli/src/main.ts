@@ -9,6 +9,7 @@ import type { Command } from './command.js'
 import { chart } from './commands/chart.js'
 import { doctor } from './commands/doctor.js'
 import { entity } from './commands/entity.js'
+import { keys } from './commands/keys.js'
 import { exceptions } from './commands/exceptions.js'
 import { expect } from './commands/expect.js'
 import { expectations } from './commands/expectations.js'
@@ -31,6 +32,7 @@ import { clean, write } from './io.js'
 
 export const COMMANDS: readonly Command[] = [
   migrate,
+  keys,
   sync,
   entity,
   open,

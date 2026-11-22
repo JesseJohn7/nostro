@@ -18,6 +18,10 @@ import { EventHistoryPrunedError } from '@nostro-labs/nostro'
 import type {
   AccountOpening,
   AccountOpeningQuery,
+  ApiKeyRow,
+  NewApiKeyRow,
+  SyncStateRow,
+  WatchedAccountRow,
   Allocation,
   AllocationQuery,
   AccountEntity,
@@ -412,6 +416,37 @@ class Where {
   }
 }
 
+const toApiKey = (row: Row): ApiKeyRow => ({
+  id: row.id as string,
+  tenantId: row.tenant_id as string,
+  label: row.label as string,
+  digest: row.digest as string,
+  scopes: JSON.parse(row.scopes as string) as string[],
+  createdAt: new Date(row.created_at as number),
+  revokedAt: row.revoked_at === null ? null : new Date(row.revoked_at as number),
+  lastUsedAt: row.last_used_at === null ? null : new Date(row.last_used_at as number),
+})
+
+const toWatched = (row: Row): WatchedAccountRow => ({
+  tenantId: row.tenant_id as string,
+  account: row.account as string,
+  source: row.source as 'config' | 'api',
+  addedAt: new Date(row.added_at as number),
+})
+
+const toSyncState = (row: Row): SyncStateRow => ({
+  tenantId: row.tenant_id as string,
+  network: row.network as string,
+  source: row.source as string,
+  account: row.account as string,
+  cursor: row.cursor as string | null,
+  lastAttemptAt: new Date(row.last_attempt_at as number),
+  lastSuccessAt: row.last_success_at === null ? null : new Date(row.last_success_at as number),
+  caughtUp: row.caught_up === 1,
+  lastError: row.last_error as string | null,
+  lastErrorAt: row.last_error_at === null ? null : new Date(row.last_error_at as number),
+})
+
 class SqliteReader implements StoreReader {
   constructor(private readonly connection: () => Database.Database) {}
 
@@ -650,6 +685,26 @@ class SqliteReader implements StoreReader {
     return row === undefined ? null : (row.value as string)
   }
 
+  async findApiKeyByDigest(digest: string): Promise<ApiKeyRow | null> {
+    const row = this.one('SELECT * FROM api_keys WHERE digest = ?', [digest])
+    return row === undefined ? null : toApiKey(row)
+  }
+
+  async listApiKeys(tenantId?: string): Promise<ApiKeyRow[]> {
+    const rows = tenantId === undefined
+      ? this.all('SELECT * FROM api_keys ORDER BY created_at, id')
+      : this.all('SELECT * FROM api_keys WHERE tenant_id = ? ORDER BY created_at, id', [tenantId])
+    return rows.map(toApiKey)
+  }
+
+  async listWatchedAccounts(tenantId: string): Promise<WatchedAccountRow[]> {
+    return this.all('SELECT * FROM watched_accounts WHERE tenant_id = ? ORDER BY added_at, account', [tenantId]).map(toWatched)
+  }
+
+  async listSyncState(tenantId: string): Promise<SyncStateRow[]> {
+    return this.all('SELECT * FROM sync_state WHERE tenant_id = ? ORDER BY account, source, network', [tenantId]).map(toSyncState)
+  }
+
   async getJournalPeriod(tenantId: string): Promise<JournalPeriod | null> {
     const row = this.one(
       'SELECT action, closed_through, note, created_at FROM journal_period_actions WHERE tenant_id = ? ORDER BY seq DESC LIMIT 1',
@@ -798,6 +853,73 @@ class SqliteTx extends SqliteReader implements StoreTx {
       `INSERT INTO cursors (tenant_id, network, source, account, value) VALUES (?, ?, ?, ?, ?)
        ON CONFLICT (tenant_id, network, source, account) DO UPDATE SET value = excluded.value`,
       [k.tenantId, k.network, k.source, k.account, value],
+    )
+  }
+
+  async insertApiKey(input: NewApiKeyRow): Promise<ApiKeyRow> {
+    if (this.one('SELECT 1 FROM api_keys WHERE digest = ?', [input.digest]) !== undefined) {
+      throw new ConstraintError('api_key_digest_unique', 'that key is already stored')
+    }
+    this.exec(
+      'INSERT INTO api_keys (id, tenant_id, label, digest, scopes, created_at, revoked_at, last_used_at) VALUES (?, ?, ?, ?, ?, ?, NULL, NULL)',
+      [input.id, input.tenantId, input.label, input.digest, JSON.stringify([...input.scopes]), input.createdAt.getTime()],
+    )
+    return toApiKey(this.one('SELECT * FROM api_keys WHERE id = ?', [input.id])!)
+  }
+
+  async revokeApiKey(id: string, at: Date): Promise<ApiKeyRow> {
+    const row = this.one('SELECT * FROM api_keys WHERE id = ?', [id])
+    if (row === undefined) throw new NotFoundError('api_key', id)
+    if (row.revoked_at === null) {
+      this.exec('UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL', [at.getTime(), id])
+    }
+    return toApiKey(this.one('SELECT * FROM api_keys WHERE id = ?', [id])!)
+  }
+
+  async recordApiKeyUse(uses: readonly { readonly id: string; readonly at: Date }[]): Promise<void> {
+    for (const { id, at } of uses) {
+      this.exec('UPDATE api_keys SET last_used_at = MAX(COALESCE(last_used_at, 0), ?) WHERE id = ?', [at.getTime(), id])
+    }
+  }
+
+  async addWatchedAccount(row: WatchedAccountRow): Promise<WatchedAccountRow> {
+    const existing = this.one('SELECT * FROM watched_accounts WHERE tenant_id = ? AND account = ?', [row.tenantId, row.account])
+    if (existing !== undefined) return toWatched(existing)
+    this.exec('INSERT INTO watched_accounts (tenant_id, account, source, added_at) VALUES (?, ?, ?, ?)', [
+      row.tenantId,
+      row.account,
+      row.source,
+      row.addedAt.getTime(),
+    ])
+    return toWatched(this.one('SELECT * FROM watched_accounts WHERE tenant_id = ? AND account = ?', [row.tenantId, row.account])!)
+  }
+
+  async removeWatchedAccount(tenantId: string, account: string): Promise<boolean> {
+    const existing = this.one('SELECT 1 FROM watched_accounts WHERE tenant_id = ? AND account = ?', [tenantId, account])
+    if (existing === undefined) return false
+    this.exec('DELETE FROM watched_accounts WHERE tenant_id = ? AND account = ?', [tenantId, account])
+    return true
+  }
+
+  async recordSyncState(state: SyncStateRow): Promise<void> {
+    this.exec(
+      `INSERT INTO sync_state (tenant_id, network, source, account, cursor, last_attempt_at, last_success_at, caught_up, last_error, last_error_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT (tenant_id, network, source, account) DO UPDATE SET
+         cursor = excluded.cursor, last_attempt_at = excluded.last_attempt_at, last_success_at = excluded.last_success_at,
+         caught_up = excluded.caught_up, last_error = excluded.last_error, last_error_at = excluded.last_error_at`,
+      [
+        state.tenantId,
+        state.network,
+        state.source,
+        state.account,
+        state.cursor,
+        state.lastAttemptAt.getTime(),
+        state.lastSuccessAt?.getTime() ?? null,
+        state.caughtUp ? 1 : 0,
+        state.lastError,
+        state.lastErrorAt?.getTime() ?? null,
+      ],
     )
   }
 

@@ -275,6 +275,7 @@ const record = (properties: Record<string, object>) => ({
 
 const PROBLEM_CODES: readonly ProblemCode[] = [
   'unauthorized',
+  'forbidden',
   'invalid_request',
   'invalid_expectation',
   'invalid_resolution',
@@ -286,10 +287,33 @@ const PROBLEM_CODES: readonly ProblemCode[] = [
   'event_history_pruned',
   'consumer_position_conflict',
   'invalid_replay',
+  'config_managed',
+  'has_open_expectations',
   'internal',
 ]
 
+/** A `G...` account, the only kind the watch list takes. */
+export const accountBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['account'],
+  properties: { account: { type: 'string', pattern: ACCOUNT } },
+} as const
+
+export const accountParams = {
+  type: 'object',
+  required: ['account'],
+  properties: { account: { type: 'string', pattern: ACCOUNT } },
+} as const
+
+export const removeAccountQuery = {
+  type: 'object',
+  additionalProperties: false,
+  properties: { force: { type: 'boolean' } },
+} as const
+
 export const components = {
+  AccountBody: accountBody,
   CancelExpectationBody: cancelExpectationBody,
   AmendExpectationBody: amendExpectationBody,
   ReplayBody: replayBody,
@@ -452,6 +476,23 @@ export const components = {
     code: { enum: [...PROBLEM_CODES] },
     detail: str,
   }),
+  SyncState: record({
+    network: str,
+    source: str,
+    cursor: nullable(str),
+    lastAttemptAt: time,
+    lastSuccessAt: nullable(time),
+    caughtUp: { type: 'boolean' },
+    lastError: nullable(str),
+    lastErrorAt: nullable(time),
+  }),
+  WatchedAccount: record({
+    account: str,
+    source: { enum: ['config', 'api'] },
+    addedAt: time,
+    sync: { type: 'array', items: ref('SyncState') },
+  }),
+  WatchedAccountList: record({ data: { type: 'array', items: ref('WatchedAccount') } }),
   ...Object.fromEntries(
     ['Movement', 'Expectation', 'Exception', 'JournalEntry', 'Event', 'DeliveryAttempt'].map((name) => [
       `${name}Page`,
