@@ -82,7 +82,22 @@ const report = await deliverWebhooks({ store, tenantId: 'acme', url: 'https://ex
 ```
 
 Like `sync()`, a call is bounded: run it on a timer, or let `nostro serve --webhook-url <url>` do it
-after each round (the secret comes only from `NOSTRO_WEBHOOK_SECRET`). The HTTP API serves the same
+after each round (the secret comes only from `NOSTRO_WEBHOOK_SECRET`). To deliver several tenants
+from one serve, pass `--config <file>` with a `webhook` per tenant, each naming the environment
+variable that holds its secret:
+
+```json
+{
+  "tenants": [
+    { "id": "acme", "network": "public", "accounts": ["G..."],
+      "webhook": { "url": "https://acme.example/nostro", "secretEnv": "NOSTRO_WEBHOOK_SECRET_ACME" } }
+  ]
+}
+```
+
+Each tenant's events go only to its own webhook. Delivery runs on its own timer (`--delivery-interval`,
+default 5 seconds), so a slow receiver delays only that tenant's deliveries, never its sync or another
+tenant's. The HTTP API serves the same
 log at `GET /v1/events` for clients that would rather poll. Secrets must be at least 32 characters
 (`openssl rand -hex 32`). Each destination keeps its own position (`consumer`, default `webhook`).
 Two deliverers sharing one consumer won't both advance it: the second one notices and stops.

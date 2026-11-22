@@ -19,6 +19,12 @@ before 1.0, a minor version may change the API.
   API; replay is a compare-and-set on the consumer's position and is recorded with its actor.
 - The deliverer stops before a POST, as well as at its cursor compare, when a replay has moved the
   consumer underneath it.
+- `nostro serve --config <file>` serves every tenant in a JSON file, each with its own accounts,
+  network and webhook. Each tenant runs a sync loop and a delivery loop on their own timers
+  (`--interval`, `--delivery-interval`), and a failing tenant backs off without holding up the
+  others. `--concurrency` bounds the rounds that run at once; `--shutdown-timeout` bounds the wait
+  on Ctrl-C. A webhook names the environment variable that holds its secret. The single-tenant flags
+  keep working unchanged. Log lines carry `[tenant=<id>]`.
 
 ## 0.1.0 (2026-11-06)
 
@@ -99,4 +105,3 @@ webhooks.
   that Horizon no longer keeps.
 - **Sources:** Horizon only. There is no Stellar RPC source, and no SEP-41 contract tokens.
 - **Accounting:** generic CSV export only, with no accounting periods.
-- `nostro serve` syncs one tenant's accounts. The API serves every tenant that has a key.

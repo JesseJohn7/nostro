@@ -1,17 +1,20 @@
 import { readFileSync } from 'node:fs'
 import type { AddressInfo } from 'node:net'
 import { resolve } from 'node:path'
-import { setTimeout as sleep } from 'node:timers/promises'
-import type { Store } from '@nostro-labs/nostro'
-import { MIN_WEBHOOK_SECRET_LENGTH, StreamWatcher, deliverWebhooks, sweepExpectations } from '@nostro-labs/nostro'
+import type { HorizonRateLimit, MovementSource, Store } from '@nostro-labs/nostro'
+import { StreamWatcher, deliverWebhooks, sweepExpectations } from '@nostro-labs/nostro'
 import type { KeyGrant, Scope } from '@nostro-labs/server'
 import { SCOPES, apiKeys, createServer } from '@nostro-labs/server'
-import type { Args } from '../args.js'
-import { CliError, NETWORK, RATE_LIMIT, UsageError, accounts, database, flag, integer, network, positionals, rateLimit, string, strings, tenant } from '../args.js'
+import type { Args, Network } from '../args.js'
+import { CliError, NETWORK, RATE_LIMIT, UsageError, database, flag, integer, positionals, rateLimit, string } from '../args.js'
 import type { Command } from '../command.js'
 import { NETWORK_HELP, RATE_LIMIT_HELP, horizonClient, movementSources } from '../command.js'
 import type { Io } from '../io.js'
 import { clean, write } from '../io.js'
+import { Limiter, startLoop } from '../serve-loops.js'
+import type { Loop } from '../serve-loops.js'
+import { tenantPlans } from '../serve-tenants.js'
+import type { TenantPlan, Webhook } from '../serve-tenants.js'
 import { assertCurrent, openStore, redact } from '../store.js'
 import { reconcileAll, syncAll } from '../work.js'
 
@@ -97,26 +100,43 @@ function keys(args: Args, io: Io): { grants: Record<string, KeyGrant>; unscoped:
 
 export const serve: Command = {
   name: 'serve',
-  summary: 'Run the HTTP API; keep accounts synced and reconciled, and deliver webhooks',
-  usage: '[--account <G...>] [options]',
-  help: `Serves the HTTP API (see packages/server) over the database. With accounts to watch, it also
-syncs and reconciles them for --tenant every --interval seconds, as "nostro sync" and "nostro
-reconcile" would. With --webhook-url it delivers that tenant's events there after each round,
-signed with NOSTRO_WEBHOOK_SECRET (docs/webhooks.md). Stops cleanly on Ctrl-C or SIGTERM, finishing
-the round it is in.
+  summary: 'Run the HTTP API; keep every tenant\'s accounts synced and reconciled, and deliver their webhooks',
+  usage: '[--config <file> | --account <G...>] [options]',
+  help: `Serves the HTTP API (see packages/server) over the database. It works on one or more tenants:
+with --config, each tenant in the file has its own accounts, network and webhook; without it, the
+single-tenant flags describe one tenant (--tenant, --account, --webhook-url), as they always have.
 
-API keys decide the tenant each request may read. They come from NOSTRO_API_KEYS
-(tenant:key,tenant:key) or --keys-file (one tenant:key per line), never the command line. Each key
-must be at least 32 characters: openssl rand -hex 32. A key can be narrowed to scopes:
-tenant[read,events]:key. Scopes: read, events, webhooks, expectations, exceptions, journal. A key
-without brackets keeps every scope, and serve warns about it at startup.
+Each tenant runs two timers, so one never waits for the other: a sync round (sync and reconcile its
+accounts every --interval seconds, as "nostro sync" and "nostro reconcile" would) and a delivery
+round (its events to its webhook every --delivery-interval seconds, signed with that webhook's
+secret, docs/webhooks.md). A delivery round also runs right after a sync round that decided
+something. A failing tenant is reported with its id and backs off on its own; the others carry on.
+--concurrency bounds how many rounds run at once across all tenants. Stops cleanly on Ctrl-C or
+SIGTERM, finishing the rounds in progress (up to --shutdown-timeout seconds).
+
+--config file (JSON):
+  { "tenants": [
+      { "id": "acme", "network": "testnet", "accounts": ["G..."],
+        "webhook": { "url": "https://acme.example/nostro", "secretEnv": "NOSTRO_WEBHOOK_SECRET_ACME" } },
+      { "id": "beta", "network": "public", "accounts": ["G..."] } ] }
+A webhook names the environment variable that holds its secret; the secret is never in the file.
+The file replaces --tenant, --account, --network, --horizon and --webhook-url, and their environment
+variables. API keys still come from NOSTRO_API_KEYS or --keys-file.
+
+API keys decide the tenant and the scopes each request may use. They come from NOSTRO_API_KEYS
+(tenant:key,tenant:key) or --keys-file (one tenant:key per line), never the command line. A key can be
+narrowed: tenant[read,events]:key. Each key must be at least 32 characters: openssl rand -hex 32.
 
 Options:
   --port <n>          Port to listen on (env NOSTRO_PORT; default 8080; 0 picks a free one)
   --host <address>    Address to listen on (env NOSTRO_HOST; default 127.0.0.1; 0.0.0.0 in a container)
   --keys-file <file>  API keys, one tenant:key (or tenant[scope,...]:key) per line
-  --interval <s>      Seconds between rounds (default 30)
-  --sse               Enable Horizon SSE stream to wake the sync loop early (off by default; ADR 0005)
+  --config <file>     Every tenant to serve, as JSON (see above)
+  --interval <s>      Seconds between sync rounds, per tenant (default 30)
+  --delivery-interval <s>  Seconds between delivery rounds, per tenant (default 5)
+  --concurrency <n>   Rounds that may run at once across all tenants (default 4, 1 to 64)
+  --shutdown-timeout <s>   Seconds to wait for rounds in progress on Ctrl-C (default 30; 0 does not wait)
+  --sse               Enable Horizon SSE streams to wake a tenant's sync round early (off by default; ADR 0005)
   --webhook-url <url> Deliver events here (env NOSTRO_WEBHOOK_URL); the secret comes only from
                       NOSTRO_WEBHOOK_SECRET
 ${NETWORK_HELP}
@@ -126,10 +146,9 @@ ${RATE_LIMIT_HELP}
   -h, --help          Show this help
 
 SSE accelerator (--sse):
-  When enabled, serve opens a Horizon SSE /ledgers?cursor=now stream. Any new ledger event wakes
-  the sync loop early for that round; bursts are coalesced. The timed --interval rounds keep
-  running regardless, so a dropped or stalled stream loses nothing. This is purely an optimisation
-  that reduces worst-case payment latency from --interval seconds toward a few seconds. See ADR 0005.`,
+  When enabled, each tenant with accounts opens a Horizon SSE /ledgers?cursor=now stream. A new
+  ledger wakes that tenant's sync round early; bursts are coalesced. The timed rounds keep running
+  regardless, so a dropped or stalled stream loses nothing. See ADR 0005.`,
   options: {
     db: { type: 'string' },
     tenant: { type: 'string' },
@@ -139,13 +158,16 @@ SSE accelerator (--sse):
     port: { type: 'string' },
     host: { type: 'string' },
     'keys-file': { type: 'string' },
+    config: { type: 'string' },
     interval: { type: 'string' },
+    'delivery-interval': { type: 'string' },
+    concurrency: { type: 'string' },
+    'shutdown-timeout': { type: 'string' },
     sse: { type: 'boolean' },
     'webhook-url': { type: 'string' },
   },
   async run(args, io) {
     positionals(args, 0)
-    const tenantId = tenant(args, io)
     let unscoped: { n: number; tenant: string }[] = []
     const authenticate = (() => {
       try {
@@ -164,101 +186,35 @@ SSE accelerator (--sse):
     const port = rawPort === undefined ? 8080 : Number(rawPort)
     const host = string(args, 'host') ?? io.env.NOSTRO_HOST ?? '127.0.0.1'
     const interval = integer(args, 'interval', 30, 1, 86_400)
+    const deliveryInterval = integer(args, 'delivery-interval', 5, 1, 86_400)
+    const concurrency = integer(args, 'concurrency', 4, 1, 64)
+    const shutdownTimeout = integer(args, 'shutdown-timeout', 30, 0, 86_400)
     const useSse = flag(args, 'sse')
-    const watched =
-      strings(args, 'account').length > 0 || (io.env.NOSTRO_ACCOUNTS ?? '').trim() !== '' ? accounts(args, io) : []
-    const net = watched.length > 0 ? network(args, io) : null
-    const hook = webhook(args, io)
+    const plans = tenantPlans(args, io)
+    const rate = rateLimit(args)
 
     const opened = await openStore(database(args, io), io, { create: false })
     const { store } = opened
     try {
       await assertCurrent(opened)
-      for (const u of unscoped) {
-        await write(
-          io.stderr,
-          `Warning: API key #${u.n} (tenant ${clean(u.tenant)}) has no scopes and keeps every scope. Scope it as ${clean(u.tenant)}[read,...]:key.\n`,
-        )
-      }
       const app = createServer({ store, authenticate })
       await app.listen({ port, host })
       // Fastify reports one loopback address even when bound to every interface; say what was asked for.
       const bound = (app.server.address() as AddressInfo).port
       const address = `http://${host.includes(':') ? `[${host}]` : host}:${bound}`
       await write(io.stdout, `Listening on ${address} (database ${opened.label}).\n`)
+      for (const u of unscoped) {
+        await write(
+          io.stderr,
+          `Warning: API key #${u.n} (tenant ${clean(u.tenant)}) has no scopes and keeps every scope. Scope it as ${clean(u.tenant)}[read,...]:key.\n`,
+        )
+      }
 
-      if (net === null && hook === null) {
+      if (plans.length === 0) {
         await write(io.stdout, 'No accounts to watch and no webhook: serving the API only.\n')
         await stopped(io.signal)
       } else {
-        if (net !== null) {
-          await write(
-            io.stdout,
-            `Syncing and reconciling ${watched.length} account(s) on ${net.name} for tenant ${clean(tenantId)} every ${interval}s.\n`,
-          )
-        }
-        if (hook !== null) await write(io.stdout, `Delivering tenant ${clean(tenantId)}'s events to ${redact(hook.url)}.\n`)
-        const sources = net === null ? [] : movementSources(horizonClient(net, io, rateLimit(args)), net)
-
-        // SSE accelerator: wakes the loop early when new ledgers arrive.
-        // Off by default (ADR 0005); enabled with --sse.
-        let watcher: StreamWatcher | null = null
-        let earlyWake: (() => void) | null = null
-
-        if (useSse && net !== null) {
-          await write(io.stdout, `SSE accelerator enabled on ${net.horizon}.\n`)
-          watcher = new StreamWatcher({
-            horizonUrl: net.horizon,
-            onWake: () => { earlyWake?.() },
-            ...(io.fetch === undefined ? {} : { fetch: io.fetch }),
-          })
-          watcher.start()
-        }
-
-        while (io.signal?.aborted !== true) {
-          try {
-            if (net !== null) {
-              const streams = await syncAll({ store, tenantId, accounts: watched, sources })
-              const totals = await reconcileAll(store, tenantId, 100)
-              const inserted = streams.reduce((n, s) => n + s.inserted, 0)
-              if (inserted > 0 || totals.decided > 0) {
-                await write(io.stdout, `${new Date().toISOString()} synced ${inserted} new movement(s), decided ${totals.decided}.\n`)
-              }
-              for (const s of streams) {
-                if (s.error !== null) await write(io.stderr, `${s.source} ${s.account}: ${clean(s.error.message)}\n`)
-              }
-              for (const [id, error] of totals.errors) await write(io.stderr, `Failed on movement ${id}: ${clean(error)}\n`)
-            } else {
-              await sweepExpectations({ store, tenantId })
-            }
-            if (hook !== null) await deliver(store, tenantId, hook, io)
-          } catch (err) {
-            await write(io.stderr, `Round failed: ${clean((err as Error).message)}\n`)
-          }
-
-          // Sleep for `interval` seconds, but allow the SSE watcher to wake
-          // us early. The AbortSignal from the outer stop also cancels this.
-          await new Promise<void>((resolve) => {
-            let done = false
-            const finish = () => { if (!done) { done = true; resolve() } }
-
-            const timer = sleep(interval * 1000, undefined, io.signal === undefined ? {} : { signal: io.signal })
-              .then(finish)
-              .catch(finish)
-
-            // Register a one-shot SSE early-wake hook.
-            earlyWake = () => {
-              earlyWake = null
-              finish()
-            }
-
-            // If the signal fires cancel immediately.
-            io.signal?.addEventListener('abort', finish, { once: true })
-            void timer
-          })
-        }
-
-        watcher?.stop()
+        await runTenants({ store, plans, interval, deliveryInterval, concurrency, shutdownTimeout, useSse, rate, io })
       }
       await app.close()
       await write(io.stdout, 'Stopped.\n')
@@ -269,27 +225,128 @@ SSE accelerator (--sse):
   },
 }
 
-interface Webhook {
-  readonly url: string
-  readonly secret: string
+interface RunOptions {
+  readonly store: Store
+  readonly plans: readonly TenantPlan[]
+  readonly interval: number
+  readonly deliveryInterval: number
+  readonly concurrency: number
+  readonly shutdownTimeout: number
+  readonly useSse: boolean
+  readonly rate: HorizonRateLimit | undefined
+  readonly io: Io
 }
 
-/** The webhook destination, if one is configured; its secret only ever comes from the environment. */
-function webhook(args: Args, io: Io): Webhook | null {
-  const url = string(args, 'webhook-url') ?? io.env.NOSTRO_WEBHOOK_URL
-  if (url === undefined) return null
-  let parsed: URL
-  try {
-    parsed = new URL(url)
-  } catch {
-    throw new UsageError(`--webhook-url must be a URL, not ${JSON.stringify(url)}.`)
+/** One log line, with the tenant it is about, so an operator can tell which one a line is about. */
+function line(out: Io['stdout'], tenantId: string, text: string): Promise<void> {
+  return write(out, `${new Date().toISOString()} [tenant=${clean(tenantId)}] ${text}\n`)
+}
+
+/**
+ * Start a sync and a delivery loop for every tenant, then wait for the
+ * signal. Each loop reports its own failures, so a tenant whose Horizon or
+ * receiver is down does not hold up any other.
+ */
+async function runTenants(o: RunOptions): Promise<void> {
+  const { store, io } = o
+  const limiter = new Limiter(o.concurrency)
+  // One client per Horizon, shared by the tenants that use it, so --rate-limit is one budget per Horizon.
+  const sourcesByHorizon = new Map<string, MovementSource[]>()
+  const sourcesFor = (net: Network) => {
+    let sources = sourcesByHorizon.get(net.horizon)
+    if (sources === undefined) {
+      sources = movementSources(horizonClient(net, io, o.rate), net)
+      sourcesByHorizon.set(net.horizon, sources)
+    }
+    return sources
   }
-  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') throw new UsageError('--webhook-url must be an http(s) URL.')
-  const secret = io.env.NOSTRO_WEBHOOK_SECRET
-  if (secret === undefined || secret.length < MIN_WEBHOOK_SECRET_LENGTH) {
-    throw new UsageError(`A webhook needs NOSTRO_WEBHOOK_SECRET, at least ${MIN_WEBHOOK_SECRET_LENGTH} characters: openssl rand -hex 32.`)
+
+  const loops: Loop[] = []
+  const watchers: StreamWatcher[] = []
+  for (const plan of o.plans) {
+    const id = plan.id
+    const warn = (text: string) => line(io.stderr, id, text)
+    if (plan.network !== null) {
+      await line(io.stdout, id, `Syncing and reconciling ${plan.accounts.length} account(s) on ${plan.network.name} for tenant ${clean(id)} every ${o.interval}s.`)
+    }
+    if (plan.webhook !== null) await line(io.stdout, id, `Delivering tenant ${clean(id)}'s events to ${redact(plan.webhook.url)}.`)
+
+    const webhook = plan.webhook
+    const delivery =
+      webhook === null
+        ? null
+        : startLoop({
+            everySeconds: o.deliveryInterval,
+            signal: io.signal,
+            step: () => limiter.run(() => deliver(store, id, webhook, io)),
+            onError: (err) => void warn(`Delivery round failed: ${clean((err as Error).message)}`),
+          })
+    if (delivery !== null) loops.push(delivery)
+
+    const sync = startLoop({
+      everySeconds: o.interval,
+      signal: io.signal,
+      step: () =>
+        limiter.run(async () => {
+          if (plan.network === null) {
+            await sweepExpectations({ store, tenantId: id })
+          } else {
+            await syncRound(store, plan, sourcesFor(plan.network), io)
+          }
+          // New events are delivered now, not at the next delivery round.
+          delivery?.wake()
+        }),
+      onError: (err) => void warn(`Round failed: ${clean((err as Error).message)}`),
+    })
+    loops.push(sync)
+
+    if (o.useSse && plan.network !== null) {
+      await line(io.stdout, id, `SSE accelerator enabled on ${plan.network.horizon}.`)
+      const watcher = new StreamWatcher({
+        horizonUrl: plan.network.horizon,
+        onWake: () => sync.wake(),
+        ...(io.fetch === undefined ? {} : { fetch: io.fetch }),
+      })
+      watcher.start()
+      watchers.push(watcher)
+    }
   }
-  return { url, secret }
+
+  await stopped(io.signal)
+  for (const watcher of watchers) watcher.stop()
+  // Each loop finishes its current round, then stops. Wait for them, but not forever.
+  const finished = Promise.allSettled(loops.map((l) => l.done))
+  const timedOut = await waitUpTo(finished, o.shutdownTimeout)
+  if (timedOut) {
+    await write(io.stderr, `Shutdown timed out after ${o.shutdownTimeout}s; stopping with rounds still in progress.\n`)
+  }
+}
+
+/** Resolves true if `promise` has not settled after `seconds`, false once it has. */
+async function waitUpTo(promise: Promise<unknown>, seconds: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const late = new Promise<boolean>((resolve) => {
+    timer = setTimeout(() => resolve(true), seconds * 1000)
+  })
+  const done = promise.then(() => false)
+  const result = await Promise.race([done, late])
+  clearTimeout(timer)
+  return result
+}
+
+/** One sync and reconcile round for a tenant's accounts, reporting each stream's failures. */
+async function syncRound(store: Store, plan: TenantPlan, sources: readonly MovementSource[], io: Io): Promise<void> {
+  const id = plan.id
+  const streams = await syncAll({ store, tenantId: id, accounts: plan.accounts, sources: [...sources] })
+  const totals = await reconcileAll(store, id, 100)
+  const inserted = streams.reduce((n, s) => n + s.inserted, 0)
+  if (inserted > 0 || totals.decided > 0) {
+    await line(io.stdout, id, `synced ${inserted} new movement(s), decided ${totals.decided}.`)
+  }
+  for (const s of streams) {
+    if (s.error !== null) await line(io.stderr, id, `${s.source} ${s.account}: ${clean(s.error.message)}`)
+  }
+  for (const [movementId, error] of totals.errors) await line(io.stderr, id, `Failed on movement ${movementId}: ${clean(error)}`)
 }
 
 /** Deliver until caught up or a delivery fails; a failed event is retried next round. */
@@ -305,11 +362,11 @@ async function deliver(store: Store, tenantId: string, hook: Webhook, io: Io): P
     })
     total += report.delivered
     if (report.failure !== null) {
-      await write(io.stderr, `Webhook failed on event ${report.failure.eventId}: ${clean(report.failure.reason)}; retrying next round.\n`)
+      await line(io.stderr, tenantId, `Webhook failed on event ${report.failure.eventId}: ${clean(report.failure.reason)}; retrying next round.`)
     }
     if (report.delivered === 0 || report.failure !== null || report.contended) break
   }
-  if (total > 0) await write(io.stdout, `${new Date().toISOString()} delivered ${total} event(s).\n`)
+  if (total > 0) await line(io.stdout, tenantId, `delivered ${total} event(s).`)
 }
 
 /** Resolves when the signal fires; never, without one. */

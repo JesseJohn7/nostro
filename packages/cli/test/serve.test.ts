@@ -3,35 +3,12 @@ import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { verifyWebhook } from '@nostro-labs/nostro'
 import { FakeHorizon } from 'nostro-testkit'
-import { main } from '../src/index.js'
-import { A, B, migrated, nostro } from './helpers.js'
+import { A, B, migrated, nostro, startServe as start } from './helpers.js'
 
 type Page = { data: { reference: string }[] }
 
 const KEY = 'k'.repeat(64)
 const env = { NOSTRO_API_KEYS: `acme:${KEY}` }
-
-/** Start `nostro serve` in-process; returns its output so far, its address, and a way to stop it. */
-async function start(cwd: string, argv: readonly string[], options: { env?: Record<string, string>; fetch?: typeof fetch } = {}) {
-  const out = { stdout: '', stderr: '' }
-  const stop = new AbortController()
-  const done = main(['serve', '--port', '0', ...argv], {
-    stdout: { write: (s) => ((out.stdout += s), true) },
-    stderr: { write: (s) => ((out.stderr += s), true) },
-    env: options.env ?? env,
-    cwd,
-    signal: stop.signal,
-    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-  })
-  const until = async (check: () => boolean) => {
-    for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 25))
-    if (!check()) throw new Error(`timed out; stdout: ${out.stdout} stderr: ${out.stderr}`)
-  }
-  await until(() => out.stdout.includes('Listening on'))
-  const address = /Listening on (\S+) /.exec(out.stdout)![1]!
-  const get = async (path: string, key = KEY) => fetch(`${address}${path}`, { headers: { authorization: `Bearer ${key}` } })
-  return { out, address, get, until, stop: async () => (stop.abort(), done) }
-}
 
 describe('nostro serve', () => {
   it('serves the API, and syncs and reconciles the watched accounts every interval', async () => {
