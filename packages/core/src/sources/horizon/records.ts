@@ -106,6 +106,7 @@ export interface HorizonBalance {
   readonly asset_issuer?: string
   /** The ledger the trustline last changed in. Absent on the native line, which lives on the account itself. */
   readonly last_modified_ledger?: number
+  readonly liquidity_pool_id?: string
 }
 
 /** `GET /accounts/{id}`. */
@@ -125,4 +126,11 @@ export function operationIdOf(effect: Pick<HorizonEffect, 'paging_token'>): stri
 /** The ledger a TOID falls in: the top 32 of its 64 bits. */
 export function ledgerOfToid(toid: string): number {
   return Number(BigInt(toid) >> 32n)
+}
+
+export function cursorAfterLedger(ledger: number): string {
+  if (!Number.isSafeInteger(ledger) || ledger < 1) {
+    throw new RangeError('ledger must be a positive integer')
+  }
+  return ((BigInt(ledger) << 32n) | 0xffffffffn).toString()
 }

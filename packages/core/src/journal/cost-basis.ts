@@ -55,6 +55,7 @@ export interface OpenLot {
 export interface CostBasisOptions {
   readonly store: Store
   readonly tenantId: string
+  readonly entityId?: string
   readonly account?: string
   readonly asset: AssetId
   readonly method?: CostBasisMethod
@@ -66,6 +67,7 @@ export interface CostBasisOptions {
 
 export interface CostBasisReport {
   readonly tenantId: string
+  readonly entityId: string | null
   readonly account: string | null
   readonly asset: AssetId
   readonly reportingAsset: AssetId
@@ -94,7 +96,7 @@ interface MutableLot {
 }
 
 export async function costBasis(options: CostBasisOptions): Promise<CostBasisReport> {
-  const { store, tenantId, account, asset } = options
+  const { store, tenantId, entityId, account, asset } = options
   const method = options.method ?? 'fifo'
   if (method !== 'fifo' && method !== 'lifo') throw new RangeError('Unknown cost basis method')
   const cutoff = options.to ?? options.asOf ?? null
@@ -107,6 +109,7 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
     const page = await store.listMovements({
       tenantId,
       limit: PAGE,
+      ...(entityId !== undefined ? { entityId } : {}),
       ...(account !== undefined ? { account } : {}),
       ...(afterSeq !== undefined ? { afterSeq } : {}),
     })
@@ -266,6 +269,7 @@ export async function costBasis(options: CostBasisOptions): Promise<CostBasisRep
 
   return {
     tenantId,
+    entityId: entityId ?? null,
     account: account ?? null,
     asset,
     reportingAsset: repAsset,

@@ -9,6 +9,9 @@ import {
   journalCsvRows,
   journalQuickBooksRows,
   journalXeroRows,
+  parseAsset,
+  renderOfx,
+  walletStatement,
 } from '@nostro-labs/nostro'
 import { COMMON, CliError, UsageError, date, flag, integer, positionals, string, tenant } from '../args.js'
 import type { Command } from '../command.js'
@@ -44,17 +47,21 @@ async function readMap(path: string, cwd: string, label: string): Promise<Readon
 
 export const exportJournal: Command = {
   name: 'export',
-  summary: 'Export the journal as CSV, QuickBooks, Xero or Beancount',
+  summary: 'Export the journal as CSV, OFX, QuickBooks, Xero or Beancount',
   usage: '[--format <format>] [--from <date>] [--to <date>] [--output <file>] [options]',
   help: `Writes journal entries effective in the range. CSV is RFC 4180 with CRLF line endings;
 Beancount is ledger text. Spreadsheet exports guard text cells against formulas. To stdout unless
 --output is given. Payer-written memo text is never written.
 
 Options:
-  --format <format>   csv (default), quickbooks, xero or beancount
+  --format <format>   csv (default), ofx, quickbooks, xero or beancount
   --decimals <n>     Round CSV amounts to n decimal places (0–38)
   --from <date>       Entries effective on or after this
   --to <date>         Entries effective before this
+  --account <G...>    Wallet account to export; required with --format ofx
+  --asset <id>        Full asset id (CODE:ISSUER, or native); required with ofx
+  --currency <code>   ISO 4217 code for the OFX CURDEF; required unless the asset code is one
+  --entity <id>       Only lines belonging to this entity
   --output <file>     Write to this file; it must not exist, unless --force
   --force             Overwrite --output if it exists
   --account-map <file> JSON map from nostro account codes to QuickBooks names or Xero codes
@@ -72,6 +79,10 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     decimals: { type: 'string' },
     from: { type: 'string' },
     to: { type: 'string' },
+    account: { type: 'string' },
+    asset: { type: 'string' },
+    currency: { type: 'string' },
+    entity: { type: 'string' },
     output: { type: 'string' },
     force: { type: 'boolean' },
     'account-map': { type: 'string' },
@@ -88,8 +99,19 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const format = string(args, 'format') ?? 'csv'
     const decimals = string(args, 'decimals') === undefined ? undefined : integer(args, 'decimals', 7, 0, 38)
     if (decimals !== undefined && format !== 'csv') throw new UsageError('--decimals only applies to CSV exports.')
-    if (!['csv', 'quickbooks', 'xero', 'beancount'].includes(format)) {
-      throw new UsageError('--format must be csv, quickbooks, xero or beancount.')
+    if (!['csv', 'ofx', 'quickbooks', 'xero', 'beancount'].includes(format)) {
+      throw new UsageError('--format must be csv, ofx, quickbooks, xero or beancount.')
+    }
+    const ofxAccount = string(args, 'account')
+    const ofxAsset = string(args, 'asset')
+    const ofxCurrency = string(args, 'currency')
+    const entityId = string(args, 'entity')
+    if (format === 'ofx') {
+      if (ofxAccount === undefined) throw new UsageError('--format ofx requires --account <G...>.')
+      if (ofxAsset === undefined) throw new UsageError('--format ofx requires --asset <id>.')
+      if (from === undefined || to === undefined) throw new UsageError('--format ofx requires --from and --to.')
+    } else if (ofxAccount !== undefined || ofxAsset !== undefined || ofxCurrency !== undefined) {
+      throw new UsageError('--account, --asset and --currency only apply to OFX exports.')
     }
     const accountMapPath = string(args, 'account-map')
     const commodityMapPath = string(args, 'commodity-map')
@@ -114,6 +136,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
 
     const destination = string(args, 'destination')
     const showBatches = flag(args, 'batches')
+    let ofxContent: string | undefined
 
     return withStore(args, io, async (store) => {
       const mark = destination ? await store.exportGetMark(tenantId, destination) : null
@@ -125,6 +148,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
           ...(cursor === undefined ? {} : { afterSeq: cursor }),
           ...(from === undefined ? {} : { effectiveFrom: from }),
           ...(to === undefined ? {} : { effectiveBefore: to }),
+          ...(entityId === undefined ? {} : { entityId }),
         })
         if (page.length === 0) break
         throughSeq = page[page.length - 1]!.seq
@@ -133,12 +157,26 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
       }
       const base = { store, tenantId, throughSeq,
         ...(afterSeq === undefined ? {} : { afterSeq }),
-        ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) }
+        ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }),
+        ...(entityId === undefined ? {} : { entityId }) }
 
       const accountMap = accountMapPath === undefined ? undefined : await readMap(accountMapPath, io.cwd, 'account')
       const commodityMap = commodityMapPath === undefined ? undefined : await readMap(commodityMapPath, io.cwd, 'commodity')
       let rows: AsyncGenerator<string>
-      if (format === 'quickbooks' || format === 'xero') {
+      if (format === 'ofx') {
+        const statement = await walletStatement({
+          store,
+          tenantId,
+          account: ofxAccount!,
+          asset: parseAsset(ofxAsset!),
+          from: from!,
+          to: to!,
+          ...(entityId === undefined ? {} : { entityId }),
+          ...(ofxCurrency === undefined ? {} : { currencyCode: ofxCurrency }),
+        })
+        ofxContent = renderOfx(statement)
+        rows = (async function* () { yield ofxContent! })()
+      } else if (format === 'quickbooks' || format === 'xero') {
         if (accountMap === undefined) throw new UsageError(`--format ${format} requires --account-map <file>.`)
         rows =
           format === 'quickbooks'
@@ -179,7 +217,9 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
         const message =
           format === 'beancount'
             ? `Wrote Beancount ledger to ${path}.\n`
-            : `Wrote ${Math.max(0, chunks - 1)} journal line(s) to ${path}.\n`
+            : format === 'ofx'
+              ? `Wrote OFX statement to ${path}.\n`
+              : `Wrote ${Math.max(0, chunks - 1)} journal line(s) to ${path}.\n`
         await write(io.stdout, message)
       }
 

@@ -1,0 +1,78 @@
+{
+  "scenario": "clawback-eurox",
+  "network": "testnet",
+  "horizon": "https://horizon-testnet.stellar.org",
+  "capturedAt": "2026-11-22T15:09:01+00:00",
+  "sources": [
+    "https://horizon-testnet.stellar.org/operations/25187333196234753?join=transactions",
+    "https://horizon-testnet.stellar.org/operations/25187333196234753/effects"
+  ],
+  "operation": {
+    "id": "25187333196234753",
+    "paging_token": "25187333196234753",
+    "transaction_successful": true,
+    "source_account": "GASU2QVEXT3GPNN3OT75Q6UA75PAPY6T3CKXRHKAFT7VLBSZ2I233CIS",
+    "type": "clawback",
+    "type_i": 19,
+    "created_at": "2026-11-22T11:05:56Z",
+    "transaction_hash": "30ea1af7d64d2dcafe76be52a5821c726e5424c9cb79257c53e5169939613c1b",
+    "transaction": {
+      "id": "30ea1af7d64d2dcafe76be52a5821c726e5424c9cb79257c53e5169939613c1b",
+      "paging_token": "25187333196234752",
+      "successful": true,
+      "hash": "30ea1af7d64d2dcafe76be52a5821c726e5424c9cb79257c53e5169939613c1b",
+      "ledger": 5864383,
+      "created_at": "2026-11-22T11:05:56Z",
+      "source_account": "GASU2QVEXT3GPNN3OT75Q6UA75PAPY6T3CKXRHKAFT7VLBSZ2I233CIS",
+      "source_account_sequence": "25187290246545414",
+      "fee_account": "GASU2QVEXT3GPNN3OT75Q6UA75PAPY6T3CKXRHKAFT7VLBSZ2I233CIS",
+      "fee_charged": "100",
+      "max_fee": "70244",
+      "operation_count": 1,
+      "envelope_xdr": "AAAAAgAAAAAlTUKkvPZntbt0/9h6gP9eB+PT2JV4nUAs/1WGWdI1vQABEmQAWXu1AAAABgAAAAEAAAAAAAAAAAAAAABrAs2+AAAAAAAAAAEAAAAAAAAAEwAAAAJFVVJPWAAAAAAAAAAAAAAAJU1CpLz2Z7W7dP/YeoD/Xgfj09iVeJ1ALP9VhlnSNb0AAAAA5dZGngZj6uZknrNDt7FZPhVfc+WYDOAlmfC2IDzFMSoAAAC6Q7dAAAAAAAAAAAABWdI1vQAAAEAyTdSd7aQRdW5a4vWLMF7PCXbJIaOsTcrJ0dGRuINzOtOOMUtQnDhwAhpyoLfdnYqYRsAWsq2qHbBnH0wvDgYA",
+      "result_xdr": "AAAAAAAAAGQAAAAAAAAAAQAAAAAAAAATAAAAAAAAAAA=",
+      "fee_meta_xdr": "AAAAAgAAAAMAWXu+AAAAAAAAAAAlTUKkvPZntbt0/9h6gP9eB+PT2JV4nUAs/1WGWdI1vQAAABdHRbhEAFl7tQAAAAUAAAAAAAAAAAAAAAsAAAAAAQAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAIAAAAAAAAAAAAAAAAAAAADAAAAAABZe74AAAAAawLMjwAAAAAAAAABAFl7vwAAAAAAAAAAJU1CpLz2Z7W7dP/YeoD/Xgfj09iVeJ1ALP9VhlnSNb0AAAAXR0W34ABZe7UAAAAFAAAAAAAAAAAAAAALAAAAAAEAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAwAAAAAAWXu+AAAAAGsCzI8AAAAA",
+      "memo_type": "none",
+      "signatures": [
+        "Mk3Une2kEXVuWuL1izBezwl2ySGjrE3KydHRkbiDczrTjjFLUJw4cAIacqC33Z2KmEbAFrKtqh2wZx9MLw4GAA=="
+      ],
+      "preconditions": {
+        "timebounds": {
+          "min_time": "0",
+          "max_time": "1795345854"
+        }
+      }
+    },
+    "asset_type": "credit_alphanum12",
+    "asset_code": "EUROX",
+    "asset_issuer": "GASU2QVEXT3GPNN3OT75Q6UA75PAPY6T3CKXRHKAFT7VLBSZ2I233CIS",
+    "from": "GDS5MRU6AZR6VZTET2ZUHN5RLE7BKX3T4WMAZYBFTHYLMIB4YUYSU4TV",
+    "amount": "80000.0000000"
+  },
+  "effects": [
+    {
+      "id": "0025187333196234753-0000000001",
+      "paging_token": "25187333196234753-1",
+      "account": "GASU2QVEXT3GPNN3OT75Q6UA75PAPY6T3CKXRHKAFT7VLBSZ2I233CIS",
+      "type": "account_credited",
+      "type_i": 2,
+      "created_at": "2026-11-22T11:05:56Z",
+      "asset_type": "credit_alphanum12",
+      "asset_code": "EUROX",
+      "asset_issuer": "GASU2QVEXT3GPNN3OT75Q6UA75PAPY6T3CKXRHKAFT7VLBSZ2I233CIS",
+      "amount": "80000.0000000"
+    },
+    {
+      "id": "0025187333196234753-0000000002",
+      "paging_token": "25187333196234753-2",
+      "account": "GDS5MRU6AZR6VZTET2ZUHN5RLE7BKX3T4WMAZYBFTHYLMIB4YUYSU4TV",
+      "type": "account_debited",
+      "type_i": 3,
+      "created_at": "2026-11-22T11:05:56Z",
+      "asset_type": "credit_alphanum12",
+      "asset_code": "EUROX",
+      "asset_issuer": "GASU2QVEXT3GPNN3OT75Q6UA75PAPY6T3CKXRHKAFT7VLBSZ2I233CIS",
+      "amount": "80000.0000000"
+    }
+  ]
+}

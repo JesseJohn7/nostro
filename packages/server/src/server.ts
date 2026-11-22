@@ -303,7 +303,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: Paging & { disposition?: Disposition; account?: string } }>(
+      v1.get<{ Querystring: Paging & { disposition?: Disposition; account?: string; entityId?: string } }>(
         '/movements',
         { schema: { querystring: query.movements } },
         async ({ tenantId, query: q }) =>
@@ -314,6 +314,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
               ...after(q),
               ...(q.disposition === undefined ? {} : { disposition: q.disposition }),
               ...(q.account === undefined ? {} : { account: q.account }),
+              ...(q.entityId === undefined ? {} : { entityId: q.entityId }),
             }),
             q.limit,
             movementJson,
@@ -537,12 +538,14 @@ export function createServer(options: ServerOptions): FastifyInstance {
         ...(q.from === undefined ? {} : { effectiveFrom: new Date(q.from) }),
         ...(q.to === undefined ? {} : { effectiveBefore: new Date(q.to) }),
       })
+      const entityFilter = (q: { entityId?: string }) =>
+        q.entityId === undefined ? {} : { entityId: q.entityId }
 
-      v1.get<{ Querystring: Paging & { from?: string; to?: string } }>(
+      v1.get<{ Querystring: Paging & { from?: string; to?: string; entityId?: string } }>(
         '/journal',
         { schema: { querystring: query.journal } },
         async ({ tenantId, query: q }) =>
-          page(await store.listJournalEntries({ tenantId, limit: q.limit, ...after(q), ...dates(q) }), q.limit, journalEntryJson),
+          page(await store.listJournalEntries({ tenantId, limit: q.limit, ...after(q), ...dates(q), ...entityFilter(q) }), q.limit, journalEntryJson),
       )
 
       v1.post<{ Body: PostJournalBody }>(
@@ -591,7 +594,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: { from?: string; to?: string } }>(
+      v1.get<{ Querystring: { from?: string; to?: string; entityId?: string } }>(
         '/journal.csv',
         { schema: { querystring: query.journalCsv } },
         async ({ tenantId, query: q }, reply) => {
@@ -601,6 +604,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
             tenantId,
             ...(effectiveFrom === undefined ? {} : { from: effectiveFrom }),
             ...(effectiveBefore === undefined ? {} : { to: effectiveBefore }),
+            ...entityFilter(q),
           })
           return reply
             .type('text/csv; charset=utf-8')
@@ -611,12 +615,23 @@ export function createServer(options: ServerOptions): FastifyInstance {
 
       // ---- Reports (issue #56, #57) ----------------------------------------
 
-      v1.get<{ Querystring: { asOf?: string } }>(
+      v1.get<{ Querystring: { asOf?: string; entityId?: string } }>(
         '/reports/trial-balance',
-        { schema: { querystring: { type: 'object', additionalProperties: false, properties: { asOf: { type: 'string', format: 'date-time' } } } } },
+        {
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                asOf: { type: 'string', format: 'date-time' },
+                entityId: { type: 'string', minLength: 1, maxLength: 100 },
+              },
+            },
+          },
+        },
         async ({ tenantId, query: q }) => {
           const asOf = q.asOf !== undefined ? new Date(q.asOf) : undefined
-          const report = await trialBalance({ store, tenantId, ...(asOf !== undefined ? { asOf } : {}) })
+          const report = await trialBalance({ store, tenantId, ...(asOf !== undefined ? { asOf } : {}), ...entityFilter(q) })
           return {
             balanced: report.balanced,
             assetTotals: report.assetTotals.map((t) => ({ asset: t.asset, net: t.net.toString() })),
@@ -631,7 +646,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: { account: string; asset: string; from?: string; to?: string } }>(
+      v1.get<{ Querystring: { account: string; asset: string; from?: string; to?: string; entityId?: string } }>(
         '/reports/ledger',
         {
           schema: {
@@ -644,6 +659,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
                 asset: { type: 'string' },
                 from: { type: 'string', format: 'date-time' },
                 to: { type: 'string', format: 'date-time' },
+                entityId: { type: 'string', minLength: 1, maxLength: 100 },
               },
             },
           },
@@ -658,6 +674,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
             asset: q.asset,
             ...(from === undefined ? {} : { from }),
             ...(to === undefined ? {} : { to }),
+            ...entityFilter(q),
           })
           return {
             account: ledger.account,
@@ -681,12 +698,23 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: { asOf?: string } }>(
+      v1.get<{ Querystring: { asOf?: string; entityId?: string } }>(
         '/reports/balance-sheet',
-        { schema: { querystring: { type: 'object', additionalProperties: false, properties: { asOf: { type: 'string', format: 'date-time' } } } } },
+        {
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                asOf: { type: 'string', format: 'date-time' },
+                entityId: { type: 'string', minLength: 1, maxLength: 100 },
+              },
+            },
+          },
+        },
         async ({ tenantId, query: q }) => {
           const asOf = q.asOf !== undefined ? new Date(q.asOf) : undefined
-          const bs = await balanceSheet({ store, tenantId, ...(asOf !== undefined ? { asOf } : {}) })
+          const bs = await balanceSheet({ store, tenantId, ...(asOf !== undefined ? { asOf } : {}), ...entityFilter(q) })
           return {
             asOf: bs.asOf?.toISOString() ?? null,
             balanced: bs.balanced,
@@ -699,9 +727,21 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: { from?: string; to?: string } }>(
+      v1.get<{ Querystring: { from?: string; to?: string; entityId?: string } }>(
         '/reports/income',
-        { schema: { querystring: { type: 'object', additionalProperties: false, properties: { from: { type: 'string', format: 'date-time' }, to: { type: 'string', format: 'date-time' } } } } },
+        {
+          schema: {
+            querystring: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                from: { type: 'string', format: 'date-time' },
+                to: { type: 'string', format: 'date-time' },
+                entityId: { type: 'string', minLength: 1, maxLength: 100 },
+              },
+            },
+          },
+        },
         async ({ tenantId, query: q }) => {
           const from = q.from !== undefined ? new Date(q.from) : undefined
           const to = q.to !== undefined ? new Date(q.to) : undefined
@@ -710,6 +750,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
             tenantId,
             ...(from === undefined ? {} : { from }),
             ...(to === undefined ? {} : { to }),
+            ...entityFilter(q),
           })
           return {
             from: stmt.from?.toISOString() ?? null,

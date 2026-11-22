@@ -44,6 +44,7 @@ export interface MovementJson {
   readonly externalId: string
   readonly revision: number
   readonly account: string
+  readonly entityId: string | null
   readonly direction: Direction
   readonly kind: MovementKind
   readonly amount: string
@@ -111,6 +112,7 @@ export interface ExceptionJson {
 
 export interface JournalLineJson {
   readonly account: string
+  readonly entityId: string | null
   readonly role: LineRole
   readonly side: Side
   readonly amount: string
@@ -146,6 +148,7 @@ export function movementJson(m: Movement): MovementJson {
     externalId: m.externalId,
     revision: m.revision,
     account: m.account,
+    entityId: m.entityId ?? null,
     direction: m.direction,
     kind: m.kind,
     amount: m.amount.toString(),
@@ -230,6 +233,7 @@ export function journalEntryJson(j: JournalEntry): JournalEntryJson {
     description: j.description,
     lines: j.lines.map((l) => ({
       account: l.account,
+      entityId: l.entityId ?? null,
       role: l.role,
       side: l.side,
       amount: l.amount.toString(),

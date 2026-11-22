@@ -6,8 +6,8 @@
  * leg can only ever net to zero or exactly its amount.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { JournalQuery, Movement, NewJournalEntry, NewJournalLine, Store } from '@nostro-labs/nostro'
-import { agingReport, costBasis, valueMovements, MapPriceSource, reconcile, postManualEntry, Money, NotFoundError, ValidationError, asset, closePeriod, postMovement, reopenPeriod } from '@nostro-labs/nostro'
+import type { JournalQuery, Movement, NewJournalEntry, NewJournalLine, NewMovement, Store } from '@nostro-labs/nostro'
+import { agingReport, costBasis, valueMovements, MapPriceSource, NATIVE, cursorAfterLedger, openAccount, reconcile, postManualEntry, Money, NotFoundError, ValidationError, asset, closePeriod, doctor, postMovement, reopenPeriod } from '@nostro-labs/nostro'
 
 const T = 'tenant-a'
 const T2 = 'tenant-b'
@@ -30,7 +30,11 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
       await store.close()
     })
 
-    async function movement(amount = usdc('10'), tenantId = T): Promise<Movement> {
+    async function movement(
+      amount = usdc('10'),
+      tenantId = T,
+      over: Partial<NewMovement> = {},
+    ): Promise<Movement> {
       counter += 1
       const { inserted } = await store.transaction((tx) =>
         tx.insertMovements([
@@ -45,6 +49,7 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
             amount,
             ledger: 1000 + counter,
             occurredAt: new Date('2026-10-05T12:00:00Z'),
+            ...over,
           },
         ]),
       )
@@ -87,6 +92,63 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
       expect(Object.isFrozen(read)).toBe(true)
       expect(Object.isFrozen(read!.lines)).toBe(true)
       expect(Object.isFrozen(read!.lines[0])).toBe(true)
+    })
+
+    it('posts mints, burns and clawbacks by kind with cash untouched by reclasses', async () => {
+      const mint = await movement(usdc('10'), T, { kind: 'mint' })
+      const burn = await movement(usdc('5'), T, { kind: 'burn', direction: 'debit' })
+      const clawback = await movement(usdc('2'), T, { kind: 'clawback', direction: 'debit' })
+      const report = await reconcile({ store, tenantId: T })
+      expect(report.ignored).toBe(1)
+      const byMovement = new Map(
+        (await store.listJournalEntries({ tenantId: T })).map((entry) => [entry.movementId, entry]),
+      )
+      const roles = (id: string) => byMovement.get(id)!.lines.map((line) => [line.role, line.side])
+      expect(roles(mint.id)).toEqual([['cash', 'debit'], ['deposit_clearing', 'credit']])
+      expect(roles(burn.id)).toEqual([['cash', 'credit'], ['redemption_payable', 'debit']])
+      expect(roles(clawback.id)).toEqual([['cash', 'credit'], ['clawback', 'debit']])
+      expect((await doctor({ store, tenantId: T })).findings).toEqual([])
+    })
+
+    it('opens an account and seeds both Horizon cursors after the opening ledger', async () => {
+      const occurredAt = new Date('2026-10-01T00:00:00Z')
+      const opening = await openAccount(store, {
+        tenantId: T,
+        network: 'testnet',
+        account: ACCOUNT,
+        ledger: 1000,
+        occurredAt,
+        balances: [{ amount: Money.parse('10', NATIVE), lastModifiedLedger: 999 }],
+        note: 'Opening',
+      })
+      expect(await store.getAccountOpening(T, 'testnet', ACCOUNT)).toMatchObject({
+        id: opening.id,
+        ledger: 1000,
+        note: 'Opening',
+      })
+      for (const source of ['horizon', 'horizon-fees']) {
+        expect(await store.getCursor({ tenantId: T, network: 'testnet', source, account: ACCOUNT }))
+          .toBe(cursorAfterLedger(1000))
+      }
+      const [entry] = await store.listJournalEntries({ tenantId: T })
+      expect(entry).toMatchObject({ kind: 'opening', movementId: null, effectiveAt: occurredAt })
+      expect(entry!.lines.map((l) => [l.role, l.side, l.account])).toEqual([
+        ['cash', 'debit', CASH],
+        ['opening_balance', 'credit', 'equity:opening-balances'],
+      ])
+    })
+
+    it('refuses an opening once the account has movements', async () => {
+      await movement()
+      await expect(openAccount(store, {
+        tenantId: T,
+        network: 'testnet',
+        account: ACCOUNT,
+        ledger: 900,
+        balances: [{ amount: Money.parse('10', NATIVE), lastModifiedLedger: 899 }],
+      })).rejects.toMatchObject(constraint('account_opening_has_movements'))
+      expect(await store.getAccountOpening(T, 'testnet', ACCOUNT)).toBeNull()
+      expect(await store.listJournalEntries({ tenantId: T })).toEqual([])
     })
 
     it('defaults the effective date to the store clock', async () => {
@@ -374,6 +436,20 @@ export function describeJournalConformance(name: string, makeStore: () => Store 
           }),
         ),
       ).rejects.toMatchObject(constraint('journal_cash_without_movement'))
+
+      await expect(
+        store.transaction((tx) =>
+          tx.postJournalEntry({
+            tenantId: T,
+            kind: 'manual',
+            description: 'Manual opening balance test',
+            lines: [
+              { account: 'assets:suspense', role: 'other', side: 'debit', amount: usdc('10') },
+              { account: 'equity:opening-balances', role: 'opening_balance', side: 'credit', amount: usdc('10') },
+            ],
+          }),
+        ),
+      ).rejects.toMatchObject(constraint('journal_manual_slot'))
     })
 
     it('posts a manual entry without movement and reads it back', async () => {

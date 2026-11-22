@@ -73,7 +73,7 @@ export async function checkBooks(store: Store, tenantId: string, delivered: Deli
         expect(m.ignoredReason, at).toBeTruthy()
         expect(exceptions.filter((x) => x.status === 'open'), at).toEqual([])
         // Nothing but a fee is ignored unless a person said so, and closed its exception saying why.
-        if (m.kind !== 'fee') expect(exceptions.some((x) => x.status === 'dismissed' && x.resolutionNote === m.ignoredReason), at).toBe(true)
+        if (m.kind !== 'fee' && m.kind !== 'clawback') expect(exceptions.some((x) => x.status === 'dismissed' && x.resolutionNote === m.ignoredReason), at).toBe(true)
         break
       case 'pending':
         throw new Error(`${at} is still pending`)
@@ -83,7 +83,7 @@ export async function checkBooks(store: Store, tenantId: string, delivered: Deli
     if (allocations.some((a) => a.strategy !== 'manual')) {
       expect(m.muxedId !== null || m.memo !== null, `${at} settled on its amount alone`).toBe(true)
     }
-    if (allocations.length > 0) expect(m.kind, `${at}: a fee is never matched`).not.toBe('fee')
+    if (allocations.length > 0) expect(['fee', 'clawback'], `${at}: a fee or clawback is never matched`).not.toContain(m.kind)
     for (const a of allocations) {
       const e = expectationById.get(a.expectationId)!
       // A lookalike asset never settles the real thing.
@@ -257,7 +257,7 @@ export function describeStoreProperties(
               }
               expect((await reconcile({ store, tenantId })).processed).toBe(0)
               const posted = await postJournal({ store, tenantId })
-              expect(posted.posted).toEqual({ initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0 })
+              expect(posted.posted).toEqual({ initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0, opening: 0 })
               expect(await snapshot(store, tenantId)).toEqual(before)
             }),
           ),

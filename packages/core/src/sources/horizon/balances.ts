@@ -34,15 +34,19 @@ export class HorizonBalanceSource implements BalanceSource {
     }
     const { body, latestLedger } = response
     const balances: BalanceLine[] = []
+    const poolShares: string[] = []
     for (const b of body.balances) {
       // Pool shares are not movements nostro records.
-      if (b.asset_type === 'liquidity_pool_shares') continue
+      if (b.asset_type === 'liquidity_pool_shares') {
+        poolShares.push(b.liquidity_pool_id ?? b.asset_code ?? 'unknown')
+        continue
+      }
       const id = b.asset_type === 'native' ? NATIVE : asset(b.asset_code ?? '', b.asset_issuer ?? '')
       balances.push({
         amount: Money.parse(b.balance, id),
         lastModifiedLedger: b.last_modified_ledger ?? body.last_modified_ledger,
       })
     }
-    return { account, ledger: latestLedger, balances }
+    return { account, ledger: latestLedger, balances, poolShares }
   }
 }

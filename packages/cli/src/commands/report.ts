@@ -59,6 +59,7 @@ Options:
   --as-of <date>       Balance as of this instant (trial-balance, balance-sheet, aging)
   --account <code>     Account code (ledger, gains)
   --asset <id>         Asset id, e.g. "native" or "USDC:GA5Z..." (ledger, gains)
+  --entity <id>        Only lines belonging to this entity
   --from <date>        Period start, inclusive (ledger, income, gains)
   --to <date>          Period end, exclusive (ledger, income, gains)
   --buckets <n,n,...>  Aging bucket boundaries, comma-separated (default 30,60,90)
@@ -70,6 +71,7 @@ ${COMMON_HELP}`,
     'as-of': { type: 'string' },
     account: { type: 'string' },
     asset: { type: 'string' },
+    entity: { type: 'string' },
     from: { type: 'string' },
     to: { type: 'string' },
     buckets: { type: 'string' },
@@ -80,11 +82,13 @@ ${COMMON_HELP}`,
     const [sub] = positionals(args, 1)
     const tenantId = tenant(args, io)
     const isJson = flag(args, 'json')
+    const entityId = string(args, 'entity')
+    const entity = entityId === undefined ? {} : { entityId }
 
     if (sub === 'trial-balance') {
       const asOf = date(args, 'as-of')
       return withStore(args, io, async (store) => {
-        const report = await trialBalance({ store, tenantId, ...(asOf !== undefined ? { asOf } : {}) })
+        const report = await trialBalance({ store, tenantId, ...(asOf !== undefined ? { asOf } : {}), ...entity })
         if (isJson) {
           await write(io.stdout, json({
             balanced: report.balanced,
@@ -123,7 +127,7 @@ ${COMMON_HELP}`,
       const from = date(args, 'from')
       const to = date(args, 'to')
       return withStore(args, io, async (store) => {
-        const ledger = await accountLedger({ store, tenantId, account, asset: assetId, ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) })
+        const ledger = await accountLedger({ store, tenantId, account, asset: assetId, ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }), ...entity })
         if (isJson) {
           await write(io.stdout, json({
             account: ledger.account,
@@ -167,7 +171,7 @@ ${COMMON_HELP}`,
     if (sub === 'balance-sheet') {
       const asOf = date(args, 'as-of')
       return withStore(args, io, async (store) => {
-        const bs = await balanceSheet({ store, tenantId, ...(asOf !== undefined ? { asOf } : {}) })
+        const bs = await balanceSheet({ store, tenantId, ...(asOf !== undefined ? { asOf } : {}), ...entity })
         if (isJson) {
           await write(io.stdout, json({
             asOf: bs.asOf?.toISOString() ?? null,
@@ -200,7 +204,7 @@ ${COMMON_HELP}`,
       const from = date(args, 'from')
       const to = date(args, 'to')
       return withStore(args, io, async (store) => {
-        const stmt = await incomeStatement({ store, tenantId, ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }) })
+        const stmt = await incomeStatement({ store, tenantId, ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }), ...entity })
         if (isJson) {
           await write(io.stdout, json({
             from: stmt.from?.toISOString() ?? null,
@@ -240,6 +244,7 @@ ${COMMON_HELP}`,
           tenantId,
           ...(asOf !== undefined ? { asOf } : {}),
           ...(buckets !== undefined ? { buckets } : {}),
+          ...entity,
         })
         if (isJson) {
           await write(io.stdout, json({
@@ -436,6 +441,7 @@ ${COMMON_HELP}`,
           ...(account !== undefined ? { account } : {}),
           ...(from !== undefined ? { from } : {}),
           ...(to !== undefined ? { to } : {}),
+          ...entity,
         })
         if (isJson) {
           await write(io.stdout, json({

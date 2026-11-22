@@ -21,6 +21,13 @@ Every line has a role. The chart of accounts maps roles to account codes; pass y
 | `network_fees` | `expenses:network-fees` | transaction fees |
 | `uncategorized_income` | `income:uncategorized` | an incoming movement deliberately ignored |
 | `uncategorized_expense` | `expenses:uncategorized` | an outgoing movement deliberately ignored |
+| `deposit_clearing` | `liabilities:deposits-received` | a mint, against issued supply or wallet cash |
+| `redemption_payable` | `liabilities:redemptions-payable` | a burn, against issued supply or wallet cash |
+| `clawback` | `equity:clawback` | a clawback, against issued supply or wallet cash |
+| `due_to` | `liabilities:due-to` | an intercompany receipt |
+| `due_from` | `assets:due-from` | an intercompany payment |
+| `in_transit` | `assets:in-transit` | an internal transfer within one entity |
+| `opening_balance` | `equity:opening-balances` | an account's opening balance |
 
 Unexplained money out is a suspense *asset*, not a liability: it was usually exchanged for something
 (a DEX trade, a bill booked elsewhere), and sharing an account with unexplained receipts would let
@@ -30,15 +37,71 @@ unrelated flows cancel out.
 accounting system does. nostro's receivable lines are the payment side of that receivable, linked to
 each invoice by its expectation, so an exporter can match them up. The same goes for `payable`.
 
+## Entities and internal transfers
+
+One tenant can hold several legal entities. `nostro entity create --id <id> --name <name>` creates an
+entity; `nostro entity assign --account <G...> --entity-id <id>` says which entity owns a watched
+account, and `nostro entity list` / `nostro entity accounts` show the ownership map. Assigning an
+account again changes future stamps only: a movement inherits the entity of its account at ingest,
+and its journal lines keep that entity forever, so books do not rewrite themselves.
+
+Every journal query and report option accepts `entityId`; the CLI exposes it as `--entity`, and HTTP
+exposes it as `?entityId=`. The `entity` column in the CSV identifies the owning entity, or is empty
+for pre-entity history and manual entries.
+
+A transfer is internal when two movements in the same tenant and network have the same `txHash`,
+opposite directions, equal amounts and assets, and each account is the other's `counterparty`. Only
+`transfer` movements qualify. If both legs are present, both are reclassed in one transaction; if one
+arrives first, the partner's arrival reclasses both, dismissing any exception opened meanwhile. A leg
+already applied to an expectation stays on the normal matching path: applying a receipt on one
+wallet to an invoice on another remains out of scope, and `checkAllocation()` still refuses it with
+`allocation_account`.
+
+Between different entities, the payer posts Dr `due_from` · Cr cash and the recipient posts Dr cash
+· Cr `due_to`. Within one entity, the payer posts Dr `in_transit` · Cr cash and the recipient posts
+Dr cash · Cr `in_transit`; the clearing account nets to zero. Both legs are `ignored` with reason
+`internal transfer between watched accounts`, and `doctor` replays the same entity and transfer
+context so it does not report a stale journal.
+
 ## Examples
 
 | What happened | Entry |
 |---|---|
 | 25 USDC paid INV-2 in full | Dr cash 25 · Cr receivable 25 (INV-2) |
+| 10 USDC paid from Alpha to Beta | Dr due from 10 · Cr cash 10; Dr cash 10 · Cr due to 10 |
+| 10 USDC moved between two Alpha wallets | Dr in transit 10 · Cr cash 10; Dr cash 10 · Cr in transit 10 |
 | 30 USDC paid INV-2 (25 owed) | Dr cash 30 · Cr receivable 25 (INV-2) · Cr customer credit 5 |
 | 7 USDC arrived with no memo | Dr cash 7 · Cr unapplied 7 |
 | 0.00001 XLM network fee | Dr network fees · Cr cash |
 | Later, a person applies the 7 USDC to INV-3 | **reclass:** Dr unapplied 7 · Cr receivable 7 (INV-3) |
+| Issuer mints 100 USDC to a customer | issuer: Dr deposits received 100 · Cr issued 100; customer: Dr cash 100 · Cr deposits received 100 |
+| A customer redeems 100 USDC to the issuer | customer: Dr redemptions payable 100 · Cr cash 100; issuer: Dr issued 100 · Cr redemptions payable 100 |
+| Issuer claws back 100 USDC from a holder | holder: Dr clawback 100 · Cr cash 100; issuer: Dr issued 100 · Cr clawback 100 |
+
+Mints and burns stay matchable, so an anchor can still apply a fiat deposit expectation to a mint.
+Clawbacks are ignored by matching and posted to their own account. Entries posted before these roles
+existed are reclassed by the next `postJournal()` sweep; cash and issued supply are never touched by
+that reclass.
+
+## Opening an existing account
+
+An account with history before nostro was installed starts from a snapshot, not from invented
+movements:
+
+```sh
+nostro open --account G... --network public --note 'Books opened at ledger 123'
+```
+
+The command reads every Horizon balance line, requires native XLM to be present, and refuses an
+account holding liquidity pool shares rather than dropping them. It stores the opening balances,
+posts one `opening` entry (Dr cash, Cr `equity:opening-balances` for each asset), and seeds both
+Horizon cursors after the snapshot ledger. The next `nostro sync` therefore sees only later ledger
+activity. An account that already has movements, or a second opening for the same account, is
+refused. From code, the same operation is `openAccount({ store, tenantId, network, account, ledger,
+balances, note })`.
+
+`doctor --attest` starts I2 from the opening balances and ignores movements through the opening
+ledger, so an old account attests without replaying its pre-history.
 
 ## Entries are adjusted, never edited
 
@@ -75,7 +138,7 @@ for await (const line of journalBeancountRows({ store, tenantId: 'acme', commodi
 ```
 
 One row per journal line, RFC 4180 with CRLF line endings. Columns: `entry_id`, `seq`, `kind`,
-`posted_at`, `effective_at`, `description`, `line_no`, `account`, `role`, `asset`, `debit`, `credit`,
+`posted_at`, `effective_at`, `description`, `line_no`, `account`, `entity`, `role`, `asset`, `debit`, `credit`,
 `movement_id`, `tx_hash`, `expectation_reference`, `exception_id`, `exception_code`, `value`.
 
 - Amounts are exact decimal strings, never floats, even beyond 64 bits.
@@ -83,6 +146,13 @@ One row per journal line, RFC 4180 with CRLF line endings. Columns: `entry_id`, 
 - Text that a spreadsheet would run as a formula (starting with `=`, `+`, `-`, `@` or a tab) is
   prefixed with `'`. References and account codes come from users, and these files get opened in
   spreadsheets. Payment memo text, which the payer controls, is never written.
+
+`nostro export --format ofx --account assets:stellar:public:G... --asset USDC:GA5Z... --currency USD
+--from 2026-10-01 --to 2026-11-01` writes an OFX 2.2 bank statement for one wallet and asset. It
+contains only cash lines on that account, with credits positive and debits negative. `FITID` is a
+stable SHA-256 of tenant, account, asset, entry and line number, so importing the same range twice
+does not duplicate rows. `CURDEF` must be an ISO 4217 code; pass `--currency` unless the asset code
+itself is one. The same statement is available from code as `walletStatement()` and `renderOfx()`.
 
 `nostro export --format quickbooks --account-map accounts.json` writes the QuickBooks Online
 journal-entry columns `Journal No.`, `Journal Date`, `Account Name`, `Debits`, `Credits` and

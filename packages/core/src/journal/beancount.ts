@@ -44,6 +44,7 @@ async function validate(options: JournalBeancountOptions): Promise<ExportSnapsho
     throughSeq = entry.seq
     const date = entry.effectiveAt.toISOString().slice(0, 10)
     for (const line of entry.lines) {
+      if (options.entityId !== undefined && line.entityId !== options.entityId) continue
       const account = beancountAccount(line.account)
       const priorCode = accounts.get(account)
       if (priorCode !== undefined && priorCode !== line.account) {
@@ -84,6 +85,8 @@ export async function* journalBeancountRows(options: JournalBeancountOptions): A
   const txHashes = new Map<string, string | null>()
   const references = new Map<string, string | null>()
   for await (const entry of journalEntries({ ...options, throughSeq: snapshot.throughSeq })) {
+    const visibleLines = entry.lines.filter((line) => options.entityId === undefined || line.entityId === options.entityId)
+    if (visibleLines.length === 0) continue
     yield transactionHeader(entry)
     if (entry.movementId !== null) {
       if (!txHashes.has(entry.movementId)) {
@@ -93,7 +96,7 @@ export async function* journalBeancountRows(options: JournalBeancountOptions): A
       const txHash = txHashes.get(entry.movementId)
       if (txHash != null) yield `  tx_hash: ${quoted(txHash)}\n`
     }
-    for (const line of entry.lines) {
+    for (const line of visibleLines) {
       const account = beancountAccount(line.account)
       const amount = `${line.side === 'debit' ? '' : '-'}${line.amount.toString()}`
       const commodity = commodityFor(line.amount.asset, options.commodityMap)

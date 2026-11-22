@@ -12,15 +12,22 @@
  * memory store in code — and the shared conformance suite checks that they do.
  */
 import type {
+  AccountEntity,
+  AccountEntityQuery,
+  AccountOpening,
   Allocation,
   CursorKey,
   Direction,
   Disposition,
+  Entity,
+  EntityQuery,
   ExceptionCode,
   ExceptionRecord,
   ExceptionStatus,
   Expectation,
   ExpectationStatus,
+  InternalTransferLink,
+  InternalTransferQuery,
   JournalEntry,
   Movement,
   NewAllocation,
@@ -30,6 +37,10 @@ import type {
   NewJournalEntry,
   NewMovement,
   MovementValuation,
+  NewAccountEntity,
+  NewAccountOpening,
+  NewEntity,
+  NewInternalTransferLink,
   NewMovementValuation,
   ValuationQuery,
 } from '../model/index.js'
@@ -52,8 +63,16 @@ export interface MovementQuery {
   readonly txHash?: string
   readonly disposition?: Disposition
   readonly account?: string
+  readonly entityId?: string
   /** Return movements with `seq` greater than this; for paging in ingest order. */
   readonly afterSeq?: number
+  readonly limit?: number
+}
+
+export interface AccountOpeningQuery {
+  readonly tenantId: string
+  readonly network?: string
+  readonly account?: string
   readonly limit?: number
 }
 
@@ -198,6 +217,14 @@ export interface SyncStateRow {
 
 /** Read access. Every lookup is scoped by tenant; ids from another tenant read as absent. */
 export interface StoreReader extends JournalReader {
+  getEntity(tenantId: string, id: string): Promise<Entity | null>
+  listEntities(query: EntityQuery): Promise<Entity[]>
+  getAccountEntity(tenantId: string, network: string, account: string): Promise<AccountEntity | null>
+  listAccountEntities(query: AccountEntityQuery): Promise<AccountEntity[]>
+  getInternalTransferLink(tenantId: string, id: string): Promise<InternalTransferLink | null>
+  listInternalTransferLinks(query: InternalTransferQuery): Promise<InternalTransferLink[]>
+  getAccountOpening(tenantId: string, network: string, account: string): Promise<AccountOpening | null>
+  listAccountOpenings(query: AccountOpeningQuery): Promise<AccountOpening[]>
   /** The key with this digest, revoked or not, or null. Used by the server's authentication. */
   findApiKeyByDigest(digest: string): Promise<ApiKeyRow | null>
   /** Every key, or only one tenant's, oldest first. Never returns a plain key. */
@@ -252,6 +279,10 @@ export interface StoreReader extends JournalReader {
  * default isolation level.
  */
 export interface StoreTx extends StoreReader, JournalTx {
+  insertEntity(entity: NewEntity): Promise<Entity>
+  assignAccountEntity(assignment: NewAccountEntity): Promise<AccountEntity>
+  linkInternalTransfer(link: NewInternalTransferLink): Promise<InternalTransferLink>
+  insertAccountOpening(opening: NewAccountOpening): Promise<AccountOpening>
   linkRefund(tenantId: string, creditMovementId: string, refundMovementId: string): Promise<RefundLink>
   postAccrualExpectation(expectationId: string, tenantId: string, direction: Direction, amount: Money, reference: string): Promise<void>
   /** Lock the tenant's close state until this transaction ends, then return it. */
@@ -352,6 +383,8 @@ export interface JournalQuery {
   readonly movementIds?: readonly string[]
   /** Filter lines to this account code (matches any entry that has at least one line on this account). */
   readonly account?: string
+  /** Filter entries with at least one line on this entity. */
+  readonly entityId?: string
   /** Entries with `seq` greater than this, for paging in posting order. */
   readonly afterSeq?: number
   /** Effective on or after this instant. */
@@ -442,6 +475,14 @@ export type ConstraintName =
   | 'exception_not_open'
   | 'refund_invalid'
   | 'refund_over_credit'
+  | 'account_opening_duplicate'
+  | 'account_opening_has_movements'
+  | 'account_opening_asset_duplicate'
+  | 'entity_duplicate'
+  | 'entity_unknown'
+  | 'account_entity_duplicate'
+  | 'internal_transfer_invalid'
+  | 'internal_transfer_duplicate'
   | 'journal_manual_slot'
   | 'journal_unbalanced'
   | 'journal_posting_conflict'
@@ -464,7 +505,7 @@ export class StoreError extends Error {
 
 export class NotFoundError extends StoreError {
   constructor(
-    public readonly entity: 'movement' | 'expectation' | 'exception' | 'api_key',
+    public readonly entity: 'movement' | 'expectation' | 'exception' | 'account_opening' | 'entity' | 'account_entity' | 'internal_transfer_link' | 'api_key',
     public readonly id: string,
   ) {
     super('NOT_FOUND', `${entity} ${id} not found`)

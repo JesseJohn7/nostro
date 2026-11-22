@@ -16,13 +16,19 @@ import { randomUUID } from 'node:crypto'
 import Database from 'better-sqlite3'
 import { EventHistoryPrunedError } from '@nostro-labs/nostro'
 import type {
+  AccountOpening,
+  AccountOpeningQuery,
   ApiKeyRow,
   NewApiKeyRow,
   SyncStateRow,
   WatchedAccountRow,
   Allocation,
   AllocationQuery,
+  AccountEntity,
+  AccountEntityQuery,
   CursorKey,
+  Entity,
+  EntityQuery,
   DeliveryAttempt,
   DeliveryAttemptQuery,
   Disposition,
@@ -34,6 +40,8 @@ import type {
   ExpectationChanges,
   ExpectationQuery,
   InsertMovementsResult,
+  InternalTransferLink,
+  InternalTransferQuery,
   JournalEntry,
   JournalPeriod,
   JournalQuery,
@@ -43,7 +51,11 @@ import type {
   Movement,
   MovementConflict,
   MovementQuery,
+  NewAccountEntity,
+  NewAccountOpening,
   NewAllocation,
+  NewEntity,
+  NewInternalTransferLink,
   NewException,
   NewExpectation,
   NewJournalEntry,
@@ -64,6 +76,7 @@ import type {
   AssetId,
   MovementValuation,
   NewMovementValuation,
+  OpeningBalance,
   ValuationQuery,
 } from '@nostro-labs/nostro'
 import {
@@ -75,7 +88,11 @@ import {
   Money,
   NotFoundError,
   TransactionClosedError,
+  assertValidNewAccountEntity,
+  assertValidNewAccountOpening,
   assertValidNewAllocation,
+  assertValidNewEntity,
+  assertValidNewInternalTransferLink,
   assertValidNewException,
   assertValidNewExpectation,
   assertValidNewJournalEntry,
@@ -176,6 +193,7 @@ const toMovement = (r: Row): Movement =>
     externalId: r.external_id as string,
     revision: r.revision as number,
     account: r.account as string,
+    entityId: (r.entity_id as string | null) ?? null,
     direction: r.direction as Movement['direction'],
     kind: r.kind as Movement['kind'],
     amount: money(r.amount, r.asset, r.decimals),
@@ -189,6 +207,64 @@ const toMovement = (r: Row): Movement =>
     enrichment: r.enrichment as Movement['enrichment'],
     disposition: r.disposition as Movement['disposition'],
     ignoredReason: r.ignored_reason as string | null,
+    createdAt: date(r.created_at)!,
+  })
+
+interface StoredOpeningBalance {
+  readonly raw: string
+  readonly asset: string
+  readonly decimals: number
+  readonly lastModifiedLedger: number | null
+}
+
+const storedOpeningBalance = (b: OpeningBalance): StoredOpeningBalance => ({
+  ...b.amount.toJSON(),
+  lastModifiedLedger: b.lastModifiedLedger,
+})
+
+const toAccountOpening = (r: Row): AccountOpening => {
+  const balances = JSON.parse(r.balances_json as string) as StoredOpeningBalance[]
+  return Object.freeze({
+    id: r.id as string,
+    tenantId: r.tenant_id as string,
+    network: r.network as string,
+    account: r.account as string,
+    ledger: r.ledger as number,
+    occurredAt: new Date(r.occurred_at as number),
+    balances: Object.freeze(balances.map((b) => Object.freeze({
+      amount: Money.fromRaw(BigInt(b.raw), parseAsset(b.asset), b.decimals),
+      lastModifiedLedger: b.lastModifiedLedger,
+    }))),
+    note: r.note as string | null,
+    createdAt: new Date(r.created_at as number),
+  })
+}
+
+const toEntity = (r: Row): Entity =>
+  Object.freeze({
+    id: r.id as string,
+    tenantId: r.tenant_id as string,
+    name: r.name as string,
+    createdAt: date(r.created_at)!,
+  })
+
+const toAccountEntity = (r: Row): AccountEntity =>
+  Object.freeze({
+    tenantId: r.tenant_id as string,
+    network: r.network as string,
+    account: r.account as string,
+    entityId: r.entity_id as string,
+    createdAt: date(r.created_at)!,
+  })
+
+const toInternalTransferLink = (r: Row): InternalTransferLink =>
+  Object.freeze({
+    id: r.id as string,
+    tenantId: r.tenant_id as string,
+    network: r.network as string,
+    txHash: r.tx_hash as string,
+    movementIds: Object.freeze([r.movement_a as string, r.movement_b as string]) as readonly [string, string],
+    sameEntity: (r.same_entity as number) === 1,
     createdAt: date(r.created_at)!,
   })
 
@@ -297,6 +373,7 @@ const toJournalEntry = (r: Row, lines: readonly Row[]): JournalEntry =>
       lines.map((l) =>
         Object.freeze({
           account: l.account as string,
+          entityId: (l.entity_id as string | null) ?? null,
           role: l.role as JournalEntry['lines'][number]['role'],
           side: l.side as JournalEntry['lines'][number]['side'],
           amount: money(l.amount, l.asset, l.decimals),
@@ -312,9 +389,9 @@ class Where {
   readonly params: Param[] = []
   private readonly clauses: string[] = []
 
-  add(sql: string, value: Param | undefined): this {
-    if (value !== undefined) {
-      this.params.push(value)
+  add(sql: string, ...values: (Param | undefined)[]): this {
+    if (values.every((value) => value !== undefined)) {
+      this.params.push(...(values as Param[]))
       this.clauses.push(sql)
     }
     return this
@@ -392,6 +469,7 @@ class SqliteReader implements StoreReader {
       .in('id', q.ids)
       .add('disposition = ?', q.disposition)
       .add('account = ?', q.account)
+      .add('entity_id = ?', q.entityId)
       .add('tx_hash = ?', q.txHash)
       .add('seq > ?', q.afterSeq)
     return this.all(`SELECT * FROM movements${w} ORDER BY seq${w.limit(q.limit)}`, w.params).map(toMovement)
@@ -507,6 +585,70 @@ class SqliteReader implements StoreReader {
     return this.all(`SELECT * FROM webhook_rewinds${w} ORDER BY seq DESC${w.limit(q.limit ?? DELIVERY_ATTEMPT_LIMIT)}`, w.params).map(toRewind)
   }
 
+  async getEntity(tenantId: string, id: string): Promise<Entity | null> {
+    const row = this.one('SELECT * FROM entities WHERE tenant_id = ? AND id = ?', [tenantId, id])
+    return row === undefined ? null : toEntity(row)
+  }
+
+  async listEntities(q: EntityQuery): Promise<Entity[]> {
+    const w = new Where().add('tenant_id = ?', q.tenantId)
+    return this.all(`SELECT * FROM entities${w} ORDER BY id${w.limit(q.limit)}`, w.params).map(toEntity)
+  }
+
+  async getAccountEntity(tenantId: string, network: string, account: string): Promise<AccountEntity | null> {
+    const row = this.one(
+      'SELECT * FROM account_entities WHERE tenant_id = ? AND network = ? AND account = ?',
+      [tenantId, network, account],
+    )
+    return row === undefined ? null : toAccountEntity(row)
+  }
+
+  async listAccountEntities(q: AccountEntityQuery): Promise<AccountEntity[]> {
+    const w = new Where()
+      .add('tenant_id = ?', q.tenantId)
+      .add('network = ?', q.network)
+      .add('account = ?', q.account)
+      .add('entity_id = ?', q.entityId)
+    return this.all(`SELECT * FROM account_entities${w} ORDER BY account, network${w.limit(q.limit)}`, w.params)
+      .map(toAccountEntity)
+  }
+
+  async getInternalTransferLink(tenantId: string, id: string): Promise<InternalTransferLink | null> {
+    const row = this.one('SELECT * FROM internal_transfer_links WHERE tenant_id = ? AND id = ?', [tenantId, id])
+    return row === undefined ? null : toInternalTransferLink(row)
+  }
+
+  async listInternalTransferLinks(q: InternalTransferQuery): Promise<InternalTransferLink[]> {
+    if (q.movementIds?.length === 0) return []
+    const w = new Where()
+      .add('tenant_id = ?', q.tenantId)
+      .add('network = ?', q.network)
+      .add('tx_hash = ?', q.txHash)
+    if (q.movementIds !== undefined) {
+      const markers = q.movementIds.map(() => '?').join(', ')
+      w.add(`(movement_a IN (${markers}) OR movement_b IN (${markers}))`, ...q.movementIds, ...q.movementIds)
+    }
+    return this.all(`SELECT * FROM internal_transfer_links${w} ORDER BY created_at, id${w.limit(q.limit)}`, w.params)
+      .map(toInternalTransferLink)
+  }
+
+  async getAccountOpening(tenantId: string, network: string, account: string): Promise<AccountOpening | null> {
+    const row = this.one(
+      'SELECT * FROM account_openings WHERE tenant_id = ? AND network = ? AND account = ?',
+      [tenantId, network, account],
+    )
+    return row === undefined ? null : toAccountOpening(row)
+  }
+
+  async listAccountOpenings(q: AccountOpeningQuery): Promise<AccountOpening[]> {
+    const w = new Where()
+      .add('tenant_id = ?', q.tenantId)
+      .add('network = ?', q.network)
+      .add('account = ?', q.account)
+    return this.all(`SELECT * FROM account_openings${w} ORDER BY ledger, id${w.limit(q.limit)}`, w.params)
+      .map(toAccountOpening)
+  }
+
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
     const w = new Where()
       .add('tenant_id = ?', q.tenantId)
@@ -515,6 +657,14 @@ class SqliteReader implements StoreReader {
       .add('seq > ?', q.afterSeq)
       .add('effective_at >= ?', q.effectiveFrom?.getTime())
       .add('effective_at < ?', q.effectiveBefore?.getTime())
+      .add(
+        'EXISTS (SELECT 1 FROM journal_lines l WHERE l.entry_id = journal_entries.id AND l.account = ?)',
+        q.account,
+      )
+      .add(
+        'EXISTS (SELECT 1 FROM journal_lines l WHERE l.entry_id = journal_entries.id AND l.entity_id = ?)',
+        q.entityId,
+      )
     const selected = `SELECT * FROM journal_entries${w} ORDER BY seq${w.limit(q.limit)}`
     const entries = this.all(selected, w.params)
     if (entries.length === 0) return []
@@ -847,19 +997,139 @@ class SqliteTx extends SqliteReader implements StoreTx {
     return { deleted: removed.length, prunedThrough: Math.max(await this.getEventsPrunedThrough(tenantId), lastRemoved) }
   }
 
+  async insertEntity(n: NewEntity): Promise<Entity> {
+    assertValidNewEntity(n)
+    if (await this.getEntity(n.tenantId, n.id) !== null) {
+      throw new ConstraintError('entity_duplicate', `entity ${n.id} already exists in this tenant`)
+    }
+    const record: Entity = Object.freeze({ ...n, createdAt: this.now() })
+    this.exec(
+      'INSERT INTO entities (id, tenant_id, name, created_at) VALUES (?, ?, ?, ?)',
+      [record.id, record.tenantId, record.name, record.createdAt.getTime()],
+    )
+    return record
+  }
+
+  async assignAccountEntity(n: NewAccountEntity): Promise<AccountEntity> {
+    assertValidNewAccountEntity(n)
+    if (await this.getEntity(n.tenantId, n.entityId) === null) {
+      throw new ConstraintError('entity_unknown', `entity ${n.entityId} does not exist in this tenant`)
+    }
+    const record: AccountEntity = Object.freeze({ ...n, createdAt: this.now() })
+    this.exec(
+      `INSERT INTO account_entities (tenant_id, network, account, entity_id, created_at)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT (tenant_id, network, account)
+       DO UPDATE SET entity_id = excluded.entity_id, created_at = excluded.created_at`,
+      [record.tenantId, record.network, record.account, record.entityId, record.createdAt.getTime()],
+    )
+    return record
+  }
+
+  async linkInternalTransfer(n: NewInternalTransferLink): Promise<InternalTransferLink> {
+    assertValidNewInternalTransferLink(n)
+    const [a, b] = await Promise.all(n.movementIds.map((id) => this.movement(n.tenantId, id))) as [Movement, Movement]
+    if (a.network !== n.network || b.network !== n.network) {
+      throw new ConstraintError('internal_transfer_invalid', 'both movements must be on the transfer network')
+    }
+    const sameEntity = a.entityId === b.entityId
+    if (sameEntity !== n.sameEntity) {
+      throw new ConstraintError('internal_transfer_invalid', 'sameEntity disagrees with the linked movements')
+    }
+    const existingLinks = await this.listInternalTransferLinks({ tenantId: n.tenantId, movementIds: n.movementIds })
+    if (existingLinks.length > 0) {
+      throw new ConstraintError('internal_transfer_duplicate', 'a movement is already part of another internal transfer')
+    }
+    const [movementA, movementB] = [...n.movementIds].sort() as [string, string]
+    const record: InternalTransferLink = Object.freeze({
+      ...n,
+      id: this.ids(),
+      movementIds: Object.freeze([movementA, movementB]) as readonly [string, string],
+      sameEntity,
+      createdAt: this.now(),
+    })
+    try {
+      this.exec(
+        `INSERT INTO internal_transfer_links
+           (id, tenant_id, network, tx_hash, movement_a, movement_b, same_entity, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          record.id,
+          record.tenantId,
+          record.network,
+          record.txHash,
+          movementA,
+          movementB,
+          sameEntity ? 1 : 0,
+          record.createdAt.getTime(),
+        ],
+      )
+    } catch (err) {
+      if (err instanceof Error && err.message.includes('internal transfer')) {
+        throw new ConstraintError('internal_transfer_duplicate', err.message)
+      }
+      throw err
+    }
+    return record
+  }
+
+  async insertAccountOpening(opening: NewAccountOpening): Promise<AccountOpening> {
+    assertValidNewAccountOpening(opening)
+    if (await this.getAccountOpening(opening.tenantId, opening.network, opening.account) !== null) {
+      throw new ConstraintError('account_opening_duplicate', `${opening.network}:${opening.account} already has an opening`)
+    }
+    const movement = this.one(
+      'SELECT 1 FROM movements WHERE tenant_id = ? AND network = ? AND account = ? LIMIT 1',
+      [opening.tenantId, opening.network, opening.account],
+    )
+    if (movement !== undefined) {
+      throw new ConstraintError('account_opening_has_movements', `${opening.network}:${opening.account} already has movements`)
+    }
+    const record: AccountOpening = Object.freeze({
+      ...opening,
+      id: this.ids(),
+      occurredAt: opening.occurredAt ?? this.now(),
+      balances: opening.balances,
+      note: opening.note ?? null,
+      createdAt: this.now(),
+    })
+    this.exec(
+      `INSERT INTO account_openings
+         (id, tenant_id, network, account, ledger, occurred_at, balances_json, note, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        record.id,
+        record.tenantId,
+        record.network,
+        record.account,
+        record.ledger,
+        record.occurredAt.getTime(),
+        JSON.stringify(record.balances.map(storedOpeningBalance)),
+        record.note,
+        record.createdAt.getTime(),
+      ],
+    )
+    return record
+  }
+
   async insertMovements(batch: readonly NewMovement[]): Promise<InsertMovementsResult> {
     batch.forEach(assertValidNewMovement)
     const inserted: Movement[] = []
     const duplicates: Movement[] = []
     const conflicts: MovementConflict[] = []
     for (const n of batch) {
+      const assignment = await this.getAccountEntity(n.tenantId, n.network, n.account)
+      const entityId = n.entityId ?? assignment?.entityId ?? null
+      if (entityId !== null && await this.getEntity(n.tenantId, entityId) === null) {
+        throw new ConstraintError('entity_unknown', `entity ${entityId} does not exist in this tenant`)
+      }
       const [memoType, memoValue, memoText] = memoColumns(n.memo)
       const row = this.one(
         `INSERT INTO movements (
-           id, tenant_id, network, source, external_id, revision, account, direction, kind,
+           id, tenant_id, network, source, external_id, revision, account, entity_id, direction, kind,
            asset, decimals, amount, counterparty, muxed_id, memo_type, memo_value, memo_text,
            ledger, tx_hash, operation_id, occurred_at, enrichment, disposition, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
          ON CONFLICT (tenant_id, network, source, external_id) DO NOTHING
          RETURNING *`,
         [
@@ -868,9 +1138,10 @@ class SqliteTx extends SqliteReader implements StoreTx {
           n.network,
           n.source,
           n.externalId,
-          n.revision ?? 1,
-          n.account,
-          n.direction,
+           n.revision ?? 1,
+           n.account,
+           entityId,
+           n.direction,
           n.kind,
           n.amount.asset,
           n.amount.decimals,
@@ -1127,14 +1398,15 @@ class SqliteTx extends SqliteReader implements StoreTx {
       (l, i) =>
         this.one(
           `INSERT INTO journal_lines (
-             entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id
-           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+             entry_id, line_no, tenant_id, account, entity_id, role, side, asset, decimals, amount, expectation_id, exception_id
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
           [
             entry.id as string,
             i + 1,
-            n.tenantId,
-            l.account,
-            l.role,
+             n.tenantId,
+             l.account,
+             l.entityId ?? movement?.entityId ?? null,
+             l.role,
             l.side,
             l.amount.asset,
             l.amount.decimals,

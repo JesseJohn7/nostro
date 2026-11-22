@@ -69,6 +69,73 @@ export const DISPOSITIONS: readonly Disposition[] = ['pending', 'allocated', 'pa
 /** Whether the enrichment feeds (memo, muxed id, op type) were stitched on. */
 export type Enrichment = 'complete' | 'missing'
 
+export interface Entity {
+  readonly id: string
+  readonly tenantId: string
+  readonly name: string
+  readonly createdAt: Date
+}
+
+export interface NewEntity {
+  readonly id: string
+  readonly tenantId: string
+  readonly name: string
+}
+
+export interface AccountEntity {
+  readonly tenantId: string
+  readonly network: string
+  readonly account: string
+  readonly entityId: string
+  readonly createdAt: Date
+}
+
+export interface NewAccountEntity {
+  readonly tenantId: string
+  readonly network: string
+  readonly account: string
+  readonly entityId: string
+}
+
+export interface InternalTransferLink {
+  readonly id: string
+  readonly tenantId: string
+  readonly network: string
+  readonly txHash: string
+  readonly movementIds: readonly [string, string]
+  readonly sameEntity: boolean
+  readonly createdAt: Date
+}
+
+export interface NewInternalTransferLink {
+  readonly tenantId: string
+  readonly network: string
+  readonly txHash: string
+  readonly movementIds: readonly [string, string]
+  readonly sameEntity: boolean
+}
+
+export interface InternalTransferQuery {
+  readonly tenantId: string
+  readonly network?: string
+  readonly txHash?: string
+  readonly movementIds?: readonly string[]
+  readonly limit?: number
+}
+
+export interface EntityQuery {
+  readonly tenantId: string
+  readonly limit?: number
+}
+
+export interface AccountEntityQuery {
+  readonly tenantId: string
+  readonly network?: string
+  readonly account?: string
+  readonly entityId?: string
+  readonly limit?: number
+}
+
 export interface Movement {
   readonly id: string
   readonly tenantId: string
@@ -83,6 +150,7 @@ export interface Movement {
   readonly revision: number
   /** The watched account (`G...`). */
   readonly account: string
+  readonly entityId?: string | null
   readonly direction: Direction
   readonly kind: MovementKind
   /** Always positive; the sign lives in `direction`. */
@@ -111,6 +179,7 @@ export interface NewMovement {
   readonly externalId: string
   readonly revision?: number
   readonly account: string
+  readonly entityId?: string | null
   readonly direction: Direction
   readonly kind: MovementKind
   readonly amount: Money
@@ -122,6 +191,28 @@ export interface NewMovement {
   readonly operationId?: string | null
   readonly occurredAt: Date
   readonly enrichment?: Enrichment
+}
+
+export interface OpeningBalance {
+  readonly amount: Money
+  readonly lastModifiedLedger: number | null
+}
+
+export interface NewAccountOpening {
+  readonly tenantId: string
+  readonly network: string
+  readonly account: string
+  readonly ledger: number
+  readonly occurredAt?: Date
+  readonly balances: readonly OpeningBalance[]
+  readonly note?: string | null
+}
+
+export interface AccountOpening extends NewAccountOpening {
+  readonly id: string
+  readonly occurredAt: Date
+  readonly note: string | null
+  readonly createdAt: Date
 }
 
 export type ExpectationStatus = 'open' | 'partially_paid' | 'settled' | 'cancelled'
@@ -329,6 +420,13 @@ export type LineRole =
   | 'uncategorized_expense'
   | 'conversion'
   | 'refund_clearing'
+  | 'deposit_clearing'
+  | 'redemption_payable'
+  | 'clawback'
+  | 'due_to'
+  | 'due_from'
+  | 'in_transit'
+  | 'opening_balance'
   | 'other'
 
 export const LINE_ROLES: readonly LineRole[] = [
@@ -344,6 +442,13 @@ export const LINE_ROLES: readonly LineRole[] = [
   'uncategorized_expense',
   'conversion',
   'refund_clearing',
+  'deposit_clearing',
+  'redemption_payable',
+  'clawback',
+  'due_to',
+  'due_from',
+  'in_transit',
+  'opening_balance',
   'other',
 ]
 
@@ -355,12 +460,13 @@ export type Side = 'debit' | 'credit'
  * `correction`: changes the cash leg itself (a source correction).
  * `manual`: a manual entry not tied to a movement (or a manual adjustment), cash untouched.
  */
-export type JournalEntryKind = 'initial' | 'reclass' | 'correction' | 'conversion' | 'manual'
+export type JournalEntryKind = 'initial' | 'reclass' | 'correction' | 'conversion' | 'manual' | 'opening'
 
-export const JOURNAL_ENTRY_KINDS: readonly JournalEntryKind[] = ['initial', 'reclass', 'correction', 'conversion', 'manual']
+export const JOURNAL_ENTRY_KINDS: readonly JournalEntryKind[] = ['initial', 'reclass', 'correction', 'conversion', 'manual', 'opening']
 
 export interface JournalLine {
   readonly account: string
+  readonly entityId?: string | null
   readonly role: LineRole
   readonly side: Side
   /** Always positive; the direction lives in `side`. */
@@ -393,6 +499,7 @@ export interface JournalEntry {
 
 export interface NewJournalLine {
   readonly account: string
+  readonly entityId?: string | null
   readonly role: LineRole
   readonly side: Side
   readonly amount: Money

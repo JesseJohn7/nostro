@@ -17,6 +17,10 @@ import pg from 'pg'
 import type { Pool, PoolClient, QueryResultRow } from 'pg'
 import { EventHistoryPrunedError } from '@nostro-labs/nostro'
 import type {
+  AccountEntity,
+  AccountEntityQuery,
+  AccountOpening,
+  AccountOpeningQuery,
   ApiKeyRow,
   NewApiKeyRow,
   SyncStateRow,
@@ -28,6 +32,8 @@ import type {
   DeliveryAttemptQuery,
   Disposition,
   Direction,
+  Entity,
+  EntityQuery,
   EventQuery,
   ExceptionQuery,
   ExceptionRecord,
@@ -35,6 +41,8 @@ import type {
   ExpectationChanges,
   ExpectationQuery,
   InsertMovementsResult,
+  InternalTransferLink,
+  InternalTransferQuery,
   JournalEntry,
   JournalPeriod,
   JournalQuery,
@@ -43,7 +51,11 @@ import type {
   Movement,
   MovementConflict,
   MovementQuery,
+  NewAccountEntity,
+  NewAccountOpening,
   NewAllocation,
+  NewEntity,
+  NewInternalTransferLink,
   NewException,
   NewExpectation,
   NewJournalEntry,
@@ -74,7 +86,11 @@ import {
   ConstraintError,
   NotFoundError,
   TransactionClosedError,
+  assertValidNewAccountEntity,
+  assertValidNewAccountOpening,
   assertValidNewAllocation,
+  assertValidNewEntity,
+  assertValidNewInternalTransferLink,
   assertValidNewException,
   assertValidNewExpectation,
   assertValidNewJournalEntry,
@@ -100,7 +116,11 @@ import {
   sameFacts,
 } from '@nostro-labs/nostro'
 import type {
+  AccountEntityRow,
+  AccountOpeningRow,
   AllocationRow,
+  EntityRow,
+  InternalTransferLinkRow,
   DeliveryAttemptRow,
   EventRow,
   ExceptionRow,
@@ -111,7 +131,7 @@ import type {
   MovementValuationRow,
   RewindRow,
 } from './rows.js'
-import { memoColumns, toAllocation, toDeliveryAttempt, toEvent, toException, toExpectation, toJournalEntry, toMovement, toRewind, toValuation } from './rows.js'
+import { memoColumns, storedOpeningBalance, toAccountEntity, toAccountOpening, toAllocation, toDeliveryAttempt, toEntity, toEvent, toException, toExpectation, toInternalTransferLink, toJournalEntry, toMovement, toRewind, toValuation } from './rows.js'
 import { MIGRATIONS, quoteSchema } from './schema.js'
 
 export interface PostgresStoreOptions {
@@ -174,6 +194,7 @@ class PgReader implements StoreReader {
       .add((p) => `id = ANY(${p}::text[])`, q.ids === undefined ? undefined : [...q.ids])
       .add((p) => `disposition = ${p}`, q.disposition)
       .add((p) => `account = ${p}`, q.account)
+      .add((p) => `entity_id = ${p}`, q.entityId)
       .add((p) => `tx_hash = ${p}`, q.txHash)
       .add((p) => `seq > ${p}`, q.afterSeq)
     const sql = `SELECT * FROM ${this.s}.movements${w} ORDER BY seq${w.limit(q.limit)}`
@@ -260,6 +281,89 @@ class PgReader implements StoreReader {
     return (await this.run<ExceptionRow>(sql, w.params)).map(toException)
   }
 
+  async getEntity(tenantId: string, id: string): Promise<Entity | null> {
+    const [row] = await this.run<EntityRow>(
+      `SELECT * FROM ${this.s}.entities WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, id],
+    )
+    return row === undefined ? null : toEntity(row)
+  }
+
+  async listEntities(q: EntityQuery): Promise<Entity[]> {
+    const w = new Where().add((p) => `tenant_id = ${p}`, q.tenantId)
+    const rows = await this.run<EntityRow>(
+      `SELECT * FROM ${this.s}.entities${w} ORDER BY id${w.limit(q.limit)}`,
+      w.params,
+    )
+    return rows.map(toEntity)
+  }
+
+  async getAccountEntity(tenantId: string, network: string, account: string): Promise<AccountEntity | null> {
+    const [row] = await this.run<AccountEntityRow>(
+      `SELECT * FROM ${this.s}.account_entities WHERE tenant_id = $1 AND network = $2 AND account = $3`,
+      [tenantId, network, account],
+    )
+    return row === undefined ? null : toAccountEntity(row)
+  }
+
+  async listAccountEntities(q: AccountEntityQuery): Promise<AccountEntity[]> {
+    const w = new Where()
+      .add((p) => `tenant_id = ${p}`, q.tenantId)
+      .add((p) => `network = ${p}`, q.network)
+      .add((p) => `account = ${p}`, q.account)
+      .add((p) => `entity_id = ${p}`, q.entityId)
+    const rows = await this.run<AccountEntityRow>(
+      `SELECT * FROM ${this.s}.account_entities${w} ORDER BY account, network${w.limit(q.limit)}`,
+      w.params,
+    )
+    return rows.map(toAccountEntity)
+  }
+
+  async getInternalTransferLink(tenantId: string, id: string): Promise<InternalTransferLink | null> {
+    const [row] = await this.run<InternalTransferLinkRow>(
+      `SELECT * FROM ${this.s}.internal_transfer_links WHERE tenant_id = $1 AND id = $2`,
+      [tenantId, id],
+    )
+    return row === undefined ? null : toInternalTransferLink(row)
+  }
+
+  async listInternalTransferLinks(q: InternalTransferQuery): Promise<InternalTransferLink[]> {
+    if (q.movementIds?.length === 0) return []
+    const w = new Where()
+      .add((p) => `tenant_id = ${p}`, q.tenantId)
+      .add((p) => `network = ${p}`, q.network)
+      .add((p) => `tx_hash = ${p}`, q.txHash)
+      .add(
+        (p) => `(movement_a = ANY(${p}::text[]) OR movement_b = ANY(${p}::text[]))`,
+        q.movementIds === undefined ? undefined : [...q.movementIds],
+      )
+    const rows = await this.run<InternalTransferLinkRow>(
+      `SELECT * FROM ${this.s}.internal_transfer_links${w} ORDER BY created_at, id${w.limit(q.limit)}`,
+      w.params,
+    )
+    return rows.map(toInternalTransferLink)
+  }
+
+  async getAccountOpening(tenantId: string, network: string, account: string): Promise<AccountOpening | null> {
+    const [row] = await this.run<AccountOpeningRow>(
+      `SELECT * FROM ${this.s}.account_openings WHERE tenant_id = $1 AND network = $2 AND account = $3`,
+      [tenantId, network, account],
+    )
+    return row === undefined ? null : toAccountOpening(row)
+  }
+
+  async listAccountOpenings(q: AccountOpeningQuery): Promise<AccountOpening[]> {
+    const w = new Where()
+      .add((p) => `tenant_id = ${p}`, q.tenantId)
+      .add((p) => `network = ${p}`, q.network)
+      .add((p) => `account = ${p}`, q.account)
+    const rows = await this.run<AccountOpeningRow>(
+      `SELECT * FROM ${this.s}.account_openings${w} ORDER BY ledger, id${w.limit(q.limit)}`,
+      w.params,
+    )
+    return rows.map(toAccountOpening)
+  }
+
   async listJournalEntries(q: JournalQuery): Promise<JournalEntry[]> {
     if (q.movementIds?.length === 0) return []
     const w = new Where()
@@ -269,6 +373,14 @@ class PgReader implements StoreReader {
       .add((p) => `seq > ${p}`, q.afterSeq)
       .add((p) => `effective_at >= ${p}`, q.effectiveFrom)
       .add((p) => `effective_at < ${p}`, q.effectiveBefore)
+      .add(
+        (p) => `EXISTS (SELECT 1 FROM ${this.s}.journal_lines l WHERE l.entry_id = ${this.s}.journal_entries.id AND l.account = ${p})`,
+        q.account,
+      )
+      .add(
+        (p) => `EXISTS (SELECT 1 FROM ${this.s}.journal_lines l WHERE l.entry_id = ${this.s}.journal_entries.id AND l.entity_id = ${p})`,
+        q.entityId,
+      )
     const entries = await this.run<JournalEntryRow>(
       `SELECT * FROM ${this.s}.journal_entries${w} ORDER BY seq${w.limit(q.limit)}`,
       w.params,
@@ -753,6 +865,127 @@ class PgTx extends PgReader implements StoreTx {
     return { deleted: removed.length, prunedThrough: Math.max(await this.getEventsPrunedThrough(tenantId), lastRemoved) }
   }
 
+  async insertEntity(n: NewEntity): Promise<Entity> {
+    assertValidNewEntity(n)
+    if (await this.getEntity(n.tenantId, n.id) !== null) {
+      throw new ConstraintError('entity_duplicate', `entity ${n.id} already exists in this tenant`)
+    }
+    const record: Entity = Object.freeze({ ...n, createdAt: this.now() })
+    try {
+      await this.run(
+        `INSERT INTO ${this.s}.entities (id, tenant_id, name, created_at) VALUES ($1, $2, $3, $4)`,
+        [record.id, record.tenantId, record.name, record.createdAt],
+      )
+    } catch (err) {
+      if (err instanceof Error && 'code' in err && err.code === '23505') {
+        throw new ConstraintError('entity_duplicate', `entity ${n.id} already exists in this tenant`)
+      }
+      throw err
+    }
+    return record
+  }
+
+  async assignAccountEntity(n: NewAccountEntity): Promise<AccountEntity> {
+    assertValidNewAccountEntity(n)
+    if (await this.getEntity(n.tenantId, n.entityId) === null) {
+      throw new ConstraintError('entity_unknown', `entity ${n.entityId} does not exist in this tenant`)
+    }
+    const record: AccountEntity = Object.freeze({ ...n, createdAt: this.now() })
+    await this.run(
+      `INSERT INTO ${this.s}.account_entities (tenant_id, network, account, entity_id, created_at)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (tenant_id, network, account)
+       DO UPDATE SET entity_id = excluded.entity_id, created_at = excluded.created_at`,
+      [record.tenantId, record.network, record.account, record.entityId, record.createdAt],
+    )
+    return record
+  }
+
+  async linkInternalTransfer(n: NewInternalTransferLink): Promise<InternalTransferLink> {
+    assertValidNewInternalTransferLink(n)
+    const [a, b] = await Promise.all(n.movementIds.map((id) => this.lockMovement(n.tenantId, id))) as [Movement, Movement]
+    if (a.network !== n.network || b.network !== n.network) {
+      throw new ConstraintError('internal_transfer_invalid', 'both movements must be on the transfer network')
+    }
+    const sameEntity = a.entityId === b.entityId
+    if (sameEntity !== n.sameEntity) {
+      throw new ConstraintError('internal_transfer_invalid', 'sameEntity disagrees with the linked movements')
+    }
+    if ((await this.listInternalTransferLinks({ tenantId: n.tenantId, movementIds: n.movementIds })).length > 0) {
+      throw new ConstraintError('internal_transfer_duplicate', 'a movement is already part of another internal transfer')
+    }
+    const [movementA, movementB] = [...n.movementIds].sort() as [string, string]
+    const record: InternalTransferLink = Object.freeze({
+      ...n,
+      id: this.ids(),
+      movementIds: Object.freeze([movementA, movementB]) as readonly [string, string],
+      sameEntity,
+      createdAt: this.now(),
+    })
+    try {
+      await this.run(
+        `INSERT INTO ${this.s}.internal_transfer_links
+           (id, tenant_id, network, tx_hash, movement_a, movement_b, same_entity, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [
+          record.id,
+          record.tenantId,
+          record.network,
+          record.txHash,
+          movementA,
+          movementB,
+          sameEntity,
+          record.createdAt,
+        ],
+      )
+    } catch (err) {
+      if (err instanceof Error && ('code' in err && err.code === '23505' || err.message.includes('internal transfer'))) {
+        throw new ConstraintError('internal_transfer_duplicate', 'a movement is already part of another internal transfer')
+      }
+      throw err
+    }
+    return record
+  }
+
+  async insertAccountOpening(opening: NewAccountOpening): Promise<AccountOpening> {
+    assertValidNewAccountOpening(opening)
+    if (await this.getAccountOpening(opening.tenantId, opening.network, opening.account) !== null) {
+      throw new ConstraintError('account_opening_duplicate', `${opening.network}:${opening.account} already has an opening`)
+    }
+    const [movement] = await this.run(
+      `SELECT 1 FROM ${this.s}.movements WHERE tenant_id = $1 AND network = $2 AND account = $3 LIMIT 1`,
+      [opening.tenantId, opening.network, opening.account],
+    )
+    if (movement !== undefined) {
+      throw new ConstraintError('account_opening_has_movements', `${opening.network}:${opening.account} already has movements`)
+    }
+    const record: AccountOpening = Object.freeze({
+      ...opening,
+      id: this.ids(),
+      occurredAt: opening.occurredAt ?? this.now(),
+      balances: opening.balances,
+      note: opening.note ?? null,
+      createdAt: this.now(),
+    })
+    await this.run(
+      `INSERT INTO ${this.s}.account_openings
+         (id, tenant_id, network, account, ledger, occurred_at, balances_json, note, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        record.id,
+        record.tenantId,
+        record.network,
+        record.account,
+        record.ledger,
+        record.occurredAt,
+        JSON.stringify(record.balances.map(storedOpeningBalance)),
+        record.note,
+        record.createdAt,
+      ],
+    )
+    return record
+  }
+
   async insertMovements(batch: readonly NewMovement[]): Promise<InsertMovementsResult> {
     batch.forEach(assertValidNewMovement)
     if (batch.length === 0) return { inserted: [], duplicates: [], conflicts: [] }
@@ -762,6 +995,14 @@ class PgTx extends PgReader implements StoreTx {
     // just as the original sequential implementation classified them.
     const unique: { ordinal: number; movement: NewMovement; id: string }[] = []
     const seen = new Set<string>()
+    const entityIds = await Promise.all(batch.map(async (movement) => {
+      const assignment = await this.getAccountEntity(movement.tenantId, movement.network, movement.account)
+      const entityId = movement.entityId ?? assignment?.entityId ?? null
+      if (entityId !== null && await this.getEntity(movement.tenantId, entityId) === null) {
+        throw new ConstraintError('entity_unknown', `entity ${entityId} does not exist in this tenant`)
+      }
+      return entityId
+    }))
     const inputRows = batch.map((movement, ordinal) => {
       const key = JSON.stringify([movement.tenantId, movement.network, movement.source, movement.externalId])
       const [memoType, memoValue, memoText] = memoColumns(movement.memo)
@@ -774,6 +1015,7 @@ class PgTx extends PgReader implements StoreTx {
         external_id: movement.externalId,
         revision: movement.revision ?? 1,
         account: movement.account,
+        entity_id: entityIds[ordinal] ?? null,
         direction: movement.direction,
         kind: movement.kind,
         asset: movement.amount.asset,
@@ -804,17 +1046,17 @@ class PgTx extends PgReader implements StoreTx {
     const uniqueRows = inputRows.filter(({ row }) => uniqueOrdinals.has(row.ordinal)).map(({ row }) => row)
     const insertedRows = await this.run<MovementRow>(
       `INSERT INTO ${this.s}.movements (
-         id, tenant_id, network, source, external_id, revision, account, direction, kind,
+         id, tenant_id, network, source, external_id, revision, account, entity_id, direction, kind,
          asset, decimals, amount, counterparty, muxed_id, memo_type, memo_value, memo_text,
          ledger, tx_hash, operation_id, occurred_at, enrichment, disposition, ignored_reason, created_at
        )
-       SELECT id, tenant_id, network, source, external_id, revision, account, direction, kind,
+       SELECT id, tenant_id, network, source, external_id, revision, account, entity_id, direction, kind,
               asset, decimals, amount, counterparty, muxed_id, memo_type, memo_value,
               CASE WHEN memo_text IS NULL THEN NULL ELSE decode(memo_text, 'base64') END,
               ledger, tx_hash, operation_id, occurred_at, enrichment, disposition, ignored_reason, created_at
          FROM jsonb_to_recordset($1::jsonb) AS x(
            ordinal integer, id text, tenant_id text, network text, source text, external_id text,
-           revision integer, account text, direction text, kind text, asset text, decimals integer,
+           revision integer, account text, entity_id text, direction text, kind text, asset text, decimals integer,
            amount numeric, counterparty text, muxed_id numeric, memo_type text, memo_value text,
            memo_text text, ledger bigint, tx_hash text, operation_id text, occurred_at timestamptz,
            enrichment text, disposition text, ignored_reason text, created_at timestamptz
@@ -1127,6 +1369,7 @@ class PgTx extends PgReader implements StoreTx {
     const lineRows = n.lines.map((line, index) => ({
       line_no: index + 1,
       account: line.account,
+      entity_id: line.entityId ?? movement?.entityId ?? null,
       role: line.role,
       side: line.side,
       asset: line.amount.asset,
@@ -1137,12 +1380,12 @@ class PgTx extends PgReader implements StoreTx {
     }))
     const lines = await this.run<JournalLineRow>(
       `INSERT INTO ${this.s}.journal_lines (
-         entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id
+         entry_id, line_no, tenant_id, account, entity_id, role, side, asset, decimals, amount, expectation_id, exception_id
        )
-       SELECT $1, x.line_no, $2, x.account, x.role, x.side, x.asset, x.decimals,
+       SELECT $1, x.line_no, $2, x.account, x.entity_id, x.role, x.side, x.asset, x.decimals,
               x.amount, x.expectation_id, x.exception_id
          FROM jsonb_to_recordset($3::jsonb) AS x(
-           line_no integer, account text, role text, side text, asset text, decimals integer,
+           line_no integer, account text, entity_id text, role text, side text, asset text, decimals integer,
            amount numeric, expectation_id text, exception_id text
          )
         ORDER BY x.line_no

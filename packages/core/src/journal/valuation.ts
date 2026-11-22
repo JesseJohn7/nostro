@@ -159,6 +159,7 @@ export interface ValueMovementsOptions {
   readonly tenantId: string
   readonly priceSource: PriceSource
   readonly reportingAsset: AssetId
+  readonly entityId?: string
   readonly reportingDecimals?: number
   readonly pageSize?: number
   readonly from?: Date
@@ -189,6 +190,7 @@ export async function valueMovements(options: ValueMovementsOptions): Promise<Va
     const page: Movement[] = await store.listMovements({
       tenantId,
       limit: pageSize,
+      ...(options.entityId === undefined ? {} : { entityId: options.entityId }),
       ...(afterSeq !== undefined ? { afterSeq } : {}),
     })
     if (page.length === 0) break

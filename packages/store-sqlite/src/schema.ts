@@ -31,6 +31,29 @@ const LINE_ROLES = list([
 ])
 const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
 const MANUAL_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual'])
+const CURRENT_LINE_ROLES = list([
+  'cash',
+  'issued',
+  'receivable',
+  'payable',
+  'unapplied',
+  'customer_credit',
+  'unexplained',
+  'network_fees',
+  'uncategorized_income',
+  'uncategorized_expense',
+  'conversion',
+  'refund_clearing',
+  'deposit_clearing',
+  'redemption_payable',
+  'clawback',
+  'due_to',
+  'due_from',
+  'in_transit',
+  'opening_balance',
+  'other',
+])
+const CURRENT_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual', 'opening'])
 const EVENT_TYPES = [
   'movement.decided',
   'expectation.partially_paid',
@@ -548,6 +571,105 @@ PRIMARY KEY (tenant_id, destination)
             AND id <> NEW.id
         )
       BEGIN SELECT RAISE(ABORT, 'fingerprint_suffix already in use on this account/asset'); END;
+  `,
+  `
+    CREATE TABLE saved_journal_lines AS SELECT * FROM journal_lines;
+    DROP TABLE journal_lines;
+    CREATE TABLE journal_entries_current (
+      seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+      id           TEXT NOT NULL UNIQUE,
+      tenant_id    TEXT NOT NULL,
+      movement_id  TEXT REFERENCES movements (id),
+      posting_no   INTEGER CHECK (posting_no >= 1),
+      kind         TEXT NOT NULL CHECK (kind IN (${CURRENT_ENTRY_KINDS})),
+      effective_at INTEGER NOT NULL,
+      posted_at    INTEGER NOT NULL,
+      description  TEXT NOT NULL,
+      CHECK ((movement_id IS NULL) = (posting_no IS NULL)),
+      UNIQUE (movement_id, posting_no)
+    );
+    INSERT INTO journal_entries_current SELECT * FROM journal_entries;
+    DROP TABLE journal_entries;
+    ALTER TABLE journal_entries_current RENAME TO journal_entries;
+    CREATE INDEX journal_entries_effective ON journal_entries (tenant_id, effective_at);
+    CREATE INDEX journal_entries_movement ON journal_entries (tenant_id, movement_id, seq);
+    ${appendOnly('journal_entries')}
+    CREATE TABLE journal_lines (
+      entry_id       TEXT NOT NULL REFERENCES journal_entries (id),
+      line_no        INTEGER NOT NULL CHECK (line_no >= 1),
+      tenant_id      TEXT NOT NULL,
+      account        TEXT NOT NULL,
+      role           TEXT NOT NULL CHECK (role IN (${CURRENT_LINE_ROLES})),
+      side           TEXT NOT NULL CHECK (side IN ('debit', 'credit')),
+      asset          TEXT NOT NULL,
+      decimals       INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount         TEXT NOT NULL ${positive('amount')},
+      expectation_id TEXT REFERENCES expectations (id),
+      exception_id   TEXT REFERENCES exceptions (id),
+      PRIMARY KEY (entry_id, line_no)
+    );
+    INSERT INTO journal_lines SELECT * FROM saved_journal_lines;
+    DROP TABLE saved_journal_lines;
+    CREATE INDEX journal_lines_account ON journal_lines (tenant_id, account, asset);
+    ${appendOnly('journal_lines')}
+  `,
+  `
+    CREATE TABLE account_openings (
+      id            TEXT PRIMARY KEY,
+      tenant_id     TEXT NOT NULL,
+      network       TEXT NOT NULL,
+      account       TEXT NOT NULL,
+      ledger        INTEGER NOT NULL CHECK (ledger >= 1),
+      occurred_at   INTEGER NOT NULL,
+      balances_json TEXT NOT NULL,
+      note          TEXT,
+      created_at    INTEGER NOT NULL,
+      UNIQUE (tenant_id, network, account)
+    );
+    CREATE INDEX account_openings_tenant ON account_openings (tenant_id, network, account);
+  `,
+  `
+    ALTER TABLE movements ADD COLUMN entity_id TEXT;
+    CREATE INDEX movements_entity ON movements (tenant_id, entity_id, seq);
+    ALTER TABLE journal_lines ADD COLUMN entity_id TEXT;
+    CREATE INDEX journal_lines_entity ON journal_lines (tenant_id, entity_id, entry_id);
+    CREATE TABLE entities (
+      id          TEXT NOT NULL,
+      tenant_id   TEXT NOT NULL,
+      name        TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, id)
+    );
+    CREATE TABLE account_entities (
+      tenant_id   TEXT NOT NULL,
+      network     TEXT NOT NULL,
+      account     TEXT NOT NULL,
+      entity_id   TEXT NOT NULL,
+      created_at  INTEGER NOT NULL,
+      PRIMARY KEY (tenant_id, network, account)
+    );
+    CREATE INDEX account_entities_entity ON account_entities (tenant_id, entity_id);
+    CREATE TABLE internal_transfer_links (
+      id             TEXT PRIMARY KEY,
+      tenant_id      TEXT NOT NULL,
+      network        TEXT NOT NULL,
+      tx_hash        TEXT NOT NULL,
+      movement_a     TEXT NOT NULL REFERENCES movements (id),
+      movement_b     TEXT NOT NULL REFERENCES movements (id),
+      same_entity    INTEGER NOT NULL CHECK (same_entity IN (0, 1)),
+      created_at     INTEGER NOT NULL,
+      CHECK (movement_a <> movement_b),
+      UNIQUE (tenant_id, network, tx_hash, movement_a, movement_b)
+    );
+    CREATE TRIGGER internal_transfer_movement_a_unique
+      BEFORE INSERT ON internal_transfer_links
+      WHEN EXISTS (
+        SELECT 1 FROM internal_transfer_links
+        WHERE tenant_id = NEW.tenant_id
+          AND (movement_a IN (NEW.movement_a, NEW.movement_b)
+            OR movement_b IN (NEW.movement_a, NEW.movement_b))
+      )
+      BEGIN SELECT RAISE(ABORT, 'a movement is already part of another internal transfer'); END;
   `,
   `
     CREATE TABLE api_keys (

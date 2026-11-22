@@ -42,6 +42,29 @@ const LINE_ROLES = list([
 ])
 const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
 const MANUAL_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual'])
+const CURRENT_LINE_ROLES = list([
+  'cash',
+  'issued',
+  'receivable',
+  'payable',
+  'unapplied',
+  'customer_credit',
+  'unexplained',
+  'network_fees',
+  'uncategorized_income',
+  'uncategorized_expense',
+  'conversion',
+  'refund_clearing',
+  'deposit_clearing',
+  'redemption_payable',
+  'clawback',
+  'due_to',
+  'due_from',
+  'in_transit',
+  'opening_balance',
+  'other',
+])
+const CURRENT_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual', 'opening'])
 const EVENT_TYPES = list([
   'movement.decided',
   'expectation.partially_paid',
@@ -506,6 +529,81 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
     CREATE UNIQUE INDEX IF NOT EXISTS expectations_fingerprint
       ON ${s}.expectations (tenant_id, account, asset, fingerprint_suffix)
       WHERE status = 'open' AND fingerprint_suffix IS NOT NULL;
+  `,
+  (s) => `
+    ALTER TABLE ${s}.journal_entries DROP CONSTRAINT journal_entries_kind_check;
+    ALTER TABLE ${s}.journal_entries ADD CONSTRAINT journal_entries_kind_check CHECK (kind IN (${CURRENT_ENTRY_KINDS}));
+    ALTER TABLE ${s}.journal_lines DROP CONSTRAINT journal_lines_role_check;
+    ALTER TABLE ${s}.journal_lines ADD CONSTRAINT journal_lines_role_check CHECK (role IN (${CURRENT_LINE_ROLES}));
+  `,
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.account_openings (
+      id            text PRIMARY KEY,
+      tenant_id     text NOT NULL,
+      network       text NOT NULL,
+      account       text NOT NULL,
+      ledger        bigint NOT NULL CHECK (ledger >= 1),
+      occurred_at   timestamptz NOT NULL,
+      balances_json text NOT NULL,
+      note          text,
+      created_at    timestamptz NOT NULL,
+      UNIQUE (tenant_id, network, account)
+    );
+    CREATE INDEX IF NOT EXISTS account_openings_tenant ON ${s}.account_openings (tenant_id, network, account);
+  `,
+  (s) => `
+    ALTER TABLE ${s}.movements ADD COLUMN IF NOT EXISTS entity_id text;
+    CREATE INDEX IF NOT EXISTS movements_entity ON ${s}.movements (tenant_id, entity_id, seq);
+    ALTER TABLE ${s}.journal_lines ADD COLUMN IF NOT EXISTS entity_id text;
+    CREATE INDEX IF NOT EXISTS journal_lines_entity ON ${s}.journal_lines (tenant_id, entity_id, entry_id);
+
+    CREATE TABLE IF NOT EXISTS ${s}.entities (
+      id          text NOT NULL,
+      tenant_id   text NOT NULL,
+      name        text NOT NULL,
+      created_at  timestamptz NOT NULL,
+      PRIMARY KEY (tenant_id, id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ${s}.account_entities (
+      tenant_id   text NOT NULL,
+      network     text NOT NULL,
+      account     text NOT NULL,
+      entity_id   text NOT NULL,
+      created_at  timestamptz NOT NULL,
+      PRIMARY KEY (tenant_id, network, account)
+    );
+    CREATE INDEX IF NOT EXISTS account_entities_entity ON ${s}.account_entities (tenant_id, entity_id);
+
+    CREATE TABLE IF NOT EXISTS ${s}.internal_transfer_links (
+      id             text PRIMARY KEY,
+      tenant_id      text NOT NULL,
+      network        text NOT NULL,
+      tx_hash        text NOT NULL,
+      movement_a     text NOT NULL REFERENCES ${s}.movements (id),
+      movement_b     text NOT NULL REFERENCES ${s}.movements (id),
+      same_entity    boolean NOT NULL,
+      created_at     timestamptz NOT NULL,
+      CHECK (movement_a <> movement_b),
+      UNIQUE (tenant_id, network, tx_hash, movement_a, movement_b)
+    );
+    CREATE OR REPLACE FUNCTION ${s}.internal_transfer_unique_movement() RETURNS trigger AS $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM ${s}.internal_transfer_links
+        WHERE tenant_id = NEW.tenant_id
+          AND (movement_a IN (NEW.movement_a, NEW.movement_b)
+            OR movement_b IN (NEW.movement_a, NEW.movement_b))
+      ) THEN
+        RAISE EXCEPTION 'a movement is already part of another internal transfer';
+      END IF;
+      RETURN NEW;
+    END;
+    $$ LANGUAGE plpgsql;
+    DROP TRIGGER IF EXISTS internal_transfer_unique_movement ON ${s}.internal_transfer_links;
+    CREATE TRIGGER internal_transfer_unique_movement
+      BEFORE INSERT ON ${s}.internal_transfer_links
+      FOR EACH ROW EXECUTE FUNCTION ${s}.internal_transfer_unique_movement();
   `,
   // 15: API keys, watched accounts and sync state. Keys hold only a SHA-256
   // digest; scopes are a JSON array the server interprets.

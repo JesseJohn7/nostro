@@ -37,10 +37,11 @@ ledger must add up to it, however much happens afterwards.
 1. Read the snapshot: balances and their ledgers, and the `Latest-Ledger` of the response.
 2. Catch every movement source up (`sync()` until caught up). The snapshot comes first, so every
    movement through its ledgers has had the chance to be recorded.
-3. Compare per asset. An asset with recorded movements but no balance line must sum to zero as of
-   the snapshot's ledger. An asset the account issues has no balance line to compare with and is
-   reported as `issuer`, not attested. Liquidity pool shares are skipped; nostro does not record
-   them as movements.
+3. Compare per asset, starting from the account's opening balances when it has them and excluding
+   movements through the opening ledger. An asset with recorded movements but no balance line must
+   sum to zero as of the snapshot's ledger. An asset the account issues has no balance line to
+   compare with and is reported as `issuer`, not attested. Liquidity pool shares are skipped by
+   attestation; `nostro open` refuses them rather than dropping them.
 4. On a mismatch, wait about a ledger and repeat steps 2–3 against the same snapshot, a bounded
    number of times. Only a mismatch that survives is reported.
 
@@ -53,5 +54,5 @@ ledger must add up to it, however much happens afterwards.
 - Attesting ingests: whoever asks for it gets the same writes `sync()` makes. `doctor()` writes
   nothing unless asked to attest.
 - Issuer accounts are not covered. Attesting them needs the asset's supply, not a balance line.
-- Like everything about ingest from the start of history, this only holds for an account whose whole
-  history Horizon still retains (ADR 0006).
+- An account opened from a current snapshot attests from that ledger onward; its pre-nostro history
+  is represented by the opening entry, not by replayed movements (ADR 0006).

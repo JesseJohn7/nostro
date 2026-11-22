@@ -92,6 +92,7 @@ export interface AgingReport {
 export interface AgingReportOptions {
   readonly store: Store
   readonly tenantId: string
+  readonly entityId?: string
   readonly asOf?: Date
   readonly buckets?: readonly number[]
 }
@@ -111,8 +112,11 @@ export function bucketNameForDays(days: number, buckets: readonly number[]): str
 }
 
 export async function agingReport(options: AgingReportOptions): Promise<AgingReport> {
-  const { store, tenantId } = options
+  const { store, tenantId, entityId } = options
   const asOf = options.asOf ?? new Date()
+  const entityAccounts = entityId === undefined
+    ? null
+    : new Set((await store.listAccountEntities({ tenantId, entityId })).map((assignment) => assignment.account))
   const buckets = [...(options.buckets ?? DEFAULT_AGING_BUCKETS)].sort((a, b) => a - b)
 
   const PAGE = 500
@@ -127,6 +131,7 @@ export async function agingReport(options: AgingReportOptions): Promise<AgingRep
       ...(afterSeqExp !== undefined ? { afterSeq: afterSeqExp } : {}),
     })
     for (const e of page) {
+      if (entityAccounts !== null && !entityAccounts.has(e.account)) continue
       if (e.createdAt <= asOf) expectations.push(e)
     }
     if (page.length < PAGE) break
@@ -195,6 +200,7 @@ export async function agingReport(options: AgingReportOptions): Promise<AgingRep
   for (;;) {
     const page: JournalEntry[] = await store.listJournalEntries({
       tenantId,
+      ...(entityId === undefined ? {} : { entityId }),
       limit: PAGE,
       effectiveBefore: new Date(asOf.getTime() + 1),
       ...(afterSeqJrn !== undefined ? { afterSeq: afterSeqJrn } : {}),
@@ -222,6 +228,7 @@ export async function agingReport(options: AgingReportOptions): Promise<AgingRep
   for (const entry of entries) {
     if (entry.movementId === null) continue
     for (const line of entry.lines) {
+      if (entityId !== undefined && line.entityId !== entityId) continue
       if (!UNEXPLAINED_ROLES.has(line.role)) continue
       const role = line.role as UnexplainedRole
       const key = `${entry.movementId}:${role}:${line.amount.asset}`

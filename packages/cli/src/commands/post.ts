@@ -21,7 +21,7 @@ ${COMMON_HELP}`,
   async run(args, io) {
     positionals(args, 0)
     const tenantId = tenant(args, io)
-    const posted: Record<JournalEntryKind, number> = { initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0 }
+    const posted: Record<JournalEntryKind, number> = { initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0, opening: 0 }
     const errors = new Map<string, string>()
     let examined = 0
     await withStore(args, io, async (store) => {

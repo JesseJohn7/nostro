@@ -8,7 +8,7 @@
  * that lag a decision, and rows changed outside nostro (SQLite cannot check
  * an entry's balance itself).
  */
-import type { Allocation, ExceptionRecord, JournalEntry, Movement } from '../model/index.js'
+import type { Allocation, ExceptionRecord, InternalTransferLink, JournalEntry, Movement } from '../model/index.js'
 import { planPosting } from '../journal/index.js'
 import type { RefundLink, ConstraintName } from '../store/index.js'
 import { refundCoverage, ConstraintError, checkDisposition, checkJournalEntry, sumAmounts } from '../store/index.js'
@@ -21,6 +21,7 @@ export interface MovementRecords {
   readonly exceptions: readonly ExceptionRecord[]
   readonly entries: readonly JournalEntry[]
   readonly refunds?: readonly RefundLink[]
+  readonly transfers?: readonly InternalTransferLink[]
 }
 
 const JOURNAL_CODES: Partial<Record<ConstraintName, FindingCode>> = {
@@ -30,7 +31,7 @@ const JOURNAL_CODES: Partial<Record<ConstraintName, FindingCode>> = {
   journal_cash_mismatch: 'journal_cash_mismatch',
 }
 
-export function checkMovement({ movement, allocations, exceptions, entries, refunds = [] }: MovementRecords): Finding[] {
+export function checkMovement({ movement, allocations, exceptions, entries, refunds = [], transfers = [] }: MovementRecords): Finding[] {
   const findings: Finding[] = []
   const add = (invariant: Invariant, severity: Severity, code: FindingCode, detail: string, entryId: string | null = null) =>
     findings.push({
@@ -85,7 +86,7 @@ export function checkMovement({ movement, allocations, exceptions, entries, refu
   }
   if (findings.length > 0) return findings
 
-  if (planPosting(movement, allocations, exceptions, entries, {refunds}) !== null) {
+  if (planPosting(movement, allocations, exceptions, entries, { refunds, transfers }) !== null) {
     add(
       'I3',
       'warning',

@@ -52,11 +52,17 @@ import { resolveKind } from './chart.js'
 const PAGE = 500
 
 /** Scan every journal entry for a tenant, paged. */
-async function* scanEntries(store: Store, tenantId: string, effectiveBefore?: Date): AsyncGenerator<JournalEntry> {
+async function* scanEntries(
+  store: Store,
+  tenantId: string,
+  effectiveBefore?: Date,
+  entityId?: string,
+): AsyncGenerator<JournalEntry> {
   let afterSeq: number | undefined
   for (;;) {
     const page = await store.listJournalEntries({
       tenantId,
+      ...(entityId === undefined ? {} : { entityId }),
       limit: PAGE,
       ...(afterSeq !== undefined ? { afterSeq } : {}),
       ...(effectiveBefore !== undefined ? { effectiveBefore } : {}),
@@ -69,6 +75,9 @@ async function* scanEntries(store: Store, tenantId: string, effectiveBefore?: Da
 
 /** Signed raw unit balance of a line: debit = positive, credit = negative. */
 const signedRaw = (side: 'debit' | 'credit', raw: bigint): bigint => (side === 'debit' ? raw : -raw)
+
+const linesFor = (entry: JournalEntry, entityId?: string) =>
+  entityId === undefined ? entry.lines : entry.lines.filter((line) => line.entityId === entityId)
 
 // ---------------------------------------------------------------------------
 // Trial balance (issue #56)
@@ -102,6 +111,7 @@ export interface TrialBalanceReport {
 export interface TrialBalanceOptions {
   readonly store: Store
   readonly tenantId: string
+  readonly entityId?: string
   /**
    * Balance as of this instant (exclusive upper bound on effectiveAt).
    * Omit for a balance that includes everything posted so far.
@@ -110,14 +120,14 @@ export interface TrialBalanceOptions {
 }
 
 export async function trialBalance(options: TrialBalanceOptions): Promise<TrialBalanceReport> {
-  const { store, tenantId, asOf } = options
+  const { store, tenantId, asOf, entityId } = options
 
   // key: `account\0asset/decimals`
   interface Slot { totalDebits: bigint; totalCredits: bigint; account: string; asset: string; decimals: number }
   const slots = new Map<string, Slot>()
 
-  for await (const entry of scanEntries(store, tenantId, asOf)) {
-    for (const line of entry.lines) {
+  for await (const entry of scanEntries(store, tenantId, asOf, entityId)) {
+    for (const line of linesFor(entry, entityId)) {
       const key = `${line.account}\0${line.amount.asset}/${line.amount.decimals}`
       let slot = slots.get(key)
       if (slot === undefined) {
@@ -181,6 +191,7 @@ export interface AccountLedgerReport {
 export interface AccountLedgerOptions {
   readonly store: Store
   readonly tenantId: string
+  readonly entityId?: string
   readonly account: string
   /** The full asset id to report on (e.g. "native" or "USDC:GA5Z…"). */
   readonly asset: string
@@ -191,13 +202,13 @@ export interface AccountLedgerOptions {
 }
 
 export async function accountLedger(options: AccountLedgerOptions): Promise<AccountLedgerReport> {
-  const { store, tenantId, account, asset } = options
+  const { store, tenantId, entityId, account, asset } = options
 
   // --- Opening balance: sum everything before `from` ---
   let openingBalance = 0n
   if (options.from !== undefined) {
-    for await (const entry of scanEntries(store, tenantId, options.from)) {
-      for (const line of entry.lines) {
+    for await (const entry of scanEntries(store, tenantId, options.from, entityId)) {
+      for (const line of linesFor(entry, entityId)) {
         if (line.account !== account || line.amount.asset !== asset) continue
         openingBalance += signedRaw(line.side, line.amount.raw)
       }
@@ -208,9 +219,9 @@ export async function accountLedger(options: AccountLedgerOptions): Promise<Acco
   const ledgerLines: LedgerEntryLine[] = []
   let runningBalance = openingBalance
 
-  for await (const entry of scanEntries(store, tenantId, options.to)) {
+  for await (const entry of scanEntries(store, tenantId, options.to, entityId)) {
     if (options.from !== undefined && entry.effectiveAt.getTime() < options.from.getTime()) continue
-    for (const line of entry.lines) {
+    for (const line of linesFor(entry, entityId)) {
       if (line.account !== account || line.amount.asset !== asset) continue
       runningBalance += signedRaw(line.side, line.amount.raw)
       ledgerLines.push({
@@ -261,6 +272,7 @@ export interface BalanceSheetReport {
 export interface BalanceSheetOptions {
   readonly store: Store
   readonly tenantId: string
+  readonly entityId?: string
   /** Balance as of this instant. Omit for all-time. */
   readonly asOf?: Date
   /**
@@ -273,7 +285,12 @@ export interface BalanceSheetOptions {
 
 export async function balanceSheet(options: BalanceSheetOptions): Promise<BalanceSheetReport> {
   const { store, tenantId, kindMap = {} } = options
-  const tb = await trialBalance({ store, tenantId, ...(options.asOf === undefined ? {} : { asOf: options.asOf }) })
+  const tb = await trialBalance({
+    store,
+    tenantId,
+    ...(options.entityId === undefined ? {} : { entityId: options.entityId }),
+    ...(options.asOf === undefined ? {} : { asOf: options.asOf }),
+  })
 
   // Group by kind
   interface AccountAssetBalance { account: string; asset: string; balance: bigint; decimals: number }
@@ -380,6 +397,7 @@ export interface IncomeStatementReport {
 export interface IncomeStatementOptions {
   readonly store: Store
   readonly tenantId: string
+  readonly entityId?: string
   /** Start of period (inclusive). */
   readonly from?: Date
   /** End of period (exclusive). */
@@ -389,13 +407,23 @@ export interface IncomeStatementOptions {
 
 export async function incomeStatement(options: IncomeStatementOptions): Promise<IncomeStatementReport> {
   const { store, tenantId, kindMap = {} } = options
-  const tb = await trialBalance({ store, tenantId, ...(options.to === undefined ? {} : { asOf: options.to }) })
+  const tb = await trialBalance({
+    store,
+    tenantId,
+    ...(options.entityId === undefined ? {} : { entityId: options.entityId }),
+    ...(options.to === undefined ? {} : { asOf: options.to }),
+  })
 
   // For income accounts we also need to subtract anything before `from` to get
   // just the period. We do this by computing a "before" trial balance and diffing.
   let tbBefore: TrialBalanceReport | null = null
   if (options.from !== undefined) {
-    tbBefore = await trialBalance({ store, tenantId, asOf: options.from })
+    tbBefore = await trialBalance({
+      store,
+      tenantId,
+      ...(options.entityId === undefined ? {} : { entityId: options.entityId }),
+      asOf: options.from,
+    })
   }
 
   const beforeMap = new Map<string, bigint>()
