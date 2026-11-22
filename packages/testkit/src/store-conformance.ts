@@ -196,6 +196,92 @@ export function describeStoreConformance(name: string, makeStore: () => Store | 
       })
     })
 
+    describe('API keys', () => {
+      const digestOf = (n: number) => n.toString(16).padStart(64, '0')
+      const newKey = (id: string, over: { tenantId?: string; digest?: string; scopes?: string[]; createdAt?: Date } = {}) => ({
+        id,
+        tenantId: over.tenantId ?? T,
+        label: `label ${id}`,
+        digest: over.digest ?? digestOf(id.length + id.charCodeAt(0)),
+        scopes: over.scopes ?? ['read'],
+        createdAt: over.createdAt ?? new Date('2026-01-01T00:00:00Z'),
+      })
+
+      it('stores a key by its digest, with no revocation or use yet', async () => {
+        const row = await store.transaction((tx) => tx.insertApiKey(newKey('k1', { digest: digestOf(1), scopes: ['read', 'events'] })))
+        expect(row).toMatchObject({ id: 'k1', tenantId: T, label: 'label k1', scopes: ['read', 'events'], revokedAt: null, lastUsedAt: null })
+        expect((await store.findApiKeyByDigest(digestOf(1)))?.id).toBe('k1')
+        expect(await store.findApiKeyByDigest(digestOf(2))).toBeNull()
+      })
+
+      it('refuses a second key with the same digest', async () => {
+        await store.transaction((tx) => tx.insertApiKey(newKey('k1', { digest: digestOf(3) })))
+        await expect(store.transaction((tx) => tx.insertApiKey(newKey('k2', { digest: digestOf(3) })))).rejects.toMatchObject(
+          constraint('api_key_digest_unique'),
+        )
+      })
+
+      it('lists keys oldest first, optionally for one tenant, and never a plain key', async () => {
+        await store.transaction(async (tx) => {
+          await tx.insertApiKey(newKey('late', { createdAt: new Date('2026-02-01T00:00:00Z') }))
+          await tx.insertApiKey(newKey('early', { createdAt: new Date('2026-01-01T00:00:00Z') }))
+          await tx.insertApiKey(newKey('other', { tenantId: T2, createdAt: new Date('2026-01-15T00:00:00Z') }))
+        })
+        expect((await store.listApiKeys()).map((k) => k.id)).toEqual(['early', 'other', 'late'])
+        expect((await store.listApiKeys(T)).map((k) => k.id)).toEqual(['early', 'late'])
+      })
+
+      it('revokes a key once, keeping the first revocation time, and refuses an unknown id', async () => {
+        await store.transaction((tx) => tx.insertApiKey(newKey('k1', { digest: digestOf(4) })))
+        const first = new Date('2026-03-01T00:00:00Z')
+        const revoked = await store.transaction((tx) => tx.revokeApiKey('k1', first))
+        expect(revoked.revokedAt?.getTime()).toBe(first.getTime())
+        const again = await store.transaction((tx) => tx.revokeApiKey('k1', new Date('2026-04-01T00:00:00Z')))
+        expect(again.revokedAt?.getTime()).toBe(first.getTime())
+        await expect(store.transaction((tx) => tx.revokeApiKey('nope', first))).rejects.toMatchObject({ code: 'NOT_FOUND' })
+      })
+
+      it('keeps the latest use per key, and ignores ids it does not hold', async () => {
+        await store.transaction((tx) => tx.insertApiKey(newKey('k1', { digest: digestOf(5) })))
+        await store.transaction((tx) =>
+          tx.recordApiKeyUse([
+            { id: 'k1', at: new Date('2026-05-02T00:00:00Z') },
+            { id: 'k1', at: new Date('2026-05-01T00:00:00Z') },
+            { id: 'ghost', at: new Date('2026-05-03T00:00:00Z') },
+          ]),
+        )
+        expect((await store.findApiKeyByDigest(digestOf(5)))?.lastUsedAt?.toISOString()).toBe('2026-05-02T00:00:00.000Z')
+      })
+    })
+
+    describe('watched accounts and sync state', () => {
+      it('adds an account once, keeps its first row, and removes it', async () => {
+        const first = new Date('2026-01-01T00:00:00Z')
+        await store.transaction((tx) => tx.addWatchedAccount({ tenantId: T, account: ACCOUNT, source: 'api', addedAt: first }))
+        const again = await store.transaction((tx) =>
+          tx.addWatchedAccount({ tenantId: T, account: ACCOUNT, source: 'config', addedAt: new Date('2026-06-01T00:00:00Z') }),
+        )
+        expect(again).toMatchObject({ source: 'api', addedAt: first })
+        expect(await store.listWatchedAccounts(T)).toEqual([{ tenantId: T, account: ACCOUNT, source: 'api', addedAt: first }])
+        expect(await store.listWatchedAccounts(T2)).toEqual([])
+        expect(await store.transaction((tx) => tx.removeWatchedAccount(T, ACCOUNT))).toBe(true)
+        expect(await store.transaction((tx) => tx.removeWatchedAccount(T, ACCOUNT))).toBe(false)
+        expect(await store.listWatchedAccounts(T)).toEqual([])
+      })
+
+      it('replaces sync state per (tenant, network, source, account), and lists one tenant\'s', async () => {
+        const at = new Date('2026-01-01T00:00:00Z')
+        const base = { tenantId: T, network: 'testnet', source: 'horizon', account: ACCOUNT, cursor: '10-1', lastAttemptAt: at, lastSuccessAt: at, caughtUp: true, lastError: null, lastErrorAt: null }
+        await store.transaction((tx) => tx.recordSyncState(base))
+        await store.transaction((tx) => tx.recordSyncState({ ...base, cursor: '11-1', caughtUp: false, lastError: 'boom', lastErrorAt: at }))
+        await store.transaction((tx) => tx.recordSyncState({ ...base, tenantId: T2, cursor: null }))
+        const mine = await store.listSyncState(T)
+        expect(mine).toHaveLength(1)
+        expect(mine[0]).toMatchObject({ cursor: '11-1', caughtUp: false, lastError: 'boom' })
+        expect(await store.listSyncState(T2)).toHaveLength(1)
+      })
+    })
+
     describe('transactions and cursors', () => {
       it('advances the cursor atomically with the movements it covers', async () => {
         await expect(

@@ -3,7 +3,8 @@
  * server validates requests with. Served at `GET /v1/openapi.json`.
  */
 import { readFileSync } from 'node:fs'
-import { components, expectationBody, postJournalBody, query, ref, replayBody, resolveBody } from './schemas.js'
+import { accountParams, components, expectationBody, postJournalBody, query, ref, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
+import { ROUTE_SCOPES } from './scopes.js'
 
 /** This package's version, which is the API's. */
 const VERSION = (JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')) as { version: string }).version
@@ -21,6 +22,7 @@ const ok = (schemaName: string, description = 'OK') => ({
 const errors = {
   '400': problem('The request was malformed: an unknown or invalid parameter or field (`invalid_request`).'),
   '401': problem('No valid API key (`unauthorized`).'),
+  '403': problem('The API key lacks the scope this operation needs (`forbidden`).'),
   '500': problem('Something failed inside the server (`internal`); the detail says nothing more.'),
 }
 
@@ -32,8 +34,24 @@ function parameters(schema: { properties: Record<string, object> }) {
 const idParam = (what: string) => ({ name: 'id', in: 'path', required: true, schema: { type: 'string' }, description: `The ${what}'s id.` })
 const consumerParam = { name: 'consumer', in: 'path', required: true, schema: { type: 'string' }, description: 'The webhook consumer name.' }
 
+/**
+ * Each operation lists the scope it needs under the bearer scheme (OpenAPI 3.1
+ * allows role names on a non-OAuth security requirement). Taken from the same
+ * table the server enforces, so the document cannot drift from it.
+ */
+function withScopes<T extends { paths: Record<string, Record<string, object>> }>(doc: T): T {
+  for (const [path, methods] of Object.entries(doc.paths)) {
+    for (const [method, op] of Object.entries(methods)) {
+      const scope = ROUTE_SCOPES[`${method.toUpperCase()} ${path.replace(/\{(\w+)\}/g, ':$1')}`]
+      if (scope === undefined) continue
+      ;(op as { security?: unknown }).security = [{ apiKey: [scope] }]
+    }
+  }
+  return doc
+}
+
 export function buildOpenApi() {
-  return {
+  const doc = {
     openapi: '3.1.0',
     info: {
       title: 'nostro',
@@ -65,6 +83,43 @@ export function buildOpenApi() {
           summary: 'This document',
           security: [],
           responses: { '200': { description: 'OK', content: { 'application/json': { schema: { type: 'object' } } } } },
+        },
+      },
+      '/v1/accounts': {
+        get: {
+          operationId: 'listAccounts',
+          summary: 'Watched accounts, each with its sync state per network and source',
+          responses: { '200': ok('WatchedAccountList'), ...errors },
+        },
+        post: {
+          operationId: 'watchAccount',
+          summary: 'Start watching a G... account; idempotent',
+          requestBody: { required: true, content: { 'application/json': { schema: ref('AccountBody') } } },
+          responses: {
+            '200': ok('WatchedAccount', 'Already watched'),
+            '201': {
+              description: 'Now watched; sync starts on the next round',
+              headers: { location: { schema: { type: 'string' } } },
+              content: { 'application/json': { schema: ref('WatchedAccount') } },
+            },
+            ...errors,
+          },
+        },
+      },
+      '/v1/accounts/{account}': {
+        delete: {
+          operationId: 'unwatchAccount',
+          summary: 'Stop syncing an account. Its movements, expectations and cursor are kept.',
+          parameters: [
+            { name: 'account', in: 'path', required: true, schema: accountParams.properties.account, description: 'The G... account.' },
+            ...parameters(removeAccountQuery as unknown as { properties: Record<string, object> }),
+          ],
+          responses: {
+            '204': { description: 'No longer watched' },
+            '404': problem('The account is not on the watch list (`not_found`).'),
+            '409': problem('The account comes from the service configuration (`config_managed`), or has open expectations and `force` was not set (`has_open_expectations`).'),
+            ...errors,
+          },
         },
       },
       '/v1/movements': {
@@ -469,4 +524,5 @@ export function buildOpenApi() {
       },
     },
   }
+  return withScopes(doc)
 }

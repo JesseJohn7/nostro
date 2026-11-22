@@ -148,14 +148,25 @@ export interface Network {
 }
 
 export function network(args: Args, io: Io): Network {
-  const name = string(args, "network") ?? io.env.NOSTRO_NETWORK ?? "testnet";
+  return networkNamed(
+    string(args, "network") ?? io.env.NOSTRO_NETWORK ?? "testnet",
+    string(args, "horizon") ?? io.env.NOSTRO_HORIZON_URL,
+    io,
+  );
+}
+
+/** A network by name, with its Horizon: the given one, else the name's public default. */
+export function networkNamed(
+  name: string,
+  horizonOverride: string | undefined,
+  io: Io,
+): Network {
   if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) {
     throw new UsageError(
       `--network must be a lowercase label such as testnet or public, not ${JSON.stringify(name)}.`,
     );
   }
-  const horizon =
-    string(args, "horizon") ?? io.env.NOSTRO_HORIZON_URL ?? HORIZON[name];
+  const horizon = horizonOverride ?? HORIZON[name];
   if (horizon === undefined) {
     throw new UsageError(
       `Network ${name} has no default Horizon; pass --horizon <url>.`,

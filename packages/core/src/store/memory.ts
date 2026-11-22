@@ -76,6 +76,7 @@ import { Money } from '../money/index.js'
 import { refundParts, refundCoverage } from './refunds.js'
 import { postAccrual } from './accrual.js'
 import { ConstraintError, NotFoundError, TransactionClosedError } from './store.js'
+import type { ApiKeyRow, NewApiKeyRow, SyncStateRow, WatchedAccountRow } from './store.js'
 import { EventHistoryPrunedError, eventCursorKey } from './events.js'
 import type { EventQuery, NewOutboxEvent, OutboxEvent, PruneEventsResult } from './events.js'
 import type {
@@ -110,6 +111,12 @@ interface State {
   readonly allocations: Map<string, Allocation>
   readonly exceptions: Map<string, ExceptionRecord>
   readonly cursors: Map<string, string>
+  /** Keyed by id. The digest index is checked by scanning, which is fine at a tenant's key count. */
+  readonly apiKeys: Map<string, ApiKeyRow>
+  /** (tenant, account) → the watched account. */
+  readonly watched: Map<string, WatchedAccountRow>
+  /** (tenant, network, source, account) → sync state. */
+  readonly syncState: Map<string, SyncStateRow>
   journalSeq: number
   readonly journal: Map<string, JournalEntry>
   eventSeq: number
@@ -144,6 +151,9 @@ function emptyState(): State {
     allocations: new Map(),
     exceptions: new Map(),
     cursors: new Map(),
+    apiKeys: new Map(),
+    watched: new Map(),
+    syncState: new Map(),
     journalSeq: 0,
     journal: new Map(),
     journalByMovement: new Map(),
@@ -172,6 +182,9 @@ function cloneState(s: State): State {
     allocations: new Map(s.allocations),
     exceptions: new Map(s.exceptions),
     cursors: new Map(s.cursors),
+    apiKeys: new Map(s.apiKeys),
+    watched: new Map(s.watched),
+    syncState: new Map(s.syncState),
     journalSeq: s.journalSeq,
     journal: new Map(s.journal),
     journalByMovement: new Map(s.journalByMovement),
@@ -436,6 +449,33 @@ abstract class MemoryReader implements StoreReader {
     return this.snapshot().cursors.get(cursorKey(k)) ?? null
   }
 
+  async findApiKeyByDigest(digest: string): Promise<ApiKeyRow | null> {
+    this.check()
+    for (const row of this.snapshot().apiKeys.values()) if (row.digest === digest) return row
+    return null
+  }
+
+  async listApiKeys(tenantId?: string): Promise<ApiKeyRow[]> {
+    this.check()
+    return [...this.snapshot().apiKeys.values()]
+      .filter((row) => tenantId === undefined || row.tenantId === tenantId)
+      .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || (a.id < b.id ? -1 : 1))
+  }
+
+  async listWatchedAccounts(tenantId: string): Promise<WatchedAccountRow[]> {
+    this.check()
+    return [...this.snapshot().watched.values()]
+      .filter((row) => row.tenantId === tenantId)
+      .sort((a, b) => a.addedAt.getTime() - b.addedAt.getTime() || (a.account < b.account ? -1 : 1))
+  }
+
+  async listSyncState(tenantId: string): Promise<SyncStateRow[]> {
+    this.check()
+    return [...this.snapshot().syncState.values()]
+      .filter((row) => row.tenantId === tenantId)
+      .sort((a, b) => (a.account < b.account ? -1 : a.account > b.account ? 1 : a.source < b.source ? -1 : a.source > b.source ? 1 : a.network < b.network ? -1 : 1))
+  }
+
   async getJournalPeriod(tenantId: string): Promise<JournalPeriod | null> {
     this.check()
     const actions = this.snapshot().periodActions
@@ -629,6 +669,73 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.check()
     checkCursorValue(value)
     this.draft.cursors.set(cursorKey(k), value)
+  }
+
+  async insertApiKey(input: NewApiKeyRow): Promise<ApiKeyRow> {
+    this.check()
+    for (const row of this.draft.apiKeys.values()) {
+      if (row.digest === input.digest) throw new ConstraintError('api_key_digest_unique', 'that key is already stored')
+    }
+    const row: ApiKeyRow = Object.freeze({
+      id: input.id,
+      tenantId: input.tenantId,
+      label: input.label,
+      digest: input.digest,
+      scopes: Object.freeze([...input.scopes]),
+      createdAt: copyDate(input.createdAt),
+      revokedAt: null,
+      lastUsedAt: null,
+    })
+    this.draft.apiKeys.set(row.id, row)
+    return row
+  }
+
+  async revokeApiKey(id: string, at: Date): Promise<ApiKeyRow> {
+    this.check()
+    const row = this.draft.apiKeys.get(id)
+    if (row === undefined) throw new NotFoundError('api_key', id)
+    if (row.revokedAt !== null) return row
+    const next: ApiKeyRow = Object.freeze({ ...row, revokedAt: copyDate(at) })
+    this.draft.apiKeys.set(id, next)
+    return next
+  }
+
+  async recordApiKeyUse(uses: readonly { readonly id: string; readonly at: Date }[]): Promise<void> {
+    this.check()
+    for (const { id, at } of uses) {
+      const row = this.draft.apiKeys.get(id)
+      if (row === undefined) continue
+      if (row.lastUsedAt !== null && row.lastUsedAt.getTime() >= at.getTime()) continue
+      this.draft.apiKeys.set(id, Object.freeze({ ...row, lastUsedAt: copyDate(at) }))
+    }
+  }
+
+  async addWatchedAccount(row: WatchedAccountRow): Promise<WatchedAccountRow> {
+    this.check()
+    const k = key(row.tenantId, row.account)
+    const existing = this.draft.watched.get(k)
+    if (existing !== undefined) return existing
+    const stored: WatchedAccountRow = Object.freeze({ ...row, addedAt: copyDate(row.addedAt) })
+    this.draft.watched.set(k, stored)
+    return stored
+  }
+
+  async removeWatchedAccount(tenantId: string, account: string): Promise<boolean> {
+    this.check()
+    return this.draft.watched.delete(key(tenantId, account))
+  }
+
+  async recordSyncState(state: SyncStateRow): Promise<void> {
+    this.check()
+    this.draft.syncState.set(
+      key(state.tenantId, state.network, state.source, state.account),
+      Object.freeze({
+        ...state,
+        lastAttemptAt: copyDate(state.lastAttemptAt),
+        lastSuccessAt: state.lastSuccessAt === null ? null : copyDate(state.lastSuccessAt),
+        lastErrorAt: state.lastErrorAt === null ? null : copyDate(state.lastErrorAt),
+      }),
+    )
   }
 
   async recordDeliveryAttempt(attempt: NewDeliveryAttempt): Promise<DeliveryAttempt> {

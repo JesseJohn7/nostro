@@ -32,6 +32,31 @@ export interface RunOptions {
 }
 
 /** Run `nostro <argv>` in-process, in `cwd`. */
+/** Start `nostro serve` in-process; returns its output so far, its address, and a way to stop it. */
+/** The key and tenant `startServe` serves by default, as serve.test.ts uses. */
+export const SERVE_KEY = 'k'.repeat(64)
+
+export async function startServe(cwd: string, argv: readonly string[], options: { env?: Record<string, string>; fetch?: typeof fetch } = {}) {
+  const out = { stdout: '', stderr: '' }
+  const stop = new AbortController()
+  const done = main(['serve', '--port', '0', ...argv], {
+    stdout: { write: (s) => ((out.stdout += s), true) },
+    stderr: { write: (s) => ((out.stderr += s), true) },
+    env: options.env ?? { NOSTRO_API_KEYS: `acme:${SERVE_KEY}` },
+    cwd,
+    signal: stop.signal,
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+  })
+  const until = async (check: () => boolean) => {
+    for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 25))
+    if (!check()) throw new Error(`timed out; stdout: ${out.stdout} stderr: ${out.stderr}`)
+  }
+  await until(() => out.stdout.includes('Listening on'))
+  const address = /Listening on (\S+) /.exec(out.stdout)![1]!
+  const get = async (path: string, key = SERVE_KEY) => fetch(`${address}${path}`, { headers: { authorization: `Bearer ${key}` } })
+  return { out, address, get, until, stop: async () => (stop.abort(), done) }
+}
+
 export async function nostro(cwd: string, argv: readonly string[], options: RunOptions = {}): Promise<Run> {
   let stdout = ''
   let stderr = ''
