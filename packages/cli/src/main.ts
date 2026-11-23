@@ -23,6 +23,8 @@ import { post } from './commands/post.js'
 import { pruneEventsCommand } from './commands/prune-events.js'
 import { period } from './commands/period.js'
 import { reconcile } from './commands/reconcile.js'
+import { replay } from './commands/replay.js'
+import { scheduleCommand } from './commands/schedule.js'
 import { report } from './commands/report.js'
 import { resolve } from './commands/resolve.js'
 import { serve } from './commands/serve.js'
@@ -41,6 +43,8 @@ export const COMMANDS: readonly Command[] = [
   cancel,
   amend,
   reconcile,
+  replay,
+  scheduleCommand() as unknown as Command,
   exceptions,
   resolve,
   post,

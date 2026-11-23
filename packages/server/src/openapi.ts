@@ -3,7 +3,7 @@
  * server validates requests with. Served at `GET /v1/openapi.json`.
  */
 import { readFileSync } from 'node:fs'
-import { accountParams, components, expectationBody, postJournalBody, query, ref, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
+import { accountParams, batchResolveBody, components, expectationBody, postJournalBody, query, ref, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
 import { ROUTE_SCOPES } from './scopes.js'
 
 /** This package's version, which is the API's. */
@@ -133,12 +133,58 @@ export function buildOpenApi() {
       '/v1/movements/{id}': {
         get: {
           operationId: 'getMovement',
-          summary: 'One movement, with its allocations, refunds, exceptions and journal entries',
+          summary: 'One movement, with what was allocated, any exceptions, its journal entries, and the recorded decision',
           parameters: [idParam('movement')],
           responses: { '200': ok('MovementDetail'), '404': problem('No such movement in this tenant (`not_found`).'), ...errors },
         },
       },
-      '/v1/expectations': {
+      '/v1/movements/{id}/explain': {
+        get: {
+          operationId: 'explainMovement',
+          summary: "Explain one movement's recorded decision and whether today's engine agrees",
+          parameters: [idParam('movement')],
+          responses: { '200': ok('ExplainDecision'), ...errors },
+        },
+      },
+      '/v1/decisions/replay': {
+        get: {
+          operationId: 'replayDecisions',
+          summary: 'Replay recorded decisions read-only with proposed matching options',
+          parameters: parameters(query.decisionReplay as any),
+          responses: { '200': ok('ReplayReport'), ...errors },
+        },
+      },
+      '/v1/schedules': {
+        get: {
+          operationId: 'listSchedules',
+          summary: 'List schedules',
+          parameters: parameters(query.schedules),
+          responses: { '200': ok('SchedulePage'), ...errors },
+        },
+        post: {
+          operationId: 'createSchedule',
+          summary: 'Create a schedule',
+          requestBody: { required: true, content: { 'application/json': { schema: ref('CreateScheduleRequest') } } },
+          responses: { '201': { ...ok('Schedule', 'Created'), headers: { location: { schema: { type: 'string' } } } }, ...errors },
+        },
+      },
+      '/v1/schedules/{id}': {
+        get: {
+          operationId: 'getSchedule',
+          summary: 'Get one schedule',
+          parameters: [idParam('schedule')],
+          responses: { '200': ok('Schedule'), ...errors },
+        },
+      },
+      '/v1/schedules/{id}/end': {
+        post: {
+          operationId: 'endSchedule',
+          summary: 'End a schedule',
+          parameters: [idParam('schedule')],
+          responses: { '200': ok('Schedule'), ...errors },
+        },
+      },
+  '/v1/expectations': {
         get: {
           operationId: 'listExpectations',
           summary: 'Expectations, in creation order',
@@ -219,6 +265,19 @@ export function buildOpenApi() {
             '404': problem('No such exception in this tenant (`not_found`).'),
             '409': problem('The rules refuse it: a lookalike asset, too much, a movement already decided (`resolution_refused`).'),
             '422': problem('It cannot be carried out as asked: an unknown reference, or more decimals than the asset has (`invalid_resolution`).'),
+            ...errors,
+          },
+        },
+      },
+      '/v1/exceptions/resolve': {
+        post: {
+          operationId: 'resolveExceptions',
+          summary: 'Decide many exceptions in one call',
+          requestBody: { required: true, content: { 'application/json': { schema: batchResolveBody } } },
+          responses: {
+            '200': ok('BatchResolution'),
+            '207': ok('BatchResolution', 'Partial success in row mode'),
+            '422': problem('The batch is not valid (`invalid_resolution`).'),
             ...errors,
           },
         },
@@ -402,6 +461,9 @@ export function buildOpenApi() {
         apiKey: { type: 'http', scheme: 'bearer', description: 'An API key; it decides the tenant.' },
       },
       schemas: {
+    Schedule: { type: 'object', additionalProperties: false, required: ['id','referencePattern','account','direction','amount','asset','memo','payers','cadence','startAt','endAt','endedAt','createdAt','updatedAt'], properties: { id: { type: 'string' }, referencePattern: { type: 'string' }, account: { type: 'string' }, direction: { type: 'string', enum: ['credit','debit'] }, amount: { type: 'string' }, asset: { type: 'string' }, memo: { anyOf: [ref('Memo'), { type: 'null' }] }, payers: { type: 'array', items: { type: 'string' } }, cadence: { type: 'object' }, startAt: { type: 'string', format: 'date-time' }, endAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] }, endedAt: { anyOf: [{ type: 'string', format: 'date-time' }, { type: 'null' }] }, createdAt: { type: 'string', format: 'date-time' }, updatedAt: { type: 'string', format: 'date-time' } } },
+    CreateScheduleRequest: { type: 'object', additionalProperties: false, required: ['referencePattern','account','amount','cadence','startAt'], properties: { referencePattern: { type: 'string' }, account: { type: 'string' }, amount: { type: 'string' }, asset: { type: 'string' }, direction: { type: 'string', enum: ['credit','debit'] }, memo: { type: 'object' }, payers: { type: 'array', items: { type: 'string' } }, cadence: { type: 'object' }, startAt: { type: 'string', format: 'date-time' }, endAt: { type: 'string', format: 'date-time' } } },
+    SchedulePage: { type: 'object', additionalProperties: false, required: ['items'], properties: { items: { type: 'array', items: ref('Schedule') }, next: { type: 'string' } } },
         ...components,
         TrialBalanceLine: {
           type: 'object',

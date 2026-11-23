@@ -17,6 +17,8 @@ import type {
   AccountOpening,
   Allocation,
   CursorKey,
+  DecisionQuery,
+  DecisionRecord,
   Direction,
   Disposition,
   Entity,
@@ -31,9 +33,11 @@ import type {
   JournalEntry,
   Movement,
   NewAllocation,
+  NewDecisionSnapshot,
   NewException,
   ExpectationChanges,
   NewExpectation,
+  NewSchedule,
   NewJournalEntry,
   NewMovement,
   MovementValuation,
@@ -47,6 +51,8 @@ import type {
 import type { Money } from '../money/index.js'
 import type { AssetId } from '../money/index.js'
 import type { EventQuery, OutboxEvent, PruneEventsResult } from './events.js'
+import type { Schedule, ScheduleQuery } from '../model/index.js'
+export type { DecisionQuery, NewDecisionSnapshot }
 import type {
   DeliveryAttempt,
   DeliveryAttemptQuery,
@@ -246,7 +252,13 @@ export interface StoreReader extends JournalReader {
    */
   getExpectationsByNormalizedReference(tenantId: string, key: string): Promise<Expectation[]>
   listExpectations(query: ExpectationQuery): Promise<Expectation[]>
+  getSchedule(tenantId: string, id: string): Promise<Schedule | null>
+  listSchedules(query: ScheduleQuery): Promise<Schedule[]>
   listAllocations(query: AllocationQuery): Promise<Allocation[]>
+  /** The recorded decision for a movement, including exceptions and ignores. */
+  getDecision(tenantId: string, movementId: string): Promise<DecisionRecord | null>
+  /** Decisions in decision order, bounded by an optional time range and limit. */
+  listDecisions(query: DecisionQuery): Promise<DecisionRecord[]>
   getException(tenantId: string, id: string): Promise<ExceptionRecord | null>
   listExceptions(query: ExceptionQuery): Promise<ExceptionRecord[]>
   getJournalPeriod(tenantId: string): Promise<JournalPeriod | null>
@@ -348,6 +360,8 @@ export interface StoreTx extends StoreReader, JournalTx {
 
   /** Fails with `expectation_reference_unique` if the reference is taken in this tenant. */
   insertExpectation(expectation: NewExpectation): Promise<Expectation>
+  insertSchedule(schedule: NewSchedule): Promise<Schedule>
+  endSchedule(tenantId: string, id: string, endedAt: Date): Promise<Schedule>
 
   /**
    * Fails with `expectation_has_allocations` once anything has been allocated
@@ -368,6 +382,9 @@ export interface StoreTx extends StoreReader, JournalTx {
    * when the status changes.
    */
   allocate(allocation: NewAllocation): Promise<Allocation>
+
+  /** Record the engine decision behind this movement's disposition. One row per movement. */
+  recordDecision(decision: NewDecisionSnapshot): Promise<DecisionRecord>
 
   /** Writes an `exception.opened` event. */
   openException(exception: NewException): Promise<ExceptionRecord>

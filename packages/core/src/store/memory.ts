@@ -21,6 +21,8 @@ import type {
   AccountOpening,
   Allocation,
   CursorKey,
+  DecisionRecord,
+  NewDecisionSnapshot,
   Entity,
   EntityQuery,
   Disposition,
@@ -39,6 +41,7 @@ import type {
   NewInternalTransferLink,
   NewException,
   NewExpectation,
+  NewSchedule,
   NewJournalEntry,
   NewMovement,
   MovementValuation,
@@ -59,12 +62,14 @@ import {
 } from '../model/index.js'
 import type {
   AccountOpeningQuery,
+  DecisionQuery,
   RefundLink,
   RefundQuery,
   ExportBatch,
   AllocationQuery,
   ExceptionQuery,
   ExpectationQuery,
+
   InsertMovementsResult,
   JournalQuery,
   JournalPeriod,
@@ -96,6 +101,7 @@ import { ConstraintError, NotFoundError, TransactionClosedError } from './store.
 import type { ApiKeyRow, NewApiKeyRow, SyncStateRow, WatchedAccountRow } from './store.js'
 import { EventHistoryPrunedError, eventCursorKey } from './events.js'
 import type { EventQuery, NewOutboxEvent, OutboxEvent, PruneEventsResult } from './events.js'
+import type { Schedule, ScheduleQuery } from '../model/index.js'
 import type {
   DeliveryAttempt,
   DeliveryAttemptQuery,
@@ -125,11 +131,14 @@ interface State {
   /** Dedupe key → movement id. */
   readonly movementKeys: Map<string, string>
   readonly expectations: Map<string, Expectation>
+  readonly schedules: Map<string, Schedule>
   /** (tenant, reference) → expectation id. */
   readonly expectationRefs: Map<string, string>
   /** (tenant, normalised key) → expectation ids. A key can name several invoices. */
   readonly expectationKeys: Map<string, readonly string[]>
   readonly allocations: Map<string, Allocation>
+  /** Keyed by (tenant, movement). One decision record per decided movement. */
+  readonly decisions: Map<string, DecisionRecord>
   readonly exceptions: Map<string, ExceptionRecord>
   readonly cursors: Map<string, string>
   /** Keyed by id. The digest index is checked by scanning, which is fine at a tenant's key count. */
@@ -171,9 +180,11 @@ function emptyState(): State {
     movements: new Map(),
     movementKeys: new Map(),
     expectations: new Map(),
+      schedules: new Map(),
     expectationRefs: new Map(),
     expectationKeys: new Map(),
     allocations: new Map(),
+    decisions: new Map(),
     exceptions: new Map(),
     cursors: new Map(),
     apiKeys: new Map(),
@@ -206,9 +217,11 @@ function cloneState(s: State): State {
     movements: new Map(s.movements),
     movementKeys: new Map(s.movementKeys),
     expectations: new Map(s.expectations),
+    schedules: new Map(s.schedules),
     expectationRefs: new Map(s.expectationRefs),
     expectationKeys: new Map(s.expectationKeys),
     allocations: new Map(s.allocations),
+    decisions: new Map(s.decisions),
     exceptions: new Map(s.exceptions),
     cursors: new Map(s.cursors),
     apiKeys: new Map(s.apiKeys),
@@ -233,6 +246,7 @@ function cloneState(s: State): State {
 const key = (...parts: readonly string[]): string => JSON.stringify(parts)
 const movementKey = (m: { tenantId: string; network: string; source: string; externalId: string }) =>
   key(m.tenantId, m.network, m.source, m.externalId)
+const decisionKey = (tenantId: string, movementId: string) => key(tenantId, movementId)
 const cursorKey = (k: CursorKey) => key(k.tenantId, k.network, k.source, k.account)
 const openingKey = (o: Pick<AccountOpening, 'tenantId' | 'network' | 'account'>) =>
   key(o.tenantId, o.network, o.account)
@@ -314,6 +328,20 @@ abstract class MemoryReader implements StoreReader {
     return id === undefined ? null : (this.snapshot().expectations.get(id) ?? null)
   }
 
+  async getSchedule(tenantId: string, id: string): Promise<Schedule | null> {
+    this.check()
+    const sc = this.snapshot().schedules.get(id)
+    return sc !== undefined && sc.tenantId === tenantId ? sc : null
+  }
+
+  async listSchedules(q: ScheduleQuery): Promise<Schedule[]> {
+    this.check()
+    let out = [...this.snapshot().schedules.values()].filter((sc) => sc.tenantId === q.tenantId)
+    if (q.activeOnly) out = out.filter((sc) => sc.endedAt === null)
+    out.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
+    return out.slice(0, q.limit ?? 100)
+  }
+
   async getExpectationsByNormalizedReference(tenantId: string, normalized: string): Promise<Expectation[]> {
     this.check()
     if (normalized === '') return []
@@ -360,6 +388,26 @@ abstract class MemoryReader implements StoreReader {
       out.push(a)
     }
     return out
+  }
+
+  async getDecision(tenantId: string, movementId: string): Promise<DecisionRecord | null> {
+    this.check()
+    const decision = this.snapshot().decisions.get(decisionKey(tenantId, movementId))
+    return decision ?? null
+  }
+
+  async listDecisions(q: DecisionQuery): Promise<DecisionRecord[]> {
+    this.check()
+    const out = [...this.snapshot().decisions.values()]
+      .filter(
+        (d) =>
+          d.tenantId === q.tenantId &&
+          (q.movementId === undefined || d.movementId === q.movementId) &&
+          (q.from === undefined || d.decidedAt >= q.from) &&
+          (q.to === undefined || d.decidedAt < q.to),
+      )
+      .sort((a, b) => a.seq - b.seq)
+    return q.limit === undefined ? out : out.slice(0, q.limit)
   }
 
   async getException(tenantId: string, id: string): Promise<ExceptionRecord | null> {
@@ -990,6 +1038,38 @@ class MemoryTx extends MemoryReader implements StoreTx {
     return { deleted: removed.length, prunedThrough }
   }
 
+  async insertSchedule(n: NewSchedule): Promise<Schedule> {
+    this.check()
+    const now = this.now()
+    const schedule: Schedule = Object.freeze({
+      id: this.ids(),
+      tenantId: n.tenantId,
+      referencePattern: n.referencePattern,
+      account: n.account,
+      direction: n.direction ?? 'credit',
+      amount: n.amount,
+      memo: n.memo ?? null,
+      payers: Object.freeze([...(n.payers ?? [])]),
+      cadence: n.cadence,
+      startAt: n.startAt,
+      endAt: n.endAt ?? null,
+      endedAt: null,
+      createdAt: now,
+      updatedAt: now,
+    })
+    this.draft.schedules.set(schedule.id, schedule)
+    return schedule
+  }
+
+  async endSchedule(tenantId: string, id: string, endedAt: Date): Promise<Schedule> {
+    this.check()
+    const sc = this.draft.schedules.get(id)
+    if (sc === undefined || sc.tenantId !== tenantId) throw new NotFoundError('expectation', id)
+    const next = Object.freeze({ ...sc, endedAt, updatedAt: this.now() })
+    this.draft.schedules.set(id, next)
+    return next
+  }
+
   async insertExpectation(n: NewExpectation): Promise<Expectation> {
     this.check()
     assertValidNewExpectation(n)
@@ -1135,6 +1215,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       amount: n.amount,
       strategy: n.strategy,
       score: n.score ?? null,
+      decision: n.decision ?? null,
       createdAt: now,
     })
     this.draft.allocations.set(allocation.id, allocation)
@@ -1142,6 +1223,19 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.draft.expectations.set(e.id, updated)
     if (status !== e.status) this.emit(expectationChanged(updated, allocation))
     return allocation
+  }
+
+  async recordDecision(n: NewDecisionSnapshot): Promise<DecisionRecord> {
+    this.check()
+    const record: DecisionRecord = Object.freeze({
+      tenantId: n.tenantId,
+      movementId: n.movementId,
+      seq: this.draft.seq++,
+      decidedAt: n.decidedAt,
+      snapshot: n.snapshot,
+    })
+    this.draft.decisions.set(decisionKey(n.tenantId, n.movementId), record)
+    return record
   }
 
   async postJournalEntry(n: NewJournalEntry): Promise<JournalEntry> {

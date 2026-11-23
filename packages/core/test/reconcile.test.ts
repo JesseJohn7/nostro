@@ -85,6 +85,9 @@ describe('reconcile', () => {
 
     const [allocation] = await store.listAllocations({ tenantId: T, movementId: toMuxed!.id })
     expect(allocation).toMatchObject({ expectationId: muxed.id, strategy: 'muxed_id', score: 1 })
+    expect(allocation!.decision).toMatchObject({ engineVersion: expect.any(String) })
+    expect((await store.getDecision(T, toMuxed!.id))?.snapshot.result).toMatchObject({ outcome: 'allocate', expectationId: muxed.id })
+    expect((await store.getDecision(T, noMemo!.id))?.snapshot.result).toMatchObject({ outcome: 'exception', code: 'AMBIGUOUS_MATCH' })
   })
 
   it('leaves nothing pending and is a no-op when run again', async () => {

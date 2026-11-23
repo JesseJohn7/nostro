@@ -27,6 +27,12 @@ import type {
   AccountEntity,
   AccountEntityQuery,
   CursorKey,
+  DecisionQuery,
+  DecisionRecord,
+  DecisionSnapshot,
+  NewSchedule,
+  Schedule,
+  ScheduleQuery,
   Entity,
   EntityQuery,
   DeliveryAttempt,
@@ -54,6 +60,7 @@ import type {
   NewAccountEntity,
   NewAccountOpening,
   NewAllocation,
+  NewDecisionSnapshot,
   NewEntity,
   NewInternalTransferLink,
   NewException,
@@ -299,7 +306,35 @@ const toAllocation = (r: Row): Allocation =>
     amount: money(r.amount, r.asset, r.decimals),
     strategy: r.strategy as string,
     score: r.score as number | null,
+    decision: r.decision == null ? null : (JSON.parse(r.decision as string) as DecisionSnapshot),
     createdAt: date(r.created_at)!,
+  })
+
+const toDecisionRecord = (r: Row): DecisionRecord =>
+  Object.freeze({
+    tenantId: r.tenant_id as string,
+    movementId: r.movement_id as string,
+    seq: r.seq as number,
+    decidedAt: new Date(r.decided_at as number),
+    snapshot: JSON.parse(r.snapshot as string) as DecisionSnapshot,
+  })
+
+const toSchedule = (r: Row): Schedule =>
+  Object.freeze({
+    id: r.id as string,
+    tenantId: r.tenant_id as string,
+    referencePattern: r.reference_pattern as string,
+    account: r.account as string,
+    direction: r.direction as Direction,
+    amount: money(r.amount, r.asset, r.decimals),
+    memo: memoOf(r),
+    payers: Object.freeze(JSON.parse(r.payers as string) as string[]),
+    cadence: JSON.parse(r.cadence as string),
+    startAt: date(r.start_at)!,
+    endAt: date(r.end_at),
+    endedAt: date(r.ended_at),
+    createdAt: date(r.created_at)!,
+    updatedAt: date(r.updated_at)!,
   })
 
 const toException = (r: Row): ExceptionRecord =>
@@ -397,6 +432,8 @@ class Where {
     return this
   }
 
+  raw(sql: string): this { this.clauses.push(sql); return this }
+
   in(column: string, values: readonly string[] | undefined): this {
     if (values !== undefined) {
       this.params.push(...values)
@@ -485,6 +522,18 @@ class SqliteReader implements StoreReader {
     return row === undefined ? null : toExpectation(row)
   }
 
+  async getSchedule(tenantId: string, id: string): Promise<Schedule | null> {
+    const row = this.one('SELECT * FROM schedules WHERE tenant_id = ? AND id = ?', [tenantId, id])
+    return row === undefined ? null : toSchedule(row)
+  }
+
+  async listSchedules(query: ScheduleQuery): Promise<Schedule[]> {
+    const w = new Where()
+w.add('tenant_id = ?', query.tenantId)
+    if (query.activeOnly) w.add('ended_at IS NULL')
+    return this.all(`SELECT * FROM schedules${w} ORDER BY start_at, id${w.limit(query.limit ?? 100)}`, w.params).map(toSchedule)
+  }
+
   async getExpectationsByNormalizedReference(tenantId: string, normalized: string): Promise<Expectation[]> {
     if (normalized === '') return []
     return this.all(
@@ -517,6 +566,21 @@ class SqliteReader implements StoreReader {
       .add('expectation_id = ?', q.expectationId)
       .in('expectation_id', q.expectationIds)
     return this.all(`SELECT * FROM allocations${w} ORDER BY seq`, w.params).map(toAllocation)
+  }
+
+  async getDecision(tenantId: string, movementId: string): Promise<DecisionRecord | null> {
+    const row = this.one('SELECT * FROM decisions WHERE tenant_id = ? AND movement_id = ?', [tenantId, movementId])
+    return row === undefined ? null : toDecisionRecord(row)
+  }
+
+  async listDecisions(q: DecisionQuery): Promise<DecisionRecord[]> {
+    const w = new Where()
+      .add('tenant_id = ?', q.tenantId)
+      .add('movement_id = ?', q.movementId)
+      .add('decided_at >= ?', q.from === undefined ? undefined : q.from.getTime())
+      .add('decided_at < ?', q.to === undefined ? undefined : q.to.getTime())
+    const rows = this.all(`SELECT * FROM decisions${w} ORDER BY seq${w.limit(q.limit)}`, w.params)
+    return rows.map(toDecisionRecord)
   }
 
   async getException(tenantId: string, id: string): Promise<ExceptionRecord | null> {
@@ -1203,6 +1267,27 @@ class SqliteTx extends SqliteReader implements StoreTx {
     return next
   }
 
+  async insertSchedule(n: NewSchedule): Promise<Schedule> {
+    const [memoType, memoValue, memoText] = memoColumns(n.memo ?? null)
+    const now = this.now().getTime()
+    const id = this.ids()
+    const row = this.one(
+      `INSERT INTO schedules (
+         id, tenant_id, reference_pattern, account, direction, asset, decimals, amount,
+         memo_type, memo_value, memo_text, payers, cadence, start_at, end_at, ended_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       RETURNING *`,
+      [id, n.tenantId, n.referencePattern, n.account, n.direction ?? 'credit', n.amount.asset, n.amount.decimals, n.amount.raw.toString(), memoType, memoValue, memoText, JSON.stringify(n.payers ?? []), JSON.stringify(n.cadence), n.startAt.getTime(), ms(n.endAt), null, now, now],
+    ) as Row
+    return toSchedule(row)
+  }
+
+  async endSchedule(tenantId: string, id: string, endedAt: Date): Promise<Schedule> {
+    const row = this.one(`UPDATE schedules SET ended_at = ?, updated_at = ? WHERE tenant_id = ? AND id = ? RETURNING *`, [endedAt.getTime(), this.now().getTime(), tenantId, id]) as Row | undefined
+    if (row === undefined) throw new NotFoundError('expectation', id)
+    return toSchedule(row)
+  }
+
   async insertExpectation(n: NewExpectation): Promise<Expectation> {
     assertValidNewExpectation(n)
     if ((await this.getExpectationByReference(n.tenantId, n.reference)) !== null) {
@@ -1351,9 +1436,9 @@ class SqliteTx extends SqliteReader implements StoreTx {
     )
     const now = this.now().getTime()
     const row = this.one(
-      `INSERT INTO allocations (
-         id, tenant_id, movement_id, expectation_id, asset, decimals, amount, strategy, score, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+       `INSERT INTO allocations (
+          id, tenant_id, movement_id, expectation_id, asset, decimals, amount, strategy, score, decision, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       [
         this.ids(),
         n.tenantId,
@@ -1364,13 +1449,26 @@ class SqliteTx extends SqliteReader implements StoreTx {
         n.amount.raw.toString(),
         n.strategy,
         n.score ?? null,
+        n.decision == null ? null : JSON.stringify(n.decision),
         now,
       ],
     )!
+
     const updated = this.one('UPDATE expectations SET status = ?, updated_at = ? WHERE id = ? RETURNING *', [status, now, e.id])!
     const allocation = toAllocation(row)
     if (status !== e.status) this.emit(expectationChanged(toExpectation(updated), allocation))
     return allocation
+  }
+
+  async recordDecision(n: NewDecisionSnapshot): Promise<DecisionRecord> {
+    const row = this.one(
+      `INSERT INTO decisions (tenant_id, movement_id, decided_at, snapshot)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT (tenant_id, movement_id) DO UPDATE SET decided_at = excluded.decided_at, snapshot = excluded.snapshot
+       RETURNING *`,
+      [n.tenantId, n.movementId, n.decidedAt.getTime(), JSON.stringify(n.snapshot)],
+    )!
+    return toDecisionRecord(row)
   }
 
   async postJournalEntry(n: NewJournalEntry): Promise<JournalEntry> {

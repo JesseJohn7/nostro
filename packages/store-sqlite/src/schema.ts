@@ -706,4 +706,40 @@ PRIMARY KEY (tenant_id, destination)
       PRIMARY KEY (tenant_id, network, source, account)
     );
   `,
+  `
+    ALTER TABLE allocations ADD COLUMN decision TEXT CHECK (decision IS NULL OR json_valid(decision));
+
+    CREATE TABLE decisions (
+      seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id   TEXT NOT NULL,
+      movement_id TEXT NOT NULL UNIQUE REFERENCES movements (id),
+      decided_at  INTEGER NOT NULL,
+      snapshot    TEXT NOT NULL CHECK (json_valid(snapshot)),
+      UNIQUE (tenant_id, movement_id)
+    );
+    CREATE INDEX decisions_range ON decisions (tenant_id, decided_at, seq);
+  `,
+  `
+    CREATE TABLE schedules (
+      id                TEXT NOT NULL PRIMARY KEY,
+      tenant_id         TEXT NOT NULL,
+      reference_pattern TEXT NOT NULL,
+      account           TEXT NOT NULL,
+      direction         TEXT NOT NULL CHECK (direction IN (${DIRECTIONS})),
+      asset             TEXT NOT NULL,
+      decimals          INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount            TEXT NOT NULL ${positive('amount')},
+      memo_type         TEXT CHECK (memo_type IN (${MEMO_TYPES})),
+      memo_value        TEXT,
+      memo_text         BLOB,
+      payers            TEXT NOT NULL CHECK (json_valid(payers)),
+      cadence           TEXT NOT NULL CHECK (json_valid(cadence)),
+      start_at          INTEGER NOT NULL,
+      end_at            INTEGER,
+      ended_at          INTEGER,
+      created_at        INTEGER NOT NULL,
+      updated_at        INTEGER NOT NULL
+    );
+    CREATE INDEX schedules_tenant ON schedules (tenant_id, ended_at, start_at);
+  `,
 ]
