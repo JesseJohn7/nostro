@@ -25,6 +25,7 @@ nostro export --output journal.csv                   # the journal, a row per li
 | `migrate` | Creates the database, or applies the migrations it is missing. The only command that changes the schema; every other one refuses a database that is not exactly at the version it expects. |
 | `sync` | Ingests effects and fees for each `--account`, until caught up (or one round with `--once`). |
 | `expect` | Records an expectation: a reference, an account, an amount, and optionally a muxed id, a memo, payers, due and expiry dates. Never rounds an amount. |
+| `import` | Records many expectations from a CSV or JSON Lines file, all or nothing, with `--dry-run` to check first. Re-running is safe. See [Importing expectations](#importing-expectations). |
 | `expectations` | Lists expectations with what has been allocated to each. |
 | `reconcile` | Matches pending movements against expectations and posts each decision to the journal. |
 | `exceptions` | Lists what reconcile would not decide alone, with the reason (and, in `--json`, the evidence). |
@@ -94,3 +95,32 @@ The shapes are described in `schemas/output.schema.json` (JSON Schema 2020-12, s
 What counts as a breaking change: removing or renaming a field, changing an existing field's type, or
 renaming an error code. Adding a field or an error code is not breaking. Breaking changes are listed in
 CHANGELOG.md.
+
+## Importing expectations
+
+`nostro import <file|->` records many expectations at once, from a CSV file with a header row or from
+JSON Lines. Every row goes through the same validation as `nostro expect`.
+
+CSV, with columns `reference`, `account`, `amount`, `asset`, `direction` (`credit` or `debit`),
+`muxed_id`, `memo_text`, `memo_id`, `memo_hash`, `payers` (accounts separated by `|`), `due`, `expires`,
+and `meta.<key>` for each metadata key:
+
+```csv
+reference,account,amount,memo_text,payers,meta.note
+INV-1042,GABC...,25,INV-1042,GDEF...|GHIJ...,"paid in two parts, ask finance"
+INV-1043,GABC...,10,,,
+```
+
+JSON Lines, one object per line with the same names:
+
+```json
+{"reference":"INV-1042","account":"GABC...","amount":"25","memo_text":"INV-1042"}
+```
+
+Re-running a file is safe. A row whose reference is already recorded with the same fields is skipped. A
+row whose reference is recorded with different fields is a conflict: it is reported with its line number,
+and the recorded expectation is never changed. If any row is refused, nothing is written. Use
+`--dry-run` to check a file first, and `--json` for a full report.
+
+Exit status is 0 when everything was recorded or skipped, 1 when a row was refused or conflicts, and 2 for
+a bad command line or a header the importer does not know.

@@ -17,4 +17,9 @@ process.exitCode = await main(process.argv.slice(2), {
   env: process.env,
   cwd: process.cwd(),
   signal: stop.signal,
+  readStdin: async () => {
+    let text = '';
+    for await (const chunk of process.stdin) text += chunk;
+    return text;
+  },
 })

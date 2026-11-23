@@ -1,4 +1,4 @@
-import type { AssetId, Memo, NewExpectation } from '@nostro-labs/nostro'
+import type { AssetId, Expectation, Memo, NewExpectation, StoreTx } from '@nostro-labs/nostro'
 import { ConstraintError, Money, NATIVE, ValidationError, isAccountId, parseAsset } from '@nostro-labs/nostro'
 import type { Args } from '../args.js'
 import { COMMON, CliError, UsageError, date, flag, positionals, string, strings, tenant } from '../args.js'
@@ -58,6 +58,55 @@ function metadataOf(args: Args): Record<string, string> {
   return out
 }
 
+/**
+ * Validates an expectation's options exactly as `nostro expect` does: the
+ * reference is the first positional, the rest are options. `nostro import`
+ * builds the same options from each row, so both commands share one set of rules.
+ */
+export function expectationOf(args: Args, tenantId: string): NewExpectation {
+  const [reference] = positionals(args, 1)
+  if (reference === undefined || reference.trim() === '') throw new UsageError('Give the reference, e.g. nostro expect INV-1042 ...')
+  const account = string(args, 'account')
+  if (account === undefined || !isAccountId(account)) throw new UsageError('--account must be the G... account it is paid to.')
+  const raw = string(args, 'amount')
+  if (raw === undefined) throw new UsageError('--amount is required.')
+  const asset = assetOf(string(args, 'asset') ?? 'native')
+  let amount: Money
+  try {
+    amount = Money.parse(raw, asset)
+  } catch (err) {
+    throw new UsageError(`--amount: ${(err as Error).message}`)
+  }
+  if (flag(args, 'issue-muxed-id') && string(args, 'muxed-id') !== undefined) throw new UsageError('Give --muxed-id or --issue-muxed-id, not both.')
+  for (const payer of strings(args, 'payer')) {
+    if (!isAccountId(payer)) throw new UsageError(`--payer ${JSON.stringify(payer)} is not a G... account id.`)
+  }
+
+  return {
+    tenantId,
+    reference,
+    account,
+    direction: flag(args, 'debit') ? 'debit' : 'credit',
+    amount,
+    muxedId: flag(args, 'issue-muxed-id') ? 'issue' : (uint64(args, 'muxed-id') ?? null),
+    memo: memoOf(args),
+    payers: strings(args, 'payer'),
+    dueAt: date(args, 'due') ?? null,
+    expiresAt: date(args, 'expires') ?? null,
+    metadata: metadataOf(args),
+  }
+}
+
+/** Inserts one expectation, and posts its accrual when accrual is switched on for the tenant. */
+export async function recordExpectation(tx: StoreTx, expectation: NewExpectation): Promise<Expectation> {
+  const e = await tx.insertExpectation(expectation)
+  const accrualActive = await tx.accrualGetMode(expectation.tenantId)
+  if (accrualActive) {
+    await tx.postAccrualExpectation(e.id, expectation.tenantId, e.direction, e.amount, e.reference)
+  }
+  return e
+}
+
 export const expect: Command = {
   name: 'expect',
   summary: 'Record a payment you are owed, or one you will make',
@@ -100,46 +149,12 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     meta: { type: 'string', multiple: true },
   },
   async run(args, io) {
-    const [reference] = positionals(args, 1)
-    if (reference === undefined || reference.trim() === '') throw new UsageError('Give the reference, e.g. nostro expect INV-1042 ...')
-    const account = string(args, 'account')
-    if (account === undefined || !isAccountId(account)) throw new UsageError('--account must be the G... account it is paid to.')
-    const raw = string(args, 'amount')
-    if (raw === undefined) throw new UsageError('--amount is required.')
-    const asset = assetOf(string(args, 'asset') ?? 'native')
-    let amount: Money
-    try {
-      amount = Money.parse(raw, asset)
-    } catch (err) {
-      throw new UsageError(`--amount: ${(err as Error).message}`)
-    }
-    if (flag(args, 'issue-muxed-id') && string(args, 'muxed-id') !== undefined) throw new UsageError('Give --muxed-id or --issue-muxed-id, not both.')
-    for (const payer of strings(args, 'payer')) {
-      if (!isAccountId(payer)) throw new UsageError(`--payer ${JSON.stringify(payer)} is not a G... account id.`)
-    }
-
-    const expectation: NewExpectation = {
-      tenantId: tenant(args, io),
-      reference,
-      account,
-      direction: flag(args, 'debit') ? 'debit' : 'credit',
-      amount,
-      muxedId: flag(args, 'issue-muxed-id') ? 'issue' : (uint64(args, 'muxed-id') ?? null),
-      memo: memoOf(args),
-      payers: strings(args, 'payer'),
-      dueAt: date(args, 'due') ?? null,
-      expiresAt: date(args, 'expires') ?? null,
-      metadata: metadataOf(args),
-    }
+    const expectation = expectationOf(args, tenant(args, io))
+    const reference = expectation.reference
     const recorded = await withStore(args, io, (store) =>
       store.transaction(async (tx) => {
         try {
-          const e = await tx.insertExpectation(expectation)
-          const accrualActive = await tx.accrualGetMode(tenant(args, io))
-          if (accrualActive) {
-            await tx.postAccrualExpectation(e.id, tenant(args, io), e.direction, e.amount, e.reference)
-          }
-          return e
+          return await recordExpectation(tx, expectation)
         } catch (err) {
           if (err instanceof ValidationError) throw new UsageError(err.message)
           if (err instanceof ConstraintError && err.constraint === 'expectation_reference_unique') {

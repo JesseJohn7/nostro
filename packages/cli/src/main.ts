@@ -12,6 +12,7 @@ import { chart } from './commands/chart.js'
 import { doctor } from './commands/doctor.js'
 import { entity } from './commands/entity.js'
 import { keys } from './commands/keys.js'
+import { importCommand } from './commands/import.js'
 import { exceptions } from './commands/exceptions.js'
 import { expect } from './commands/expect.js'
 import { expectations } from './commands/expectations.js'
@@ -44,6 +45,7 @@ export const COMMANDS: readonly Command[] = [
   open,
   expect,
   expectations,
+  importCommand,
   cancel,
   amend,
   reconcile,

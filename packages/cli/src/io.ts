@@ -20,6 +20,8 @@ export interface Io {
   readonly fetch?: typeof globalThis.fetch
   /** Ends a long-running command, such as `serve`, cleanly. `bin.ts` fires it on SIGINT and SIGTERM. */
   readonly signal?: AbortSignal
+  /** Everything on standard input, read to its end. Only `nostro import -` needs it. */
+  readonly readStdin?: () => Promise<string>
 }
 
 /** Write a chunk, waiting for the stream to drain if it asks. */
