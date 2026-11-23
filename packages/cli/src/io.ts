@@ -22,6 +22,10 @@ export interface Io {
   readonly signal?: AbortSignal
   /** Everything on standard input, read to its end. Only `nostro import -` needs it. */
   readonly readStdin?: () => Promise<string>
+  /** True when standard input and standard output are both terminals. `nostro review` needs it. */
+  readonly interactive?: boolean
+  /** Asks a question and returns the answer, or null when input has ended. */
+  readonly prompt?: (question: string) => Promise<string | null>
 }
 
 /** Write a chunk, waiting for the stream to drain if it asks. */

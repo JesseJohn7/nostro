@@ -31,6 +31,7 @@ import { replay } from './commands/replay.js'
 import { scheduleCommand } from './commands/schedule.js'
 import { report } from './commands/report.js'
 import { resolve } from './commands/resolve.js'
+import { review } from './commands/review.js'
 import { serve } from './commands/serve.js'
 import { show } from './commands/show.js'
 import { sync } from './commands/sync.js'
@@ -52,6 +53,7 @@ export const COMMANDS: readonly Command[] = [
   replay,
   scheduleCommand() as unknown as Command,
   exceptions,
+  review,
   movements,
   show,
   resolve,

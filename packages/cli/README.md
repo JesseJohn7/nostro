@@ -29,6 +29,7 @@ nostro export --output journal.csv                   # the journal, a row per li
 | `expectations` | Lists expectations with what has been allocated to each. |
 | `reconcile` | Matches pending movements against expectations and posts each decision to the journal. |
 | `exceptions` | Lists what reconcile would not decide alone, with the reason (and, in `--json`, the evidence). |
+| `review` | Walks through open exceptions one at a time in a terminal: shows the payment and the candidate invoices, then applies, ignores, closes or skips each, with a note. Needs a terminal; scripts use `resolve`. |
 | `resolve` | Answers an exception: `--apply <reference[=amount]>` (this payment was for that invoice), `--ignore` (not something to reconcile) or `--close`, with a required `--note`. Moves the movement, its exceptions and the journal together. |
 | `post` | Posts to the journal any decision it does not reflect yet, such as one made outside `reconcile`. Idempotent. |
 | `doctor` | Checks invariants I1 and I3 over every record, and with `--attest` I2: each account's recorded movements against its on-chain balance in every asset. Exits 1 if any does not hold. |
