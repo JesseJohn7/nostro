@@ -5,6 +5,10 @@ before 1.0, a minor version may change the API.
 
 ## Unreleased
 
+- **CLI errors have a JSON form.** With `--json`, a failing command prints one JSON object on stderr,
+  `{"error":{"code","message"}}`, instead of text. Exit codes are unchanged, and text errors without
+  `--json` are unchanged. `exceptions` and `expectations` take `--after <seq>` for paging and `--jsonl`
+  for one record per line. The contract is documented in `packages/cli/README.md`.
 - **API keys live in the database.** `nostro keys create --tenant <id> --label <text> --scopes <list>`
   prints a new key once; `nostro keys list` shows ids, labels, scopes and last use, never keys; and
   `nostro keys revoke <id>` revokes one. A revoked key is refused on its next request, with no
