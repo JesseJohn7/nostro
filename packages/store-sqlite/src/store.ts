@@ -546,8 +546,8 @@ class SqliteReader implements StoreReader {
       .add('kind = ?', q.kind)
       .add('ledger >= ?', q.fromLedger)
       .add('ledger < ?', q.toLedger)
-      .add('occurred_at >= ?', ms(q.occurredFrom))
-      .add('occurred_at < ?', ms(q.occurredBefore))
+      .add('occurred_at >= ?', ms(q.occurredFrom) ?? undefined)
+      .add('occurred_at < ?', ms(q.occurredBefore) ?? undefined)
       .add('seq > ?', q.afterSeq)
     return this.all(`SELECT * FROM movements${w} ORDER BY seq${w.limit(q.limit)}`, w.params).map(toMovement)
   }
