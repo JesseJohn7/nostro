@@ -9,7 +9,7 @@
 import { Readable } from 'node:stream'
 import Fastify from 'fastify'
 import type { FastifyError, FastifyInstance, FastifyServerOptions } from 'fastify'
-import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, NewExpectation, Store } from '@nostro-labs/nostro'
+import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, NewExpectation, NewSchedule, Store } from '@nostro-labs/nostro'
 import {
   ConsumerPositionConflict,
   ConstraintError,
@@ -22,13 +22,17 @@ import {
   PrecisionError,
   ValidationError,
   accountLedger,
+  DEFAULT_STRATEGIES,
   allocationJson,
   balanceSheet,
   consumerStatusJson,
   decideException,
+  decideExceptions,
   deliveryAttemptJson,
   exceptionJson,
   expectationJson,
+  scheduleJson,
+  explainMovement,
   getConsumerStatus,
   incomeStatement,
   journalCsvRows,
@@ -39,6 +43,7 @@ import {
   outboxEventJson,
   parseAsset,
   postManualEntry,
+  replayDecisions,
   resolutionJson,
   rewindConsumer,
   rewindJson,
@@ -48,7 +53,7 @@ import type { Authenticate, Principal } from './auth.js'
 import { ROUTE_SCOPES } from './scopes.js'
 import { buildOpenApi } from './openapi.js'
 import { HttpProblem } from './problem.js'
-import { UINT64, accountBody, accountParams, amendExpectationBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
+import { UINT64, accountBody, accountParams, amendExpectationBody, batchResolveBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, removeAccountQuery, replayBody, resolveBody, scheduleBody } from './schemas.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -155,6 +160,33 @@ function uint64(field: string, value: string): bigint {
   const n = BigInt(value)
   if (n > UINT64_MAX) throw invalid(`${field} must be below 2^64.`)
   return n
+}
+
+interface ScheduleBody { referencePattern:string; account:string; amount:string; asset?:string; direction?:'credit'|'debit'; memo?:{type:'text'|'id'|'hash'|'return'; value:string}; payers?:string[]; cadence:{kind:'daily'}|{kind:'weekly';day:number}|{kind:'monthly';day:number}; startAt:string; endAt?:string }
+function toNewSchedule(tenantId: string, b: ScheduleBody): NewSchedule {
+  let asset: AssetId
+  try { asset = b.asset === undefined || b.asset === 'native' ? NATIVE : parseAsset(b.asset) } catch (err) {
+    if (err instanceof InvalidAssetError) throw invalid(`asset must be "native" or CODE:ISSUER: ${err.message}`)
+    throw err
+  }
+  let amount: Money
+  try { amount = Money.parse(b.amount, asset) } catch (err) {
+    if (err instanceof PrecisionError) throw invalid(`amount: ${err.message}`)
+    throw err
+  }
+  let memo: NewSchedule['memo']
+  if (b.memo) {
+    if (b.memo.type === 'text') {
+      if (Buffer.byteLength(b.memo.value,'utf8') > 28) throw invalid('memo.value must fit in a text memo: 28 bytes.')
+      memo = { type:'text', value:b.memo.value }
+    } else if (b.memo.type === 'id') memo = { type:'id', value:uint64('memo.value', b.memo.value) }
+    else if (b.memo.type === 'hash' || b.memo.type === 'return') {
+      if (!/^[0-9a-f]{64}$/i.test(b.memo.value)) throw invalid('memo.value must be 64 hex characters.')
+      memo = { type:b.memo.type, value:b.memo.value.toLowerCase() }
+    }
+  }
+  const cadence = b.cadence.kind === 'daily' ? { type: 'daily' as const } : b.cadence.kind === 'weekly' ? { type: 'weekly' as const, dayOfWeek: b.cadence.day } : { type: 'monthly' as const, dayOfMonth: b.cadence.day }
+  return { tenantId, referencePattern:b.referencePattern, account:b.account, direction:b.direction ?? 'credit', amount, ...(memo ? { memo } : {}), payers:b.payers ?? [], cadence, startAt:new Date(b.startAt), ...(b.endAt ? { endAt:new Date(b.endAt) } : {}) }
 }
 
 function toNewExpectation(tenantId: string, b: ExpectationBody): NewExpectation {
@@ -327,13 +359,75 @@ export function createServer(options: ServerOptions): FastifyInstance {
         const movementId = movement.id
         return {
           movement: movementJson(movement),
-          refunds: (await store.listRefundLinks({tenantId,movementIds:[movementId]})).map(refundLinkJson),
+          refunds: (await store.listRefundLinks({ tenantId, movementIds: [movementId] })).map(refundLinkJson),
           allocations: (await store.listAllocations({ tenantId, movementId })).map(allocationJson),
           exceptions: (await store.listExceptions({ tenantId, movementId })).map(exceptionJson),
           journal: (await store.listJournalEntries({ tenantId, movementId })).map(journalEntryJson),
+          decision: (await store.getDecision(tenantId, movementId))?.snapshot ?? null,
         }
       })
 
+      v1.get<{ Params: { id: string } }>('/movements/:id/explain', { schema: { params: idParams } }, async ({ tenantId, params }) =>
+        explainMovement({ store, tenantId, movementId: params.id }),
+      )
+
+      v1.get<{ Querystring: { from?: string; to?: string; threshold?: number; margin?: number; strategy?: string | string[]; limit?: number } }>(
+        '/decisions/replay',
+        { schema: { querystring: query.decisionReplay } },
+        async ({ tenantId, query: q }) => {
+          const options: { threshold?: number; margin?: number; strategies?: readonly (typeof DEFAULT_STRATEGIES)[number][] } = {}
+          if (q.threshold !== undefined) options.threshold = q.threshold
+          if (q.margin !== undefined) options.margin = q.margin
+          if (q.strategy !== undefined) {
+            options.strategies = (Array.isArray(q.strategy) ? q.strategy : [q.strategy]).map((name) => {
+              const strategy = DEFAULT_STRATEGIES.find((s) => s.name === name)
+              if (strategy === undefined) throw invalid(`unknown strategy: ${name}`)
+              return strategy
+            })
+          }
+          return replayDecisions({
+            store,
+            tenantId,
+            ...(q.from === undefined ? {} : { from: new Date(q.from) }),
+            ...(q.to === undefined ? {} : { to: new Date(q.to) }),
+            ...(q.limit === undefined ? {} : { limit: q.limit }),
+            options,
+          })
+        },
+      )
+
+
+      v1.get<{ Querystring: Paging & { activeOnly?: string } }>(
+        '/schedules',
+        { schema: { querystring: query.schedules } },
+        async ({ tenantId, query: q }) => {
+          const items = await store.listSchedules({ tenantId, limit: q.limit, ...(q.activeOnly === 'true' ? { activeOnly: true } : {}) })
+          return { items: items.map(scheduleJson) }
+        },
+      )
+
+      v1.post<{ Body: ScheduleBody }>(
+        '/schedules',
+        { schema: { body: scheduleBody }, preValidation: async (request) => onlyStrings(request.body, '') },
+        async (request, reply) => {
+          const created = await store.transaction((tx) => tx.insertSchedule(toNewSchedule(request.tenantId, request.body)))
+          return reply.code(201).header('location', `/v1/schedules/${created.id}`).send(scheduleJson(created))
+        },
+      )
+
+      v1.get<{ Params: { id: string } }>('/schedules/:id', { schema: { params: idParams } }, async ({ tenantId, params }) => {
+        const sc = await store.getSchedule(tenantId, params.id)
+        if (sc === null) throw new HttpProblem(404, 'not_found', `No schedule ${params.id}.`)
+        return scheduleJson(sc)
+      })
+
+      v1.post<{ Params: { id: string } }>('/schedules/:id/end', { schema: { params: idParams } }, async ({ tenantId, params }) => {
+        const sc = await store.getSchedule(tenantId, params.id)
+        if (sc === null) throw new HttpProblem(404, 'not_found', `No schedule ${params.id}.`)
+        if (sc.endedAt) return scheduleJson(sc)
+        const ended = await store.transaction((tx) => tx.endSchedule(tenantId, params.id, new Date()))
+        return scheduleJson(ended)
+      })
       v1.get<{ Querystring: Paging & { status?: string; account?: string } }>(
         '/expectations',
         { schema: { querystring: query.expectations } },
@@ -529,6 +623,31 @@ export function createServer(options: ServerOptions): FastifyInstance {
             }
             if (err instanceof ValidationError || err instanceof PrecisionError) throw new HttpProblem(422, 'invalid_resolution', err.message)
             if (err instanceof ConstraintError) throw new HttpProblem(409, 'resolution_refused', err.message)
+            throw err
+          }
+        },
+      )
+
+      v1.post<{ Body: { mode: 'atomic' | 'row'; decisions: { exceptionId: string; decision: ExceptionDecision }[] } }>(
+        '/exceptions/resolve',
+        { schema: { body: batchResolveBody }, preValidation: async (request) => onlyStrings(request.body, '') },
+        async ({ tenantId, body }, reply) => {
+          try {
+            const report = await decideExceptions({ store, tenantId, mode: body.mode, decisions: body.decisions })
+            if (report.errors > 0 && report.mode === 'row') reply.code(207)
+            return {
+              mode: report.mode,
+              applied: report.applied,
+              errors: report.errors,
+              results: report.results.map((r) => ({
+                index: r.index,
+                exceptionId: r.exceptionId,
+                result: r.result ? resolutionJson(r.result) : null,
+                error: r.error ?? null,
+              })),
+            }
+          } catch (err) {
+            if (err instanceof ValidationError || err instanceof PrecisionError) throw new HttpProblem(422, 'invalid_resolution', err.message)
             throw err
           }
         },

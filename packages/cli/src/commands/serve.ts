@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import type { AddressInfo } from 'node:net'
 import { resolve } from 'node:path'
 import type { HorizonRateLimit, MovementSource, Store } from '@nostro-labs/nostro'
-import { StreamWatcher, deliverWebhooks, sweepExpectations } from '@nostro-labs/nostro'
+import { StreamWatcher, deliverWebhooks, generateExpectations, sweepExpectations } from '@nostro-labs/nostro'
 import type { KeyGrant, Scope } from '@nostro-labs/server'
 import { SCOPES, apiKeys, createServer, firstOf, storedKeys } from '@nostro-labs/server'
 import type { StoredKeys } from '@nostro-labs/server'
@@ -317,6 +317,7 @@ async function runTenants(o: RunOptions): Promise<void> {
       signal: io.signal,
       step: () =>
         limiter.run(async () => {
+          await generateExpectations({ store, tenantId: id, until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) })
           if (plan.network === null) {
             await sweepExpectations({ store, tenantId: id })
           } else {

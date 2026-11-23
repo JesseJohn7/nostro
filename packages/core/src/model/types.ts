@@ -19,6 +19,7 @@
  * than mutate them.
  */
 import type { AssetId, Money } from '../money/index.js'
+import type { ExpectationJson, MovementJson } from './json.js'
 
 /** Which way value moved, relative to the watched account. */
 export type Direction = 'credit' | 'debit'
@@ -301,6 +302,8 @@ export interface Allocation {
   readonly strategy: string
   /** Match confidence in [0, 1]; `null` for manual allocations. */
   readonly score: number | null
+  /** The engine decision behind an automatic allocation; `null` for manual ones. */
+  readonly decision?: DecisionSnapshot | null
   readonly createdAt: Date
 }
 
@@ -311,6 +314,27 @@ export interface NewAllocation {
   readonly amount: Money
   readonly strategy: string
   readonly score?: number | null
+  readonly decision?: DecisionSnapshot | null
+}
+
+/**
+ * The audit trail for one decided movement. `decisions` is keyed by movement,
+ * so exceptions and ignores are covered as well as automatic allocations.
+ */
+export interface DecisionRecord {
+  readonly tenantId: string
+  readonly movementId: string
+  readonly seq: number
+  readonly decidedAt: Date
+  readonly snapshot: DecisionSnapshot
+}
+
+export interface DecisionQuery {
+  readonly tenantId: string
+  readonly movementId?: string
+  readonly from?: Date
+  readonly to?: Date
+  readonly limit?: number
 }
 
 /**
@@ -361,6 +385,46 @@ export type ExceptionStatus = 'open' | 'resolved' | 'dismissed'
 
 /** JSON-safe evidence. bigints and Money must be serialised before they go in. */
 export type Json = string | number | boolean | null | readonly Json[] | { readonly [k: string]: Json }
+
+export interface DecisionOptionsJson {
+  readonly threshold: number
+  readonly margin: number
+  readonly strategies: readonly string[]
+}
+
+export interface DecisionCandidateJson {
+  readonly expectation: ExpectationJson & {
+    readonly tenantId: string
+    readonly fingerprintSuffix: string | null
+  }
+  /** What was still owed on this expectation when the decision was made. */
+  readonly remaining: string
+  readonly decimals: number
+}
+
+export interface DecisionInputsJson {
+  readonly movement: MovementJson & { readonly tenantId: string }
+  readonly candidates: readonly DecisionCandidateJson[]
+}
+
+/** A decision written by a transaction, with its tenant and decided-at time. */
+export interface NewDecisionSnapshot {
+  readonly tenantId: string
+  readonly movementId: string
+  readonly decidedAt: Date
+  readonly snapshot: DecisionSnapshot
+}
+
+/** Everything needed to replay one decision with a later engine or different options. */
+export interface DecisionSnapshot {
+  readonly engineVersion: string
+  readonly decidedAt: string
+  readonly options: DecisionOptionsJson
+  readonly inputs: DecisionInputsJson
+  readonly evidence: Json
+  /** The outcome `decide()` produced, reduced to JSON. */
+  readonly result: Json
+}
 
 export interface ExceptionRecord {
   readonly id: string
@@ -569,4 +633,45 @@ export interface ValuationQuery {
   readonly tenantId: string
   readonly movementId?: string
   readonly reportingAsset?: AssetId
+}
+
+export type ScheduleCadence =
+  | { readonly type: 'daily' }
+  | { readonly type: 'weekly'; readonly dayOfWeek: number }
+  | { readonly type: 'monthly'; readonly dayOfMonth: number }
+
+export interface Schedule {
+  readonly id: string
+  readonly tenantId: string
+  readonly referencePattern: string
+  readonly account: string
+  readonly direction: Direction
+  readonly amount: Money
+  readonly memo: Memo | null
+  readonly payers: readonly string[]
+  readonly cadence: ScheduleCadence
+  readonly startAt: Date
+  readonly endAt: Date | null
+  readonly endedAt: Date | null
+  readonly createdAt: Date
+  readonly updatedAt: Date
+}
+
+export interface NewSchedule {
+  readonly tenantId: string
+  readonly referencePattern: string
+  readonly account: string
+  readonly direction?: Direction
+  readonly amount: Money
+  readonly memo?: Memo | null
+  readonly payers?: readonly string[]
+  readonly cadence: ScheduleCadence
+  readonly startAt: Date
+  readonly endAt?: Date | null
+}
+
+export interface ScheduleQuery {
+  readonly tenantId: string
+  readonly activeOnly?: boolean
+  readonly limit?: number
 }

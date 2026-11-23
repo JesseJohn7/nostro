@@ -28,6 +28,11 @@ import type {
   Allocation,
   AllocationQuery,
   CursorKey,
+  DecisionQuery,
+  NewSchedule,
+  Schedule,
+  ScheduleQuery,
+  DecisionRecord,
   DeliveryAttempt,
   DeliveryAttemptQuery,
   Disposition,
@@ -54,6 +59,7 @@ import type {
   NewAccountEntity,
   NewAccountOpening,
   NewAllocation,
+  NewDecisionSnapshot,
   NewEntity,
   NewInternalTransferLink,
   NewException,
@@ -119,6 +125,7 @@ import type {
   AccountEntityRow,
   AccountOpeningRow,
   AllocationRow,
+  DecisionRow,
   EntityRow,
   InternalTransferLinkRow,
   DeliveryAttemptRow,
@@ -129,9 +136,10 @@ import type {
   JournalLineRow,
   MovementRow,
   MovementValuationRow,
+  ScheduleRow,
   RewindRow,
 } from './rows.js'
-import { memoColumns, storedOpeningBalance, toAccountEntity, toAccountOpening, toAllocation, toDeliveryAttempt, toEntity, toEvent, toException, toExpectation, toInternalTransferLink, toJournalEntry, toMovement, toRewind, toValuation } from './rows.js'
+import { memoColumns, storedOpeningBalance, toAccountEntity, toAccountOpening, toAllocation, toDecisionRecord, toDeliveryAttempt, toEntity, toEvent, toException, toExpectation, toInternalTransferLink, toJournalEntry, toMovement, toRewind, toSchedule, toValuation } from './rows.js'
 import { MIGRATIONS, quoteSchema } from './schema.js'
 
 export interface PostgresStoreOptions {
@@ -167,6 +175,8 @@ class Where {
     this.params.push(n)
     return ` LIMIT $${this.params.length}`
   }
+
+  raw(sql:string): this { this.clauses.push(sql); return this }
 
   toString(): string {
     return this.clauses.length === 0 ? '' : ` WHERE ${this.clauses.join(' AND ')}`
@@ -244,6 +254,18 @@ class PgReader implements StoreReader {
     return (await this.run<ExpectationRow>(sql, w.params)).map(toExpectation)
   }
 
+  async getSchedule(tenantId: string, id: string): Promise<Schedule | null> {
+    const [row] = await this.run<ScheduleRow>(`SELECT * FROM ${this.s}.schedules WHERE tenant_id = $1 AND id = $2`, [tenantId, id])
+    return row === undefined ? null : toSchedule(row)
+  }
+
+  async listSchedules(q: ScheduleQuery): Promise<Schedule[]> {
+    const w = new Where().add((p) => `tenant_id = ${p}`, q.tenantId)
+    if (q.activeOnly) w.raw('ended_at IS NULL')
+    const rows = await this.run<ScheduleRow>(`SELECT * FROM ${this.s}.schedules${w} ORDER BY start_at, id${w.limit(q.limit ?? 100)}`, w.params)
+    return rows.map(toSchedule)
+  }
+
   async listAllocations(q: AllocationQuery): Promise<Allocation[]> {
     if (q.movementIds?.length === 0 || q.expectationIds?.length === 0) return []
     const w = new Where()
@@ -255,6 +277,24 @@ class PgReader implements StoreReader {
     return (await this.run<AllocationRow>(`SELECT * FROM ${this.s}.allocations${w} ORDER BY seq`, w.params)).map(
       toAllocation,
     )
+  }
+
+  async getDecision(tenantId: string, movementId: string): Promise<DecisionRecord | null> {
+    const [row] = await this.run<DecisionRow>(
+      `SELECT * FROM ${this.s}.decisions WHERE tenant_id = $1 AND movement_id = $2`,
+      [tenantId, movementId],
+    )
+    return row === undefined ? null : toDecisionRecord(row)
+  }
+
+  async listDecisions(q: DecisionQuery): Promise<DecisionRecord[]> {
+    const w = new Where()
+      .add((p) => `tenant_id = ${p}`, q.tenantId)
+      .add((p) => `movement_id = ${p}`, q.movementId)
+      .add((p) => `decided_at >= ${p}`, q.from)
+      .add((p) => `decided_at < ${p}`, q.to)
+    const sql = `SELECT * FROM ${this.s}.decisions${w} ORDER BY seq${w.limit(q.limit)}`
+    return (await this.run<DecisionRow>(sql, w.params)).map(toDecisionRecord)
   }
 
   async getException(tenantId: string, id: string): Promise<ExceptionRecord | null> {
@@ -1132,6 +1172,29 @@ class PgTx extends PgReader implements StoreTx {
     return next
   }
 
+  async insertSchedule(n: NewSchedule): Promise<Schedule> {
+    const [memoType, memoValue, memoText] = memoColumns(n.memo ?? null)
+    const now = this.now()
+    const [row] = await this.run<ScheduleRow>(
+      `INSERT INTO ${this.s}.schedules (
+         id, tenant_id, reference_pattern, account, direction, asset, decimals, amount,
+         memo_type, memo_value, memo_text, payers, cadence, start_at, end_at, ended_at, created_at, updated_at
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18)
+       RETURNING *`,
+      [this.ids(), n.tenantId, n.referencePattern, n.account, n.direction ?? 'credit', n.amount.asset, n.amount.decimals, n.amount.raw.toString(), memoType, memoValue, memoText, JSON.stringify(n.payers ?? []), JSON.stringify(n.cadence), n.startAt, n.endAt ?? null, null, now, now],
+    )
+    return toSchedule(row!)
+  }
+
+  async endSchedule(tenantId: string, id: string, endedAt: Date): Promise<Schedule> {
+    const [row] = await this.run<ScheduleRow>(
+      `UPDATE ${this.s}.schedules SET ended_at = $3, updated_at = $4 WHERE tenant_id = $1 AND id = $2 RETURNING *`,
+      [tenantId, id, endedAt, this.now()],
+    )
+    if (row === undefined) throw new NotFoundError('expectation', id)
+    return toSchedule(row)
+  }
+
   async insertExpectation(n: NewExpectation): Promise<Expectation> {
     assertValidNewExpectation(n)
     const taken = () =>
@@ -1305,9 +1368,9 @@ class PgTx extends PgReader implements StoreTx {
     )
     const now = this.now()
     const [row] = await this.run<AllocationRow>(
-      `INSERT INTO ${this.s}.allocations (
-         id, tenant_id, movement_id, expectation_id, asset, decimals, amount, strategy, score, created_at
-       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+       `INSERT INTO ${this.s}.allocations (
+          id, tenant_id, movement_id, expectation_id, asset, decimals, amount, strategy, score, decision, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::json, $11) RETURNING *`,
       [
         this.ids(),
         n.tenantId,
@@ -1318,9 +1381,11 @@ class PgTx extends PgReader implements StoreTx {
         n.amount.raw.toString(),
         n.strategy,
         n.score ?? null,
+        n.decision == null ? null : JSON.stringify(n.decision),
         now,
       ],
     )
+
     const [updated] = await this.run<ExpectationRow>(
       `UPDATE ${this.s}.expectations SET status = $2, updated_at = $3 WHERE id = $1 RETURNING *`,
       [e.id, status, now],
@@ -1328,6 +1393,18 @@ class PgTx extends PgReader implements StoreTx {
     const allocation = toAllocation(row!)
     if (status !== e.status) await this.emit(expectationChanged(toExpectation(updated!), allocation))
     return allocation
+  }
+
+  async recordDecision(n: NewDecisionSnapshot): Promise<DecisionRecord> {
+    const [row] = await this.run<DecisionRow>(
+      `INSERT INTO ${this.s}.decisions (tenant_id, movement_id, decided_at, snapshot)
+       VALUES ($1, $2, $3, $4::json)
+       ON CONFLICT ON CONSTRAINT decisions_unique
+       DO UPDATE SET decided_at = excluded.decided_at, snapshot = excluded.snapshot
+       RETURNING *`,
+      [n.tenantId, n.movementId, n.decidedAt, JSON.stringify(n.snapshot)],
+    )
+    return toDecisionRecord(row!)
   }
 
   async postJournalEntry(n: NewJournalEntry): Promise<JournalEntry> {
