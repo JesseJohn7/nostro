@@ -210,4 +210,218 @@ describe('the OpenAPI document', () => {
     expect(res.json().muxedId).toMatch(/^[0-9]+$/)
     expect(BigInt(res.json().muxedId) > 0n).toBe(true)
   })
+
+  it('produces every event type through the store and API, and validates each against its schema', async () => {
+    const store = new MemoryStore()
+    const server = createServer({ store, authenticate: apiKeys({ [KEY]: 'acme' }) })
+    await server.ready()
+
+    const doc = buildOpenApi()
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    addFormats(ajv)
+    ajv.addSchema({ $id: 'nostro', components: doc.components })
+
+    // 1. insertExpectation -> expectation.created
+    const expRes = await server.inject({
+      method: 'POST',
+      url: '/v1/expectations',
+      headers,
+      payload: { reference: 'INV-EVENT-1', account: A, amount: '10' },
+    })
+    expect(expRes.statusCode).toBe(201)
+    const exp = expRes.json()
+
+    // 2. insertMovements -> movement.recorded
+    const { inserted } = await store.transaction((tx) =>
+      tx.insertMovements([
+        {
+          tenantId: 'acme',
+          network: 'testnet',
+          source: 'horizon',
+          externalId: 'ext-evt-1',
+          account: A,
+          direction: 'credit',
+          kind: 'transfer',
+          amount: Money.parse('10', NATIVE),
+          ledger: 100,
+          occurredAt: new Date('2026-10-01T00:00:00Z'),
+        },
+      ]),
+    )
+    const mov = inserted[0]!
+
+    // 3. allocate partial -> expectation.partially_paid
+    await store.transaction(async (tx) => {
+      await tx.allocate({ tenantId: 'acme', movementId: mov.id, expectationId: exp.id, amount: Money.parse('4', NATIVE) })
+    })
+
+    // 4. allocate settled -> expectation.settled
+    await store.transaction(async (tx) => {
+      await tx.allocate({ tenantId: 'acme', movementId: mov.id, expectationId: exp.id, amount: Money.parse('6', NATIVE) })
+    })
+
+    // 5. setDisposition -> movement.decided
+    await store.transaction(async (tx) => {
+      await tx.setDisposition('acme', mov.id, 'allocated')
+    })
+
+    // 6. openException -> exception.opened
+    const ex1 = await store.transaction((tx) =>
+      tx.openException({ tenantId: 'acme', code: 'AMBIGUOUS_MATCH', movementId: mov.id, detail: 'ex-1' }),
+    )
+    const ex2 = await store.transaction((tx) =>
+      tx.openException({ tenantId: 'acme', code: 'MEMO_MISSING', movementId: mov.id, detail: 'ex-2' }),
+    )
+
+    // 7. resolveException -> exception.resolved
+    await store.transaction((tx) =>
+      tx.resolveException('acme', ex1.id, { status: 'resolved', note: 'fixed' }),
+    )
+
+    // 8. resolveException dismissed -> exception.dismissed
+    await store.transaction((tx) =>
+      tx.resolveException('acme', ex2.id, { status: 'dismissed', note: 'ignored' }),
+    )
+
+    // 9. cancel expectation -> expectation.cancelled
+    const expCancelRes = await server.inject({
+      method: 'POST',
+      url: '/v1/expectations',
+      headers,
+      payload: { reference: 'INV-CANCEL', account: A, amount: '5' },
+    })
+    const expToCancel = expCancelRes.json()
+    const cancelRes = await server.inject({
+      method: 'POST',
+      url: `/v1/expectations/${expToCancel.id}/cancel`,
+      headers,
+      payload: { reason: 'not needed' },
+    })
+    expect(cancelRes.statusCode).toBe(200)
+
+    // 10. amend expectation -> expectation.amended
+    const amendRes = await server.inject({
+      method: 'POST',
+      url: `/v1/expectations/${exp.id}/amend`,
+      headers,
+      payload: { reason: 'corrected reference', amount: '12', muxedId: null },
+    })
+    expect(amendRes.statusCode).toBe(200)
+
+    // 11. postJournalEntry -> journal.posted
+    await store.transaction((tx) =>
+      tx.postJournalEntry({
+        tenantId: 'acme',
+        movementId: mov.id,
+        postingNo: 1,
+        kind: 'initial',
+        description: 'Journal entry for event test',
+        lines: [
+          { account: 'cash', role: 'cash', side: 'debit', amount: mov.amount },
+          { account: 'unapplied', role: 'unapplied', side: 'credit', amount: mov.amount },
+        ],
+      }),
+    )
+
+    // Fetch all events via API
+    const eventsRes = await server.inject({ method: 'GET', url: '/v1/events?limit=50', headers })
+    expect(eventsRes.statusCode).toBe(200)
+    const events = eventsRes.json().data as Array<{ type: string; [k: string]: unknown }>
+
+    const schemaMap: Record<string, string> = {
+      'movement.decided': 'MovementDecidedEvent',
+      'expectation.partially_paid': 'ExpectationPartiallyPaidEvent',
+      'expectation.settled': 'ExpectationSettledEvent',
+      'expectation.cancelled': 'ExpectationCancelledEvent',
+      'expectation.amended': 'ExpectationAmendedEvent',
+      'exception.opened': 'ExceptionOpenedEvent',
+      'exception.resolved': 'ExceptionResolvedEvent',
+      'exception.dismissed': 'ExceptionDismissedEvent',
+      'expectation.created': 'ExpectationCreatedEvent',
+      'movement.recorded': 'MovementRecordedEvent',
+      'journal.posted': 'JournalPostedEvent',
+    }
+
+    const seen = new Set(events.map((e) => e.type))
+    for (const type of Object.keys(schemaMap)) {
+      expect(seen.has(type), `event type ${type} was produced`).toBe(true)
+    }
+
+    const validateEvent = ajv.compile(asSchema(doc.components.schemas.Event))
+    for (const event of events) {
+      expect(validateEvent(event), `Event schema validates ${event.type}: ${ajv.errorsText(validateEvent.errors)}`).toBe(true)
+      const specificSchemaName = schemaMap[event.type]!
+      const validateSpecific = ajv.compile(asSchema((doc.components.schemas as Record<string, object>)[specificSchemaName]!))
+      expect(validateSpecific(event), `${specificSchemaName} validates: ${ajv.errorsText(validateSpecific.errors)}`).toBe(true)
+      ajv.removeSchema(asSchema((doc.components.schemas as Record<string, object>)[specificSchemaName]!))
+    }
+  })
+
+  it('fails contract validation when an event payload is modified or corrupted', async () => {
+    const doc = buildOpenApi()
+    const ajv = new Ajv2020({ strict: false, allErrors: true })
+    addFormats(ajv)
+    ajv.addSchema({ $id: 'nostro', components: doc.components })
+
+    const validateDecided = ajv.compile(asSchema((doc.components.schemas as Record<string, object>).MovementDecidedEvent!))
+    const validateUnion = ajv.compile(asSchema(doc.components.schemas.Event))
+
+    const validEvent = {
+      id: 'evt-1',
+      seq: 1,
+      type: 'movement.decided',
+      subjectId: 'mov-1',
+      createdAt: '2026-10-01T00:00:00.000Z',
+      data: {
+        movement: {
+          id: 'mov-1',
+          seq: 1,
+          network: 'testnet',
+          source: 'horizon',
+          externalId: 'ext-1',
+          revision: 1,
+          account: A,
+          entityId: null,
+          direction: 'credit',
+          kind: 'transfer',
+          amount: '10.0000000',
+          asset: 'native',
+          counterparty: null,
+          muxedId: null,
+          memo: null,
+          ledger: 100,
+          txHash: null,
+          operationId: null,
+          occurredAt: '2026-10-01T00:00:00.000Z',
+          enrichment: 'complete',
+          disposition: 'allocated',
+          ignoredReason: null,
+          createdAt: '2026-10-01T00:00:00.000Z',
+        },
+        previous: 'pending',
+        allocations: [],
+      },
+    }
+
+    expect(validateDecided(validEvent)).toBe(true)
+    expect(validateUnion(validEvent)).toBe(true)
+
+    // Corrupt the payload: remove a required field
+    const missingPrevious = structuredClone(validEvent) as any
+    delete missingPrevious.data.previous
+    expect(validateDecided(missingPrevious)).toBe(false)
+    expect(validateUnion(missingPrevious)).toBe(false)
+
+    // Corrupt the payload: invalid field value
+    const badDisposition = structuredClone(validEvent) as any
+    badDisposition.data.previous = 'invalid_disposition'
+    expect(validateDecided(badDisposition)).toBe(false)
+    expect(validateUnion(badDisposition)).toBe(false)
+
+    // Corrupt the payload: add unexpected field under closed schema
+    const extraField = structuredClone(validEvent) as any
+    extraField.data.unexpectedField = 'surprise'
+    expect(validateDecided(extraField)).toBe(false)
+    expect(validateUnion(extraField)).toBe(false)
+  })
 })

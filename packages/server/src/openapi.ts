@@ -26,6 +26,50 @@ const errors = {
   '500': problem('Something failed inside the server (`internal`); the detail says nothing more.'),
 }
 
+function webhookOp(eventType: string, schemaName: string, summary: string) {
+  return {
+    post: {
+      summary,
+      parameters: [
+        {
+          name: 'Nostro-Signature',
+          in: 'header',
+          required: true,
+          schema: { type: 'string' },
+          description: 'HMAC-SHA256 signature: t=<unix_timestamp>,v1=<hex_signature>',
+        },
+        {
+          name: 'Nostro-Event-Id',
+          in: 'header',
+          required: true,
+          schema: { type: 'string' },
+          description: 'Unique event identifier',
+        },
+        {
+          name: 'Nostro-Event-Type',
+          in: 'header',
+          required: true,
+          schema: { type: 'string', const: eventType },
+          description: 'The event type',
+        },
+      ],
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: ref(schemaName),
+          },
+        },
+      },
+      responses: {
+        '200': {
+          description: 'The event was received and stored; any 2xx status acknowledges receipt.',
+        },
+      },
+    },
+  }
+}
+
 /** Each property of a querystring schema, as an OpenAPI query parameter. */
 function parameters(schema: { properties: Record<string, object> }) {
   return Object.entries(schema.properties).map(([name, s]) => ({ name, in: 'query', required: false, schema: s }))
@@ -471,6 +515,19 @@ export function buildOpenApi() {
           },
         },
       },
+    },
+    webhooks: {
+      'movement.decided': webhookOp('movement.decided', 'MovementDecidedEvent', "A movement's disposition changed"),
+      'expectation.partially_paid': webhookOp('expectation.partially_paid', 'ExpectationPartiallyPaidEvent', 'An allocation part-paid an expectation'),
+      'expectation.settled': webhookOp('expectation.settled', 'ExpectationSettledEvent', 'An allocation paid an expectation in full'),
+      'expectation.cancelled': webhookOp('expectation.cancelled', 'ExpectationCancelledEvent', 'An expectation was cancelled'),
+      'expectation.amended': webhookOp('expectation.amended', 'ExpectationAmendedEvent', 'An expectation was amended'),
+      'exception.opened': webhookOp('exception.opened', 'ExceptionOpenedEvent', 'An exception was opened'),
+      'exception.resolved': webhookOp('exception.resolved', 'ExceptionResolvedEvent', 'An exception was resolved'),
+      'exception.dismissed': webhookOp('exception.dismissed', 'ExceptionDismissedEvent', 'An exception was dismissed'),
+      'expectation.created': webhookOp('expectation.created', 'ExpectationCreatedEvent', 'A new expectation was recorded'),
+      'movement.recorded': webhookOp('movement.recorded', 'MovementRecordedEvent', 'A new movement was ingested'),
+      'journal.posted': webhookOp('journal.posted', 'JournalPostedEvent', 'A journal entry was posted'),
     },
     components: {
       securitySchemes: {
