@@ -1,6 +1,6 @@
 import type { ExpectationStatus } from '@nostro-labs/nostro'
 import { isAccountId, sumAmounts } from '@nostro-labs/nostro'
-import { COMMON, UsageError, flag, integer, positionals, string, tenant } from '../args.js'
+import { COMMON, UsageError, afterSeq, integer, machineFormat, positionals, string, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
 import { assetLabel, expectationWithPaid, when } from '../format.js'
@@ -18,12 +18,23 @@ Options:
   --status <s,...>    open, partially_paid, settled and/or cancelled (default: all)
   --account <G...>    Only this account's
   --limit <n>         At most this many (default 100)
+  --after <seq>       Only records after this seq: pass the last seq of the previous page
+  --jsonl             One JSON record per line, for streaming; --json prints one array
 ${COMMON_HELP}`,
-  options: { ...COMMON, status: { type: 'string' }, account: { type: 'string' }, limit: { type: 'string' } },
+  options: {
+    ...COMMON,
+    status: { type: 'string' },
+    account: { type: 'string' },
+    limit: { type: 'string' },
+    after: { type: 'string' },
+    jsonl: { type: 'boolean' },
+  },
   async run(args, io) {
     positionals(args, 0)
     const tenantId = tenant(args, io)
     const limit = integer(args, 'limit', 100, 1, 10_000)
+    const after = afterSeq(args)
+    const format = machineFormat(args)
     const status = string(args, 'status')?.split(',') as ExpectationStatus[] | undefined
     for (const s of status ?? []) {
       if (!STATUSES.includes(s)) throw new UsageError(`--status takes ${STATUSES.join(', ')}; not ${JSON.stringify(s)}.`)
@@ -35,6 +46,7 @@ ${COMMON_HELP}`,
       const list = await store.listExpectations({
         tenantId,
         limit,
+        ...(after === undefined ? {} : { afterSeq: after }),
         ...(status === undefined ? {} : { status }),
         ...(account === undefined ? {} : { account }),
       })
@@ -46,7 +58,11 @@ ${COMMON_HELP}`,
       return out
     })
 
-    if (flag(args, 'json')) {
+    if (format === 'jsonl') {
+      await write(io.stdout, rows.map(({ e, paid }) => `${JSON.stringify(expectationWithPaid(e, paid))}\n`).join(''))
+      return 0
+    }
+    if (format === 'json') {
       await write(io.stdout, json(rows.map(({ e, paid }) => expectationWithPaid(e, paid))))
       return 0
     }

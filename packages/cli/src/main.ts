@@ -4,7 +4,9 @@
  * when the command line itself was wrong.
  */
 import { readFileSync } from 'node:fs'
+import { HorizonError } from '@nostro-labs/nostro'
 import { CliError, UsageError, parse } from './args.js'
+import type { ErrorCode } from './args.js'
 import type { Command } from './command.js'
 import { chart } from './commands/chart.js'
 import { doctor } from './commands/doctor.js'
@@ -18,6 +20,7 @@ import { amend } from './commands/amend.js'
 import { exportJournal } from './commands/export.js'
 import { journalCommand } from './commands/journal.js'
 import { migrate } from './commands/migrate.js'
+import { movements } from './commands/movements.js'
 import { open } from './commands/open.js'
 import { post } from './commands/post.js'
 import { pruneEventsCommand } from './commands/prune-events.js'
@@ -28,6 +31,7 @@ import { scheduleCommand } from './commands/schedule.js'
 import { report } from './commands/report.js'
 import { resolve } from './commands/resolve.js'
 import { serve } from './commands/serve.js'
+import { show } from './commands/show.js'
 import { sync } from './commands/sync.js'
 import type { Io } from './io.js'
 import { clean, write } from './io.js'
@@ -46,6 +50,8 @@ export const COMMANDS: readonly Command[] = [
   replay,
   scheduleCommand() as unknown as Command,
   exceptions,
+  movements,
+  show,
   resolve,
   post,
   period,
@@ -80,10 +86,20 @@ nostro never signs a transaction and never needs a secret key.
 `
 }
 
+/** The stable code a script can branch on. See the CLI README for the list. */
+function errorCode(error: Error): ErrorCode {
+  if (error instanceof UsageError) return 'usage'
+  if (error instanceof CliError) return error.code
+  if (error instanceof HorizonError) return 'horizon'
+  return 'internal'
+}
+
 const helpFor = (c: Command) => `Usage: nostro ${c.name} ${c.usage}\n\n${c.summary}.\n\n${c.help}\n`
 
 export async function main(argv: readonly string[], io: Io): Promise<number> {
   const [name, ...rest] = argv
+  // Read before parsing, so a usage error in --json mode is still reported as JSON.
+  const wantsJson = rest.includes('--json')
   try {
     if (name === undefined) {
       await write(io.stderr, overview())
@@ -113,6 +129,11 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
     return await command.run(args, io)
   } catch (err) {
     const error = err instanceof Error ? err : new Error(String(err))
+    if (wantsJson) {
+      await write(io.stderr, `${JSON.stringify({ error: { code: errorCode(error), message: error.message } })}
+`)
+      return error instanceof UsageError ? 2 : 1
+    }
     // A message may span lines; anything else that could drive the terminal is escaped.
     const lines = (text: string) => text.split('\n').map(clean).join('\n')
     const message = lines(error.message)

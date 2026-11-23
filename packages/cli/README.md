@@ -71,3 +71,26 @@ such as a memo, is printed with control characters escaped, so it cannot rewrite
 nostro never signs a transaction and never needs a secret key.
 
 **Status:** 0.1.0, early: tested, and run against real testnet accounts, but the API may change before 1.0.
+
+## JSON output
+
+With `--json`, a command prints JSON on stdout and nothing else. A failure prints one JSON object on
+stderr instead of text:
+
+```json
+{"error":{"code":"schema_mismatch","message":"..."}}
+```
+
+Codes: `usage` (exit 2), `no_database`, `schema_mismatch`, `horizon`, `failed` and `internal` (exit 1).
+Scripts should branch on `code`, not on `message`, which is for people and may change.
+
+Lists take `--after <seq>`, which returns only records after that `seq`. To page through a list, pass
+the `seq` of the last record you received; a page shorter than `--limit` is the last one. `exceptions`
+and `expectations` also take `--jsonl`, one JSON record per line, for streaming. `--json` and `--jsonl`
+cannot be combined.
+
+The shapes are described in `schemas/output.schema.json` (JSON Schema 2020-12, shipped in the package).
+
+What counts as a breaking change: removing or renaming a field, changing an existing field's type, or
+renaming an error code. Adding a field or an error code is not breaking. Breaking changes are listed in
+CHANGELOG.md.

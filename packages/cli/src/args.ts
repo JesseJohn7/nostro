@@ -17,9 +17,18 @@ export class UsageError extends Error {
   }
 }
 
+/**
+ * Stable reasons a command can fail with, for scripts reading `--json` errors.
+ * Adding a code is not breaking; renaming or removing one is.
+ */
+export type ErrorCode = "usage" | "no_database" | "schema_mismatch" | "horizon" | "failed" | "internal";
+
 /** The command could not do what was asked, for a reason the message explains. Exit status 1. */
 export class CliError extends Error {
-  constructor(message: string) {
+  constructor(
+    message: string,
+    readonly code: ErrorCode = "failed",
+  ) {
     super(message);
     this.name = "CliError";
   }
@@ -238,4 +247,24 @@ export function date(args: Args, name: string): Date | undefined {
     );
   }
   return at;
+}
+
+/** A page cursor: the `seq` of the last record a previous page printed. */
+export function afterSeq(args: Args): number | undefined {
+  const raw = string(args, "after");
+  if (raw === undefined) return undefined;
+  if (!/^\d+$/.test(raw) || Number(raw) > Number.MAX_SAFE_INTEGER) {
+    throw new UsageError(`--after takes the seq of the last record from a previous page; not ${JSON.stringify(raw)}.`);
+  }
+  return Number(raw);
+}
+
+/** `--json` (one array) or `--jsonl` (one record per line); undefined for text. */
+export function machineFormat(args: Args): "json" | "jsonl" | undefined {
+  if (flag(args, "json") && flag(args, "jsonl")) {
+    throw new UsageError("Give --json or --jsonl, not both.");
+  }
+  if (flag(args, "jsonl")) return "jsonl";
+  if (flag(args, "json")) return "json";
+  return undefined;
 }
