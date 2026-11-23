@@ -163,3 +163,11 @@ retention watermark receives HTTP `410 event_history_pruned` with the highest pr
 `detail`; resume from that sequence. A newly registered webhook consumer starts at the current
 retention watermark and receives events retained from that point onward. Existing consumers keep
 their stored positions.
+
+## CLI consumer
+
+`nostro events` reads the same outbox as webhooks. It prints JSON Lines, can follow for new events,
+filter by `--type`, and optionally run `--exec <cmd> -- <args...>` per event. The command receives the
+event JSON on stdin and metadata in `NOSTRO_EVENT_ID`, `NOSTRO_EVENT_TYPE`, and `NOSTRO_EVENT_SEQ`;
+event data is never passed as argv. Cursor advancement is CAS-based and only happens on successful
+processing (exit 0 for `--exec`), so delivery is at-least-once. Consumers must dedupe on event `id`.

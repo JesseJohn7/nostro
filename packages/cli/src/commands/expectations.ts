@@ -1,5 +1,5 @@
 import type { ExpectationStatus } from '@nostro-labs/nostro'
-import { isAccountId, sumAmounts } from '@nostro-labs/nostro'
+import { isAccountId, isValidAccountId, muxedAddress, sumAmounts } from '@nostro-labs/nostro'
 import { COMMON, UsageError, flag, integer, positionals, string, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
@@ -30,6 +30,7 @@ ${COMMON_HELP}`,
     }
     const account = string(args, 'account')
     if (account !== undefined && !isAccountId(account)) throw new UsageError('--account must be a G... account id.')
+    if (account !== undefined && !isValidAccountId(account)) throw new UsageError('--account has an invalid checksum; check the account id.')
 
     const rows = await withStore(args, io, async (store) => {
       const list = await store.listExpectations({
@@ -57,7 +58,7 @@ ${COMMON_HELP}`,
     await write(
       io.stdout,
       table([
-        ['REFERENCE', 'STATUS', 'AMOUNT', 'PAID', 'ASSET', 'DUE', 'ACCOUNT'],
+        ['REFERENCE', 'STATUS', 'AMOUNT', 'PAID', 'ASSET', 'DUE', 'ACCOUNT', 'M ADDRESS'],
         ...rows.map(({ e, paid }) => [
           e.reference,
           e.direction === 'debit' ? `${e.status} (debit)` : e.status,
@@ -66,6 +67,7 @@ ${COMMON_HELP}`,
           assetLabel(e.amount.asset),
           when(e.dueAt).slice(0, 10),
           e.account,
+          e.muxedId === null ? '' : muxedAddress(e.account, e.muxedId),
         ]),
       ]),
     )
