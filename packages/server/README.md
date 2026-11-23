@@ -37,6 +37,8 @@ await app.listen({ port: 8080 })
 | `GET /v1/accounts` | the watched accounts, each with its sync state per network and source: saved cursor, last attempt and success, whether caught up, and the last error |
 | `POST /v1/accounts` | `{ "account": "G..." }` starts syncing it on the next round; `201`, or `200` if already watched |
 | `DELETE /v1/accounts/{account}` | stops syncing it; its movements, expectations and cursor are kept. `409` `config_managed` for an account from the service configuration; `409` `has_open_expectations` unless `?force=true` |
+| `POST /v1/rounds` | ask serve to run a round now: `{ "account": "G..." }` (optional); `202` with `Location`, `429` if rate limited, `501` if hook not configured |
+| `GET /v1/rounds/{id}` | reports round status (`queued`, `running`, `done`, `failed`) and summary report |
 | `GET /v1/webhooks` | every webhook consumer, with position, lag and last outcomes |
 | `GET /v1/webhooks/{consumer}/status` | one consumer's position, lag, last attempt, success and failure |
 | `GET /v1/webhooks/{consumer}/attempts` | `?outcome=success\|failure`, `?limit=`, `?after=`; attempts, newest first |
@@ -65,6 +67,7 @@ await app.listen({ port: 8080 })
   `invalid_expectation` (422, e.g. an amount with more decimals than the asset has),
   `invalid_resolution` (422), `resolution_refused` (409, the rules refuse it),
   `consumer_position_conflict` (409), `invalid_replay` (422), `event_history_pruned` (410),
+  `too_many_requests` (429), `not_supported` (501),
   `internal`. A
   query parameter or body field the API does not know is a 400, not silently ignored. A 500 says
   nothing about the server's insides.

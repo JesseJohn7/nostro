@@ -357,7 +357,17 @@ const PROBLEM_CODES: readonly ProblemCode[] = [
   'config_managed',
   'has_open_expectations',
   'internal',
+  'not_supported',
+  'too_many_requests',
 ]
+
+export const createRoundBody = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    account: { type: 'string', pattern: ACCOUNT },
+  },
+} as const
 
 /** A `G...` account, the only kind the watch list takes. */
 export const accountBody = {
@@ -749,6 +759,26 @@ export const components = {
     sync: { type: 'array', items: ref('SyncState') },
   }),
   WatchedAccountList: record({ data: { type: 'array', items: ref('WatchedAccount') } }),
+  RoundError: record({
+    account: nullable(str),
+    message: str,
+  }),
+  RoundSummary: record({
+    movementsInserted: int,
+    movementsDecided: int,
+    errors: { type: 'array', items: ref('RoundError') },
+  }),
+  Round: record({
+    id: str,
+    tenantId: str,
+    account: nullable(str),
+    state: { enum: ['queued', 'running', 'done', 'failed'] },
+    queuedAt: time,
+    startedAt: nullable(time),
+    finishedAt: nullable(time),
+    summary: nullable(ref('RoundSummary')),
+    error: nullable(str),
+  }),
   ...Object.fromEntries(
     ['Movement', 'Expectation', 'Exception', 'JournalEntry', 'Event', 'DeliveryAttempt'].map((name) => [
       `${name}Page`,

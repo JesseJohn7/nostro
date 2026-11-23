@@ -54,7 +54,13 @@ export async function startServe(cwd: string, argv: readonly string[], options: 
   await until(() => out.stdout.includes('Listening on'))
   const address = /Listening on (\S+) /.exec(out.stdout)![1]!
   const get = async (path: string, key = SERVE_KEY) => fetch(`${address}${path}`, { headers: { authorization: `Bearer ${key}` } })
-  return { out, address, get, until, stop: async () => (stop.abort(), done) }
+  const post = async (path: string, body?: object, key = SERVE_KEY) =>
+    fetch(`${address}${path}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${key}`, ...(body ? { 'content-type': 'application/json' } : {}) },
+      ...(body ? { body: JSON.stringify(body) } : {}),
+    })
+  return { out, address, get, post, until, stop: async () => (stop.abort(), done) }
 }
 
 export async function nostro(cwd: string, argv: readonly string[], options: RunOptions = {}): Promise<Run> {

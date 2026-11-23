@@ -3,7 +3,7 @@
  * server validates requests with. Served at `GET /v1/openapi.json`.
  */
 import { readFileSync } from 'node:fs'
-import { accountParams, batchResolveBody, components, expectationBody, postJournalBody, query, ref, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
+import { accountParams, batchResolveBody, components, createRoundBody, expectationBody, postJournalBody, query, ref, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
 import { ROUTE_SCOPES } from './scopes.js'
 
 /** This package's version, which is the API's. */
@@ -350,6 +350,36 @@ export function buildOpenApi() {
           responses: {
             '200': ok('EventPage'),
             '410': problem('The requested `after` position was pruned; resume after the reported sequence (`event_history_pruned`).'),
+            ...errors,
+          },
+        },
+      },
+      '/v1/rounds': {
+        post: {
+          operationId: 'triggerRound',
+          summary: 'Ask serve to run a sync and reconcile round now',
+          requestBody: { content: { 'application/json': { schema: createRoundBody } } },
+          responses: {
+            '202': {
+              description: 'Round queued or running',
+              headers: { Location: { schema: { type: 'string' } } },
+              content: { 'application/json': { schema: ref('Round') } },
+            },
+            '429': problem('Rate limit exceeded: at most 5 requests per minute per tenant (`too_many_requests`).'),
+            '501': problem('Manual rounds are not supported in this server configuration (`not_supported`).'),
+            ...errors,
+          },
+        },
+      },
+      '/v1/rounds/{id}': {
+        get: {
+          operationId: 'getRound',
+          summary: "Read a round's status and summary report",
+          parameters: [idParam('round')],
+          responses: {
+            '200': ok('Round', 'The round record'),
+            '404': problem('The round was not found or belongs to another tenant (`not_found`).'),
+            '501': problem('Manual rounds are not supported in this server configuration (`not_supported`).'),
             ...errors,
           },
         },

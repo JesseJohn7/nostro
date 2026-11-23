@@ -48,5 +48,7 @@ export const ROUTE_SCOPES: Readonly<Record<string, Scope>> = {
   'POST /v1/chart/move': 'journal',
   'GET /v1/accounts': 'read',
   'POST /v1/accounts': 'accounts',
+  'POST /v1/rounds': 'accounts',
+  'GET /v1/rounds/:id': 'read',
   'DELETE /v1/accounts/:account': 'accounts',
 }

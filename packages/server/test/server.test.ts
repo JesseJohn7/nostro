@@ -6,6 +6,7 @@ import type { Store } from '@nostro-labs/nostro'
 import { HorizonEffectsSource, HorizonFeesSource, JOURNAL_CSV_COLUMNS, MemoryStore, Money, NATIVE, eventCursorKey, reconcile, rewindConsumer, sync } from '@nostro-labs/nostro'
 import { FakeHorizon } from 'nostro-testkit'
 import { apiKeys, createServer } from '../src/index.js'
+import type { RoundRecord, RoundRunner } from '../src/index.js'
 
 const A = `G${'A'.repeat(55)}`
 const B = `G${'B'.repeat(55)}`
@@ -968,5 +969,56 @@ describe('batch exception resolution', () => {
     expect(res.statusCode).toBe(207)
     expect(res.json().applied).toBe(1)
     expect(res.json().errors).toBe(1)
+  })
+})
+
+describe('client-triggered rounds (issue #97)', () => {
+  it('returns 501 not_supported when server has no roundRunner hook', async () => {
+    const store = new MemoryStore()
+    const app = createServer({ store, authenticate: apiKeys({ [ACME_KEY]: 'acme' }) })
+    await app.ready()
+
+    const postRes = await app.inject({ method: 'POST', url: '/v1/rounds', headers: auth(), payload: {} })
+    expect(postRes.statusCode).toBe(501)
+    expect(postRes.json()).toMatchObject({ status: 501, code: 'not_supported' })
+
+    const getRes = await app.inject({ method: 'GET', url: '/v1/rounds/any-id', headers: auth() })
+    expect(getRes.statusCode).toBe(501)
+    expect(getRes.json()).toMatchObject({ status: 501, code: 'not_supported' })
+  })
+
+  it('triggers round, sets Location header, and returns round status and summary', async () => {
+    const store = new MemoryStore()
+    const roundData: RoundRecord = {
+      id: 'round-123',
+      tenantId: 'acme',
+      account: null,
+      state: 'queued',
+      queuedAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      summary: null,
+      error: null,
+    }
+    const mockRunner: RoundRunner = {
+      triggerRound: async (tenantId, account) => ({ id: 'round-123', round: { ...roundData, tenantId, account: account ?? null } }),
+      getRound: async (tenantId, id) => (id === 'round-123' && tenantId === 'acme' ? roundData : null),
+    }
+    const app = createServer({ store, authenticate: apiKeys({ [ACME_KEY]: 'acme', [OTHER_KEY]: 'other' }), roundRunner: mockRunner })
+    await app.ready()
+
+    const postRes = await app.inject({ method: 'POST', url: '/v1/rounds', headers: auth(), payload: {} })
+    expect(postRes.statusCode).toBe(202)
+    expect(postRes.headers.location).toBe('/v1/rounds/round-123')
+    expect(postRes.json()).toMatchObject({ id: 'round-123', state: 'queued' })
+
+    const getRes = await app.inject({ method: 'GET', url: '/v1/rounds/round-123', headers: auth() })
+    expect(getRes.statusCode).toBe(200)
+    expect(getRes.json()).toMatchObject({ id: 'round-123', state: 'queued' })
+
+    // Tenant isolation: other tenant cannot read round-123
+    const otherRes = await app.inject({ method: 'GET', url: '/v1/rounds/round-123', headers: auth(OTHER_KEY) })
+    expect(otherRes.statusCode).toBe(404)
+    expect(otherRes.json()).toMatchObject({ status: 404, code: 'not_found' })
   })
 })

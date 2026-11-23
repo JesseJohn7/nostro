@@ -53,7 +53,7 @@ import type { Authenticate, Principal } from './auth.js'
 import { ROUTE_SCOPES } from './scopes.js'
 import { buildOpenApi } from './openapi.js'
 import { HttpProblem } from './problem.js'
-import { UINT64, accountBody, accountParams, amendExpectationBody, batchResolveBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, removeAccountQuery, replayBody, resolveBody, scheduleBody } from './schemas.js'
+import { UINT64, accountBody, accountParams, amendExpectationBody, batchResolveBody, cancelExpectationBody, consumerParams, createRoundBody, expectationBody, idParams, postJournalBody, query, removeAccountQuery, replayBody, resolveBody, scheduleBody } from './schemas.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -64,11 +64,37 @@ declare module 'fastify' {
   }
 }
 
+export interface RoundSummary {
+  readonly movementsInserted: number
+  readonly movementsDecided: number
+  readonly errors: readonly { readonly account?: string | null; readonly message: string }[]
+}
+
+export type RoundState = 'queued' | 'running' | 'done' | 'failed'
+
+export interface RoundRecord {
+  readonly id: string
+  readonly tenantId: string
+  readonly account?: string | null
+  readonly state: RoundState
+  readonly queuedAt: string
+  readonly startedAt?: string | null
+  readonly finishedAt?: string | null
+  readonly summary?: RoundSummary | null
+  readonly error?: string | null
+}
+
+export interface RoundRunner {
+  triggerRound(tenantId: string, account?: string): Promise<{ id: string; round: RoundRecord }>
+  getRound(tenantId: string, id: string): Promise<RoundRecord | null>
+}
+
 export interface ServerOptions {
   readonly store: Store
   readonly authenticate: Authenticate
   /** Passed to Fastify; `false` (the default) for no request log. */
   readonly logger?: FastifyServerOptions['logger']
+  readonly roundRunner?: RoundRunner
 }
 
 const UINT64_MAX = (1n << 64n) - 1n
@@ -308,6 +334,27 @@ export function createServer(options: ServerOptions): FastifyInstance {
         const json = watchedAccountJson(row, [])
         if (already) return reply.code(200).send(json)
         return reply.code(201).header('location', `/v1/accounts/${body.account}`).send(json)
+      })
+
+      v1.post<{ Body: { account?: string } }>('/rounds', { schema: { body: createRoundBody } }, async (request, reply) => {
+        const { tenantId, body } = request
+        if (options.roundRunner === undefined) {
+          throw new HttpProblem(501, 'not_supported', 'Manual rounds are not supported in this server configuration (serve hook not configured).')
+        }
+        const { id, round } = await options.roundRunner.triggerRound(tenantId, body?.account)
+        return reply.code(202).header('location', `/v1/rounds/${id}`).send(round)
+      })
+
+      v1.get<{ Params: { id: string } }>('/rounds/:id', { schema: { params: idParams } }, async (request, reply) => {
+        const { tenantId, params } = request
+        if (options.roundRunner === undefined) {
+          throw new HttpProblem(501, 'not_supported', 'Manual rounds are not supported in this server configuration.')
+        }
+        const round = await options.roundRunner.getRound(tenantId, params.id)
+        if (round === null || round.tenantId !== tenantId) {
+          throw new HttpProblem(404, 'not_found', `Round ${params.id} not found.`)
+        }
+        return reply.code(200).send(round)
       })
 
       v1.delete<{ Params: { account: string }; Querystring: { force?: boolean } }>(

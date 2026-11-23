@@ -3,7 +3,7 @@ import type { AddressInfo } from 'node:net'
 import { resolve } from 'node:path'
 import type { HorizonRateLimit, MovementSource, Store } from '@nostro-labs/nostro'
 import { StreamWatcher, deliverWebhooks, generateExpectations, sweepExpectations } from '@nostro-labs/nostro'
-import type { KeyGrant, Scope } from '@nostro-labs/server'
+import type { KeyGrant, RoundSummary, Scope } from '@nostro-labs/server'
 import { SCOPES, apiKeys, createServer, firstOf, storedKeys } from '@nostro-labs/server'
 import type { StoredKeys } from '@nostro-labs/server'
 import type { Args, Network } from '../args.js'
@@ -16,6 +16,7 @@ import { Limiter, startLoop } from '../serve-loops.js'
 import type { Loop } from '../serve-loops.js'
 import { tenantPlans } from '../serve-tenants.js'
 import type { TenantPlan, Webhook } from '../serve-tenants.js'
+import { RoundManager } from '../rounds.js'
 import { assertCurrent, openStore, redact } from '../store.js'
 import type { StreamProgress } from '../work.js'
 import { reconcileAll, syncAll } from '../work.js'
@@ -215,7 +216,8 @@ SSE accelerator (--sse):
           throw new CliError((err as Error).message)
         }
       }
-      const app = createServer({ store, authenticate })
+      const roundManager = new RoundManager()
+      const app = createServer({ store, authenticate, roundRunner: roundManager })
       await app.listen({ port, host })
       // Fastify reports one loopback address even when bound to every interface; say what was asked for.
       const bound = (app.server.address() as AddressInfo).port
@@ -232,7 +234,7 @@ SSE accelerator (--sse):
         await write(io.stdout, 'No accounts to watch and no webhook: serving the API only.\n')
         await stopped(io.signal)
       } else {
-        await runTenants({ store, plans, interval, deliveryInterval, concurrency, shutdownTimeout, useSse, rate, io })
+        await runTenants({ store, plans, interval, deliveryInterval, concurrency, shutdownTimeout, useSse, rate, roundManager, io })
       }
       await app.close()
       await write(io.stdout, 'Stopped.\n')
@@ -254,6 +256,7 @@ interface RunOptions {
   readonly shutdownTimeout: number
   readonly useSse: boolean
   readonly rate: HorizonRateLimit | undefined
+  readonly roundManager: RoundManager
   readonly io: Io
 }
 
@@ -317,18 +320,27 @@ async function runTenants(o: RunOptions): Promise<void> {
       signal: io.signal,
       step: () =>
         limiter.run(async () => {
-          await generateExpectations({ store, tenantId: id, until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) })
-          if (plan.network === null) {
-            await sweepExpectations({ store, tenantId: id })
-          } else {
-            await syncRound(store, plan, plan.network, sourcesFor(plan.network), io)
+          const activeRound = o.roundManager.onRoundStart(id)
+          try {
+            await generateExpectations({ store, tenantId: id, until: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000) })
+            let summary: RoundSummary = { movementsInserted: 0, movementsDecided: 0, errors: [] }
+            if (plan.network === null) {
+              await sweepExpectations({ store, tenantId: id })
+            } else {
+              summary = await syncRound(store, plan, plan.network, sourcesFor(plan.network), io, activeRound?.account)
+            }
+            o.roundManager.onRoundDone(id, summary)
+            // New events are delivered now, not at the next delivery round.
+            delivery?.wake()
+          } catch (err) {
+            o.roundManager.onRoundFailed(id, err)
+            throw err
           }
-          // New events are delivered now, not at the next delivery round.
-          delivery?.wake()
         }),
       onError: (err) => void warn(`Round failed: ${clean((err as Error).message)}`),
     })
     loops.push(sync)
+    o.roundManager.registerTenant(id, () => sync.wake())
 
     if (o.useSse && plan.network !== null) {
       await line(io.stdout, id, `SSE accelerator enabled on ${plan.network.horizon}.`)
@@ -368,9 +380,17 @@ async function waitUpTo(promise: Promise<unknown>, seconds: number): Promise<boo
  * One sync and reconcile round for a tenant's watched accounts, reporting each
  * stream's failures. What each pull did is recorded, so the API can show it.
  */
-async function syncRound(store: Store, plan: TenantPlan, net: Network, sources: readonly MovementSource[], io: Io): Promise<void> {
+async function syncRound(
+  store: Store,
+  plan: TenantPlan,
+  net: Network,
+  sources: readonly MovementSource[],
+  io: Io,
+  targetAccount?: string | null,
+): Promise<RoundSummary> {
   const id = plan.id
-  const accounts = (await store.listWatchedAccounts(id)).map((w) => w.account)
+  const watched = (await store.listWatchedAccounts(id)).map((w) => w.account)
+  const accounts = targetAccount ? [targetAccount] : watched
   const streams = accounts.length === 0 ? [] : await syncAll({ store, tenantId: id, accounts, sources: [...sources] })
   if (streams.length > 0) await recordSync(store, id, net, streams)
   const totals = await reconcileAll(store, id, 100)
@@ -378,10 +398,18 @@ async function syncRound(store: Store, plan: TenantPlan, net: Network, sources: 
   if (inserted > 0 || totals.decided > 0) {
     await line(io.stdout, id, `synced ${inserted} new movement(s), decided ${totals.decided}.`)
   }
+  const errors: { account?: string; message: string }[] = []
   for (const s of streams) {
-    if (s.error !== null) await line(io.stderr, id, `${s.source} ${s.account}: ${clean(s.error.message)}`)
+    if (s.error !== null) {
+      await line(io.stderr, id, `${s.source} ${s.account}: ${clean(s.error.message)}`)
+      errors.push({ account: s.account, message: s.error.message })
+    }
   }
-  for (const [movementId, error] of totals.errors) await line(io.stderr, id, `Failed on movement ${movementId}: ${clean(error)}`)
+  for (const [movementId, error] of totals.errors) {
+    await line(io.stderr, id, `Failed on movement ${movementId}: ${clean(error)}`)
+    errors.push({ message: `Movement ${movementId}: ${error}` })
+  }
+  return { movementsInserted: inserted, movementsDecided: totals.decided, errors }
 }
 
 /** Record where each stream stands after this round. A failed pull keeps the last time it succeeded. */

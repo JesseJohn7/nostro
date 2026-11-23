@@ -155,4 +155,81 @@ describe('nostro serve', () => {
     expect((await run(['--webhook-url', 'ftp://hooks.example'])).stderr).toContain('must be an http(s) URL')
     expect((await nostro(await migrated(), ['serve', '--db', 'missing.db'], { env })).stderr).toContain('No database at')
   })
+
+  it('runs a round immediately when requested via POST /v1/rounds without waiting for --interval', async () => {
+    const cwd = await migrated()
+    const h = new FakeHorizon()
+    h.payment(10, B, A, '50', { memo: 'INV-ROUND' })
+    await nostro(cwd, ['expect', 'INV-ROUND', '--account', A, '--amount', '50', '--tenant', 'acme'])
+
+    // Long interval (1 hour): serve would never sync on its own without manual trigger
+    const server = await start(cwd, ['--account', A, '--tenant', 'acme', '--interval', '3600'], { fetch: h.fetch })
+
+    const triggerRes = await server.post('/v1/rounds', { account: A })
+    expect(triggerRes.status).toBe(202)
+    const location = triggerRes.headers.get('location')
+    expect(location).toMatch(/^\/v1\/rounds\//)
+    const initial = (await triggerRes.json()) as { id: string; state: string }
+    expect(['queued', 'running']).toContain(initial.state)
+
+    let round: any
+    await server.until(async () => {
+      const res = await server.get(location!)
+      if (res.status !== 200) return false
+      round = await res.json()
+      return round.state === 'done'
+    })
+
+    expect(round.state).toBe('done')
+    expect(round.summary).toMatchObject({
+      movementsInserted: 1,
+      movementsDecided: 1,
+      errors: [],
+    })
+
+    const settled = (await (await server.get('/v1/expectations?status=settled')).json()) as Page
+    expect(settled.data.map((e) => e.reference)).toContain('INV-ROUND')
+    expect(await server.stop()).toBe(0)
+  })
+
+  it('coalesces multiple round requests, enforces per-tenant rate limit, and preserves tenant isolation', async () => {
+    const cwd = await migrated()
+    const OTHER_KEY = 'o'.repeat(64)
+    const server = await start(cwd, ['--account', A, '--tenant', 'acme', '--interval', '3600'], {
+      env: { NOSTRO_API_KEYS: `acme:${KEY},other:${OTHER_KEY}` },
+    })
+
+    // Coalescing: two rapid requests coalesce into the same queued round
+    const [res1, res2] = await Promise.all([
+      server.post('/v1/rounds', { account: A }),
+      server.post('/v1/rounds', { account: A }),
+    ])
+    expect(res1.status).toBe(202)
+    expect(res2.status).toBe(202)
+    const body1 = (await res1.json()) as { id: string }
+    const body2 = (await res2.json()) as { id: string }
+    expect(body1.id).toBe(body2.id)
+
+    // Rate limiting: 5 requests per minute per tenant
+    const res3 = await server.post('/v1/rounds')
+    const res4 = await server.post('/v1/rounds')
+    const res5 = await server.post('/v1/rounds')
+    expect([res3.status, res4.status, res5.status]).toEqual([202, 202, 202])
+
+    // 6th request within a minute exceeds rate limit
+    const res6 = await server.post('/v1/rounds')
+    expect(res6.status).toBe(429)
+    const rateLimited = (await res6.json()) as { code: string }
+    expect(rateLimited.code).toBe('too_many_requests')
+
+    // Tenant isolation: other tenant is not rate limited
+    const otherTrigger = await server.post('/v1/rounds', {}, OTHER_KEY)
+    expect(otherTrigger.status).toBe(202)
+
+    // Tenant isolation: other tenant cannot read acme's round
+    const otherRead = await server.get(`/v1/rounds/${body1.id}`, OTHER_KEY)
+    expect(otherRead.status).toBe(404)
+
+    expect(await server.stop()).toBe(0)
+  })
 })
