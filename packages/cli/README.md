@@ -31,9 +31,38 @@ nostro export --output journal.csv                   # the journal, a row per li
 | `resolve` | Answers an exception: `--apply <reference[=amount]>` (this payment was for that invoice), `--ignore` (not something to reconcile) or `--close`, with a required `--note`. Moves the movement, its exceptions and the journal together. |
 | `post` | Posts to the journal any decision it does not reflect yet, such as one made outside `reconcile`. Idempotent. |
 | `doctor` | Checks invariants I1 and I3 over every record, and with `--attest` I2: each account's recorded movements against its on-chain balance in every asset. Exits 1 if any does not hold. |
-| `export` | Writes the journal as CSV (RFC 4180), with a date range; to stdout, or to `--output`, which it will not overwrite without `--force` and never leaves half-written. |
+| `export` | Writes the journal as CSV (RFC 4180) or, with `movements`, `expectations`, `exceptions` or `allocations`, those records as CSV. Supports a date range; to stdout, or to `--output`, which it will not overwrite without `--force` and never leaves half-written. |
 | `keys` | Creates (`keys create --tenant <id> --label <text> --scopes <list>`, printing the key once), lists (`keys list`, never keys) and revokes (`keys revoke <id>`) the API keys `serve` accepts from the store. A revoked key is refused on its next request, with no restart. |
 | `serve` | Runs the HTTP API ([@nostro-labs/server](../server/README.md)). With `--account`s to watch, syncs and reconciles them every `--interval` seconds; with `--webhook-url`, delivers each decision there, signed ([docs/webhooks.md](../../docs/webhooks.md)). Stops cleanly on Ctrl-C or SIGTERM. |
+
+### Record CSV exports
+
+Bare `nostro export` still writes the journal. Pass a record type to export the underlying records:
+
+```sh
+nostro export movements --from 2026-10-01 --to 2026-11-01 --include-memo --output payments.csv
+```
+
+All record exports use RFC 4180 quoting (CRLF), guard text cells against spreadsheet formulas, write
+to stdout unless `--output` is given, refuse to overwrite without `--force`, and leave no partial
+file on failure. `--from`/`--to` filter in the stream on `occurred_at` for movements, `created_at`
+for expectations and allocations, and `opened_at` for exceptions. Journal-only options (`--format`,
+`--decimals`, the OFX and mapping flags, `--entity` and `--destination`) are refused for these
+exports. Amounts are exact `Money.toString()` strings; `asset` applies to `amount`, `amount_paid`
+and `amount_outstanding` on expectations.
+
+| Export | Columns |
+|---|---|
+| `movements` | `id, seq, external_id, revision, network, source, account, entity_id, direction, kind, amount, asset, counterparty, muxed_id, memo_type, ledger, tx_hash, operation_id, occurred_at, disposition, ignored_reason, created_at`, plus `memo_value` with `--include-memo` |
+| `expectations` | `id, seq, reference, account, direction, amount, asset, amount_paid, amount_outstanding, muxed_id, payers, due_at, expires_at, status, cancel_reason, fingerprint_suffix, metadata, created_at, updated_at` |
+| `exceptions` | `id, seq, code, status, movement_id, expectation_id, account, amount, asset, detail, resolution_note, opened_at, resolved_at` |
+| `allocations` | `id, movement_id, expectation_id, amount, asset, strategy, score, created_at` |
+
+`payers` and `metadata` are JSON arrays/objects in one cell. Memo text is omitted by default;
+`--include-memo` adds the formula-guarded `memo_value` column, with non-printing control characters
+escaped. Movements, expectations and exceptions page by `afterSeq` in bounded reads. Allocations
+have no `seq` or cursor in the store contract, so that export reads the tenant's allocations in one
+list; it cannot be bounded by a resume point.
 
 `serve` accepts keys from the store (`nostro keys create`), and also reads `tenant:key` pairs from
 `NOSTRO_API_KEYS` (comma-separated) or
@@ -71,3 +100,12 @@ such as a memo, is printed with control characters escaped, so it cannot rewrite
 nostro never signs a transaction and never needs a secret key.
 
 **Status:** 0.1.0, early: tested, and run against real testnet accounts, but the API may change before 1.0.
+
+### Events
+
+`nostro events` streams the tenant event log as JSON Lines, using a saved consumer cursor. It supports
+`--after`, `--follow`, `--consumer`, `--type`, and `--exec` (child args after `--`). Filtered-out events
+still advance the consumer position. With `--exec`, event JSON is sent on stdin and
+`NOSTRO_EVENT_ID` / `NOSTRO_EVENT_TYPE` / `NOSTRO_EVENT_SEQ` are set in the environment; the cursor
+advances only on exit status 0. Delivery is at-least-once; consumers should dedupe on event `id`.
+The `webhook` consumer name is reserved for webhook delivery.

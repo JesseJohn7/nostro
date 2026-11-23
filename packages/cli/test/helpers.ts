@@ -4,8 +4,9 @@ import { join } from 'node:path'
 import { afterAll } from 'vitest'
 import { main } from '../src/index.js'
 
-export const A = `G${'A'.repeat(55)}`
-export const B = `G${'B'.repeat(55)}`
+// Checksum-valid test account IDs (strkey ed25519 payload filled with constant bytes).
+export const A = 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF'
+export const B = 'GAAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQDZ7H'
 
 const root = mkdtempSync(join(tmpdir(), 'nostro-cli-'))
 afterAll(() => rmSync(root, { recursive: true, force: true }))

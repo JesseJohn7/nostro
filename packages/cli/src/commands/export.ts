@@ -5,10 +5,14 @@ import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { resolve } from 'node:path'
 import {
+  allocationCsvRows,
+  exceptionCsvRows,
+  expectationCsvRows,
   journalBeancountRows,
   journalCsvRows,
   journalQuickBooksRows,
   journalXeroRows,
+  movementCsvRows,
   parseAsset,
   renderOfx,
   walletStatement,
@@ -20,6 +24,22 @@ import { write } from '../io.js'
 
 // Export formats are files or text streams; --json does not apply.
 const { json: _json, ...options } = COMMON
+
+const RECORD_KINDS = ['movements', 'expectations', 'exceptions', 'allocations'] as const
+type RecordKind = (typeof RECORD_KINDS)[number]
+type ExportKind = 'journal' | RecordKind
+const JOURNAL_ONLY_OPTIONS = [
+  'format',
+  'decimals',
+  'account',
+  'asset',
+  'currency',
+  'entity',
+  'account-map',
+  'commodity-map',
+  'tax-rate',
+  'destination',
+] as const
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -47,18 +67,21 @@ async function readMap(path: string, cwd: string, label: string): Promise<Readon
 
 export const exportJournal: Command = {
   name: 'export',
-  summary: 'Export the journal as CSV, OFX, QuickBooks, Xero or Beancount',
-  usage: '[--format <format>] [--from <date>] [--to <date>] [--output <file>] [options]',
-  help: `Writes journal entries effective in the range. CSV is RFC 4180 with CRLF line endings;
-Beancount is ledger text. Spreadsheet exports guard text cells against formulas. To stdout unless
---output is given. Payer-written memo text is never written.
+  summary: 'Export the journal, movements, expectations, exceptions or allocations',
+  usage: '[movements|expectations|exceptions|allocations] [--from <date>] [--to <date>] [--output <file>] [options]',
+  help: `With no record type, writes journal entries effective in the range as CSV (RFC 4180, CRLF).
+Pass movements, expectations, exceptions or allocations to export those records as CSV instead.
+Spreadsheet exports guard text cells against formulas. To stdout unless --output is given.
+Payer-written memo text is never written unless --include-memo is given with movements.
 
 Options:
-  --format <format>   csv (default), ofx, quickbooks, xero or beancount
-  --decimals <n>     Round CSV amounts to n decimal places (0–38)
-  --from <date>       Entries effective on or after this
-  --to <date>         Entries effective before this
-  --account <G...>    Wallet account to export; required with --format ofx
+  --format <format>   journal only: csv (default), ofx, quickbooks, xero or beancount
+  --decimals <n>     Journal only: round CSV amounts to n decimal places (0–38)
+  --from <date>       On or after this (journal effective date; movements occurred_at;
+                      expectations/allocations created_at; exceptions opened_at)
+  --to <date>         Strictly before this, using the same field as --from
+  --include-memo      Add the memo_value column to movements (default: omitted)
+  --account <G...>    Journal only: wallet account to export; required with --format ofx
   --asset <id>        Full asset id (CODE:ISSUER, or native); required with ofx
   --currency <code>   ISO 4217 code for the OFX CURDEF; required unless the asset code is one
   --entity <id>       Only lines belonging to this entity
@@ -85,13 +108,29 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     entity: { type: 'string' },
     output: { type: 'string' },
     force: { type: 'boolean' },
+    'include-memo': { type: 'boolean' },
     'account-map': { type: 'string' },
     'commodity-map': { type: 'string' },
     'tax-rate': { type: 'string' },
     destination: { type: 'string' },
   },
   async run(args, io) {
-    positionals(args, 0)
+    const kindArg = positionals(args, 1)[0]
+    if (kindArg !== undefined && !(RECORD_KINDS as readonly string[]).includes(kindArg)) {
+      throw new UsageError(`Unknown export type ${JSON.stringify(kindArg)}; use movements, expectations, exceptions or allocations.`)
+    }
+    const kind = (kindArg ?? 'journal') as ExportKind
+    const recordExport = kind !== 'journal'
+    if (recordExport) {
+      for (const name of JOURNAL_ONLY_OPTIONS) {
+        if (string(args, name) !== undefined) throw new UsageError(`--${name} only applies to journal exports.`)
+      }
+      if (kind !== 'movements' && flag(args, 'include-memo')) {
+        throw new UsageError('--include-memo only applies to movements exports.')
+      }
+    } else if (flag(args, 'include-memo')) {
+      throw new UsageError('--include-memo only applies to movements exports.')
+    }
     const tenantId = tenant(args, io)
     const from = date(args, 'from')
     const to = date(args, 'to')
@@ -137,56 +176,82 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     const destination = string(args, 'destination')
     const showBatches = flag(args, 'batches')
     let ofxContent: string | undefined
+    let throughSeq = 0
+    let afterSeq: number | undefined
 
     return withStore(args, io, async (store) => {
-      const mark = destination ? await store.exportGetMark(tenantId, destination) : null
-      const afterSeq = mark === null ? undefined : Number(mark)
-      let throughSeq = afterSeq ?? 0
-      let cursor = afterSeq
-      for (;;) {
-        const page = await store.listJournalEntries({ tenantId, limit: 500,
-          ...(cursor === undefined ? {} : { afterSeq: cursor }),
-          ...(from === undefined ? {} : { effectiveFrom: from }),
-          ...(to === undefined ? {} : { effectiveBefore: to }),
-          ...(entityId === undefined ? {} : { entityId }),
-        })
-        if (page.length === 0) break
-        throughSeq = page[page.length - 1]!.seq
-        cursor = throughSeq
-        if (page.length < 500) break
-      }
-      const base = { store, tenantId, throughSeq,
-        ...(afterSeq === undefined ? {} : { afterSeq }),
-        ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }),
-        ...(entityId === undefined ? {} : { entityId }) }
-
-      const accountMap = accountMapPath === undefined ? undefined : await readMap(accountMapPath, io.cwd, 'account')
-      const commodityMap = commodityMapPath === undefined ? undefined : await readMap(commodityMapPath, io.cwd, 'commodity')
       let rows: AsyncGenerator<string>
-      if (format === 'ofx') {
-        const statement = await walletStatement({
+      let rowNoun: string
+      if (recordExport) {
+        const range = {
           store,
           tenantId,
-          account: ofxAccount!,
-          asset: parseAsset(ofxAsset!),
-          from: from!,
-          to: to!,
-          ...(entityId === undefined ? {} : { entityId }),
-          ...(ofxCurrency === undefined ? {} : { currencyCode: ofxCurrency }),
-        })
-        ofxContent = renderOfx(statement)
-        rows = (async function* () { yield ofxContent! })()
-      } else if (format === 'quickbooks' || format === 'xero') {
-        if (accountMap === undefined) throw new UsageError(`--format ${format} requires --account-map <file>.`)
-        rows =
-          format === 'quickbooks'
-            ? journalQuickBooksRows({ ...base, accountMap })
-            : journalXeroRows({ ...base, accountMap, ...(taxRate === undefined ? {} : { taxRate }) })
-      } else if (format === 'beancount') {
-        if (commodityMap === undefined) throw new UsageError('--format beancount requires --commodity-map <file>.')
-        rows = journalBeancountRows({ ...base, commodityMap })
+          ...(from === undefined ? {} : { from }),
+          ...(to === undefined ? {} : { to }),
+        }
+        if (kind === 'movements') {
+          rows = movementCsvRows({ ...range, ...(flag(args, 'include-memo') ? { includeMemo: true } : {}) })
+          rowNoun = 'movement row(s)'
+        } else if (kind === 'expectations') {
+          rows = expectationCsvRows(range)
+          rowNoun = 'expectation row(s)'
+        } else if (kind === 'exceptions') {
+          rows = exceptionCsvRows(range)
+          rowNoun = 'exception row(s)'
+        } else {
+          rows = allocationCsvRows(range)
+          rowNoun = 'allocation row(s)'
+        }
       } else {
-        rows = journalCsvRows({ ...base, ...(decimals === undefined ? {} : { decimals }) })
+        const mark = destination ? await store.exportGetMark(tenantId, destination) : null
+        afterSeq = mark === null ? undefined : Number(mark)
+        throughSeq = afterSeq ?? 0
+        let cursor = afterSeq
+        for (;;) {
+          const page = await store.listJournalEntries({ tenantId, limit: 500,
+            ...(cursor === undefined ? {} : { afterSeq: cursor }),
+            ...(from === undefined ? {} : { effectiveFrom: from }),
+            ...(to === undefined ? {} : { effectiveBefore: to }),
+            ...(entityId === undefined ? {} : { entityId }),
+          })
+          if (page.length === 0) break
+          throughSeq = page[page.length - 1]!.seq
+          cursor = throughSeq
+          if (page.length < 500) break
+        }
+        const base = { store, tenantId, throughSeq,
+          ...(afterSeq === undefined ? {} : { afterSeq }),
+          ...(from === undefined ? {} : { from }), ...(to === undefined ? {} : { to }),
+          ...(entityId === undefined ? {} : { entityId }) }
+
+        const accountMap = accountMapPath === undefined ? undefined : await readMap(accountMapPath, io.cwd, 'account')
+        const commodityMap = commodityMapPath === undefined ? undefined : await readMap(commodityMapPath, io.cwd, 'commodity')
+        rowNoun = 'journal line(s)'
+        if (format === 'ofx') {
+          const statement = await walletStatement({
+            store,
+            tenantId,
+            account: ofxAccount!,
+            asset: parseAsset(ofxAsset!),
+            from: from!,
+            to: to!,
+            ...(entityId === undefined ? {} : { entityId }),
+            ...(ofxCurrency === undefined ? {} : { currencyCode: ofxCurrency }),
+          })
+          ofxContent = renderOfx(statement)
+          rows = (async function* () { yield ofxContent! })()
+        } else if (format === 'quickbooks' || format === 'xero') {
+          if (accountMap === undefined) throw new UsageError(`--format ${format} requires --account-map <file>.`)
+          rows =
+            format === 'quickbooks'
+              ? journalQuickBooksRows({ ...base, accountMap })
+              : journalXeroRows({ ...base, accountMap, ...(taxRate === undefined ? {} : { taxRate }) })
+        } else if (format === 'beancount') {
+          if (commodityMap === undefined) throw new UsageError('--format beancount requires --commodity-map <file>.')
+          rows = journalBeancountRows({ ...base, commodityMap })
+        } else {
+          rows = journalCsvRows({ ...base, ...(decimals === undefined ? {} : { decimals }) })
+        }
       }
       if (output === undefined) {
         for await (const row of rows) await write(io.stdout, row)
@@ -219,7 +284,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
             ? `Wrote Beancount ledger to ${path}.\n`
             : format === 'ofx'
               ? `Wrote OFX statement to ${path}.\n`
-              : `Wrote ${Math.max(0, chunks - 1)} journal line(s) to ${path}.\n`
+              : `Wrote ${Math.max(0, chunks - 1)} ${rowNoun} to ${path}.\n`
         await write(io.stdout, message)
       }
 
