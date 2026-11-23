@@ -27,6 +27,7 @@ export const ROUTE_SCOPES: Readonly<Record<string, Scope>> = {
   'GET /v1/expectations/by-reference': 'read',
   'GET /v1/expectations/:id': 'read',
   'POST /v1/expectations': 'expectations',
+  'POST /v1/expectations/batch': 'expectations',
   'POST /v1/expectations/:id/cancel': 'expectations',
   'POST /v1/expectations/:id/amend': 'expectations',
   'GET /v1/exceptions': 'read',

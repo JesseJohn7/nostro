@@ -250,6 +250,19 @@ export function buildOpenApi() {
           },
         },
       },
+      '/v1/expectations/batch': {
+        post: {
+          operationId: 'batchCreateExpectations',
+          summary: 'Create or compare up to 1000 expectations',
+          requestBody: { required: true, content: { 'application/json': { schema: { type: 'array', minItems: 1, maxItems: 1000, items: {} } } } },
+          responses: {
+            '200': { description: 'Every item was created or already matched.', content: { 'application/json': { schema: { type: 'object', required: ['data'], properties: { data: { type: 'array', items: { type: 'object' } } } } } } },
+            '207': { description: 'At least one existing expectation conflicts with the submitted fields.' },
+            '413': problem('The request exceeds the batch body limit.'),
+            ...errors,
+          },
+        },
+      },
       '/v1/expectations/by-reference': {
         get: {
           operationId: 'getExpectationByReference',

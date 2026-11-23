@@ -41,6 +41,7 @@ import {
   moveAccount,
   movementJson,
   outboxEventJson,
+  expectationMatches,
   parseAsset,
   postManualEntry,
   replayDecisions,
@@ -536,6 +537,59 @@ export function createServer(options: ServerOptions): FastifyInstance {
         async (request, reply) => {
           const created = await store.transaction((tx) => tx.insertExpectation(toNewExpectation(request.tenantId, request.body)))
           return reply.code(201).header('location', `/v1/expectations/${created.id}`).send(expectationJson(created))
+        },
+      )
+
+      v1.post<{ Body: ExpectationBody[] }>(
+        '/expectations/batch',
+        { bodyLimit: 2 * 1024 * 1024, schema: { body: { type: 'array', minItems: 1, maxItems: 1000, items: {} } } },
+        async ({ tenantId, body }, reply) => {
+          const results = []
+          for (let index = 0; index < body.length; index++) {
+            const item = body[index]!
+            let input: NewExpectation
+            try {
+              onlyStrings(item, `[${index}]`)
+              if (item === null || typeof item !== 'object' || Array.isArray(item) || typeof item.reference !== 'string' || typeof item.account !== 'string' || typeof item.amount !== 'string') {
+                throw invalid('Each item must be an expectation object with string reference, account and amount fields.')
+              }
+              const allowed = new Set(['reference', 'account', 'amount', 'asset', 'direction', 'muxedId', 'memo', 'payers', 'dueAt', 'expiresAt', 'metadata'])
+              const extra = Object.keys(item).find((key) => !allowed.has(key))
+              if (extra !== undefined) throw invalid(`Unknown expectation field ${extra}.`)
+              input = toNewExpectation(tenantId, item)
+            } catch (err) {
+              if (err instanceof HttpProblem || err instanceof ValidationError || err instanceof PrecisionError) {
+                const reference = item !== null && typeof item === 'object' && typeof item.reference === 'string' ? item.reference : null
+                results.push({ index, reference, status: 'invalid', problem: err instanceof HttpProblem ? err.toJSON() : { detail: err.message } })
+                continue
+              }
+              throw err
+            }
+            const current = await store.getExpectationByReference(tenantId, input.reference)
+            if (current !== null) {
+              results.push(expectationMatches(input, current)
+                ? { index, reference: input.reference, status: 'unchanged', expectation: expectationJson(current) }
+                : { index, reference: input.reference, status: 'conflict', expected: expectationJson(current), received: item })
+              continue
+            }
+            try {
+              const created = await store.transaction((tx) => tx.insertExpectation(input))
+              results.push({ index, reference: input.reference, status: 'created', expectation: expectationJson(created) })
+            } catch (err) {
+              if (err instanceof ValidationError || err instanceof PrecisionError) {
+                results.push({ index, reference: input.reference, status: 'invalid', problem: { detail: err.message } })
+                continue
+              }
+              if (!(err instanceof ConstraintError) || err.constraint !== 'expectation_reference_unique') throw err
+              const raced = await store.getExpectationByReference(tenantId, input.reference)
+              if (raced === null) throw err
+              results.push(expectationMatches(input, raced)
+                ? { index, reference: input.reference, status: 'unchanged', expectation: expectationJson(raced) }
+                : { index, reference: input.reference, status: 'conflict', expected: expectationJson(raced), received: item })
+            }
+          }
+          const hasIssue = results.some((result) => result.status === 'conflict' || result.status === 'invalid')
+          return reply.code(hasIssue ? 207 : 200).send({ data: results })
         },
       )
 

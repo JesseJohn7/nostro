@@ -28,6 +28,7 @@ await app.listen({ port: 8080 })
 | `GET /v1/expectations/by-reference` | `?reference=`, lookup by unique reference |
 | `GET /v1/expectations/{id}` | the expectation and its allocations |
 | `POST /v1/expectations` | record one; `201` with `Location`, `409` if the reference is taken |
+| `POST /v1/expectations/batch` | create or compare 1–1000 expectations; request body limit 2 MiB; creates each item independently and returns `207` when any reference has different fields |
 | `GET /v1/exceptions` | `?status=`, `?code=`, `?movementId=`, `?expectationId=` |
 | `GET /v1/exceptions/{id}` | the exception, its movement and its expectation |
 | `POST /v1/exceptions/{id}/resolve` | decide it: `{ "action": "apply", "allocations": [{ "reference": "INV-1" }], "note": "..." }`, `{ "action": "ignore", "note": "..." }` or `{ "action": "close", "note": "..." }`; see [When a person decides](../../docs/matching.md#when-a-person-decides) |
