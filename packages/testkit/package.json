@@ -12,6 +12,7 @@
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
+    "@nostro-labs/store-conformance": "workspace:*",
     "fast-check": "4.10.2"
   },
   "peerDependencies": {

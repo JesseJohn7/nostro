@@ -1,7 +1,8 @@
 import type { ExceptionDecision } from '@nostro-labs/nostro'
-import { ConstraintError, NotFoundError, PrecisionError, ValidationError, decideException, resolutionJson } from '@nostro-labs/nostro'
+import { ConstraintError, NotFoundError, PrecisionError, ValidationError, decideException, decideExceptions, resolutionJson } from '@nostro-labs/nostro'
 import type { Args } from '../args.js'
 import { COMMON, CliError, UsageError, flag, positionals, string, strings, tenant } from '../args.js'
+import { readFileSync } from 'node:fs'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
 import { assetLabel } from '../format.js'
@@ -34,7 +35,7 @@ function decision(args: Args): ExceptionDecision {
 export const resolve: Command = {
   name: 'resolve',
   summary: 'Decide an exception: apply its payment to invoices, ignore it, or close it',
-  usage: '<exception-id> (--apply <reference[=amount]>... | --ignore | --close) --note <why> [options]',
+  usage: '<exception-id> (--apply <reference[=amount]>... | --ignore | --close) --note <why> [options] | --file <decisions.csv> [--mode atomic|row] [options]',
   help: `Answers what "nostro exceptions" asks. The movement, its exceptions and the journal change
 together, in one transaction, and the journal adjustment leaves cash untouched.
 
@@ -48,6 +49,8 @@ Options:
   --ignore            This is not something to reconcile. What was allocated stays allocated
   --close             The exception is dealt with. Refused if an undecided movement depends on it
   --dismiss           With --close: dismissed, rather than resolved
+  --file <path>       CSV with columns: exception id,action,reference[=amount],note
+  --mode <mode>       Batch mode: atomic or row (default atomic)
   --note <why>        Required. Kept with what this closes
 ${COMMON_HELP}`,
   options: {
@@ -56,12 +59,38 @@ ${COMMON_HELP}`,
     ignore: { type: 'boolean' },
     close: { type: 'boolean' },
     dismiss: { type: 'boolean' },
+    file: { type: 'string' },
+    mode: { type: 'string' },
     note: { type: 'string' },
   },
   async run(args, io) {
+    const file = string(args, 'file')
+    const tenantId = tenant(args, io)
+    if (file !== undefined) {
+      const mode = (string(args, 'mode') ?? 'atomic') as 'atomic' | 'row'
+      if (mode !== 'atomic' && mode !== 'row') throw new UsageError('--mode must be atomic or row.')
+      const rows = parseBatchCsv(readFileSync(file, 'utf8'))
+      const report = await withStore(args, io, async (store) => {
+        try {
+          return await decideExceptions({ store, tenantId, decisions: rows, mode })
+        } catch (err) {
+          if (err instanceof ValidationError || err instanceof PrecisionError) throw new UsageError(err.message)
+          throw err
+        }
+      })
+      if (flag(args, 'json')) { await write(io.stdout, json(report)); return report.errors > 0 ? 1 : 0 }
+      let out = ''
+      for (const r of report.results) {
+        if (r.error) out += `${r.index}: ${r.exceptionId} ERROR ${r.error.code} ${clean(r.error.detail)}\n`
+        else out += `${r.index}: ${r.exceptionId} ok${r.result?.alreadyApplied ? ' (already applied)' : ''}\n`
+      }
+      out += `Applied ${report.applied}, errors ${report.errors}.\n`
+      await write(io.stdout, out)
+      return report.errors > 0 ? 1 : 0
+    }
+
     const [exceptionId] = positionals(args, 1)
     if (exceptionId === undefined) throw new UsageError('Give the exception id, from "nostro exceptions".')
-    const tenantId = tenant(args, io)
     const what = decision(args)
 
     const report = await withStore(args, io, async (store) => {
@@ -94,4 +123,43 @@ ${COMMON_HELP}`,
     await write(io.stdout, out)
     return 0
   },
+}
+
+
+function parseBatchCsv(text: string): { exceptionId: string; decision: ExceptionDecision }[] {
+  const lines = text.split(/\r?\n/).filter((l) => l.trim() !== '')
+  if (lines.length === 0) throw new UsageError('The batch file is empty.')
+  const header = splitCsv(lines[0]!).map((s) => s.trim().toLowerCase())
+  const start = header[0] === 'exception id' ? 1 : 0
+  const rows: { exceptionId: string; decision: ExceptionDecision }[] = []
+  for (let i = start; i < lines.length; i++) {
+    const cols = splitCsv(lines[i]!)
+    const exceptionId = cols[0]?.trim() ?? ''
+    const action = (cols[1]?.trim() ?? '') as ExceptionDecision['action']
+    const ref = cols[2]?.trim() ?? ''
+    const note = cols.slice(3).join(',').trim() || cols[2]?.trim() || ''
+    if (!exceptionId || !action) throw new UsageError(`Bad batch row ${i + 1}: need exception id and action.`)
+    if (action === 'apply') {
+      const refs = cols.slice(2, -1).map((s) => s.trim()).filter(Boolean)
+      const n = cols[cols.length - 1]?.trim() ?? ''
+      rows.push({ exceptionId, decision: { action: 'apply', allocations: refs.map(allocation), note: n } as ExceptionDecision })
+    } else if (action === 'ignore') {
+      rows.push({ exceptionId, decision: { action: 'ignore', note: ref || note } as ExceptionDecision })
+    } else if (action === 'close') {
+      rows.push({ exceptionId, decision: { action: 'close', note: ref || note } as ExceptionDecision })
+    } else {
+      throw new UsageError(`Bad batch row ${i + 1}: unknown action ${action}.`)
+    }
+  }
+  return rows
+}
+
+function splitCsv(line: string): string[] {
+  const out: string[] = []; let cur = ''; let q = false
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i]!
+    if (q) { if (c === '"' && line[i + 1] === '"') { cur += '"'; i++ } else if (c === '"') q = false; else cur += c }
+    else { if (c === ',') { out.push(cur); cur = '' } else if (c === '"') q = true; else cur += c }
+  }
+  out.push(cur); return out
 }

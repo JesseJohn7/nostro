@@ -32,6 +32,7 @@ import type { Store, StoreTx } from '../store/index.js'
 import { sumAmounts } from '../store/index.js'
 import type { DecideOptions } from './engine.js'
 import { decide } from './engine.js'
+import { snapshotDecision } from './decisions.js'
 import type { Candidate } from './types.js'
 import { normalizeReference } from './reference.js'
 
@@ -195,7 +196,11 @@ async function decideOne(
     )
   }
 
-  const decision = decide(movement, await candidatesFor(tx, movement), options)
+  const candidates = await candidatesFor(tx, movement)
+  const decision = decide(movement, candidates, options)
+  const decidedAt = new Date()
+  const snapshot = snapshotDecision(movement, candidates, decision, options, decidedAt)
+  await tx.recordDecision({ tenantId, movementId: id, decidedAt, snapshot })
   switch (decision.outcome) {
     case 'ignore':
       await tx.setDisposition(tenantId, id, 'ignored', decision.reason)
@@ -221,6 +226,7 @@ async function decideOne(
         amount: decision.amount,
         strategy: decision.strategy,
         score: decision.score,
+        decision: snapshot,
       })
       if (decision.residual === null) {
         await tx.setDisposition(tenantId, id, 'allocated')

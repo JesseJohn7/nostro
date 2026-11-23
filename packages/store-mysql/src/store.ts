@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import mysql from 'mysql2/promise'
 import type { Pool, PoolConnection } from 'mysql2/promise'
-import type { ResultSetHeader } from 'mysql2'
+import type { ResultSetHeader, RowDataPacket } from 'mysql2'
 import { EventHistoryPrunedError } from '@nostro-labs/nostro'
 import type {
   AccountEntity,
@@ -15,6 +15,8 @@ import type {
   Allocation,
   AllocationQuery,
   CursorKey,
+  DecisionQuery,
+  DecisionRecord,
   DeliveryAttempt,
   DeliveryAttemptQuery,
   Disposition,
@@ -41,6 +43,7 @@ import type {
   NewAccountEntity,
   NewAccountOpening,
   NewAllocation,
+  NewDecisionSnapshot,
   NewEntity,
   NewInternalTransferLink,
   NewException,
@@ -49,12 +52,15 @@ import type {
   NewMovement,
   NewDeliveryAttempt,
   NewOutboxEvent,
+  NewSchedule,
   OutboxEvent,
   Rewind,
   RewindInput,
   RewindQuery,
   PruneEventsResult,
   RefundLink,
+  Schedule,
+  ScheduleQuery,
   RefundQuery,
   Resolution,
   SchemaVersion,
@@ -106,6 +112,7 @@ import type {
   AccountEntityRow,
   AccountOpeningRow,
   AllocationRow,
+  DecisionRow,
   EntityRow,
   InternalTransferLinkRow,
   DeliveryAttemptRow,
@@ -117,8 +124,9 @@ import type {
   MovementRow,
   MovementValuationRow,
   RewindRow,
+  ScheduleRow,
 } from './rows.js'
-import { flag, memoColumns, storedOpeningBalance, toAccountEntity, toAccountOpening, toAllocation, toDeliveryAttempt, toEntity, toEvent, toException, toExpectation, toInternalTransferLink, toJournalEntry, toMovement, toRewind, toValuation } from './rows.js'
+import { flag, memoColumns, storedOpeningBalance, toAccountEntity, toAccountOpening, toAllocation, toDecisionRecord, toDeliveryAttempt, toEntity, toEvent, toException, toExpectation, toInternalTransferLink, toJournalEntry, toMovement, toRewind, toSchedule, toValuation } from './rows.js'
 import { MIGRATIONS, quoteSchema } from './schema.js'
 
 export interface MysqlStoreOptions {
@@ -179,6 +187,11 @@ class Where {
       this.params.push(value)
       this.clauses.push(sql('?'))
     }
+    return this
+  }
+
+  raw(sql: string): this {
+    this.clauses.push(sql)
     return this
   }
 
@@ -312,6 +325,39 @@ class MysqlReader implements StoreReader {
     return (await this.run<AllocationRow>(`SELECT * FROM ${this.s}.allocations${w} ORDER BY seq`, w.params)).map(
       toAllocation,
     )
+  }
+
+  async getSchedule(tenantId: string, id: string): Promise<Schedule | null> {
+    const [row] = await this.run<ScheduleRow>(
+      `SELECT * FROM ${this.s}.schedules WHERE tenant_id = ? AND id = ?`,
+      [tenantId, id],
+    )
+    return row === undefined ? null : toSchedule(row)
+  }
+
+  async listSchedules(query: ScheduleQuery): Promise<Schedule[]> {
+    const w = new Where().add((p) => `tenant_id = ${p}`, query.tenantId)
+    if (query.activeOnly) w.raw('ended_at IS NULL')
+    const sql = `SELECT * FROM ${this.s}.schedules${w} ORDER BY start_at, id${w.limit(query.limit ?? 100)}`
+    return (await this.run<ScheduleRow>(sql, w.params)).map(toSchedule)
+  }
+
+  async getDecision(tenantId: string, movementId: string): Promise<DecisionRecord | null> {
+    const [row] = await this.run<DecisionRow>(
+      `SELECT * FROM ${this.s}.decisions WHERE tenant_id = ? AND movement_id = ?`,
+      [tenantId, movementId],
+    )
+    return row === undefined ? null : toDecisionRecord(row)
+  }
+
+  async listDecisions(q: DecisionQuery): Promise<DecisionRecord[]> {
+    const w = new Where()
+      .add((p) => `tenant_id = ${p}`, q.tenantId)
+      .add((p) => `movement_id = ${p}`, q.movementId)
+      .add((p) => `decided_at >= ${p}`, q.from)
+      .add((p) => `decided_at < ${p}`, q.to)
+    const sql = `SELECT * FROM ${this.s}.decisions${w} ORDER BY seq${w.limit(q.limit)}`
+    return (await this.run<DecisionRow>(sql, w.params)).map(toDecisionRecord)
   }
 
   async getException(tenantId: string, id: string): Promise<ExceptionRecord | null> {
@@ -1207,6 +1253,45 @@ class MysqlTx extends MysqlReader implements StoreTx {
     return next
   }
 
+  async insertSchedule(n: NewSchedule): Promise<Schedule> {
+    const [memoType, memoValue, memoText] = memoColumns(n.memo ?? null)
+    const now = this.now()
+    const id = this.ids()
+    await this.run(
+      `INSERT INTO ${this.s}.schedules (
+         id, tenant_id, reference_pattern, account, direction, asset, decimals, amount,
+         memo_type, memo_value, memo_text, payers, cadence, start_at, end_at, ended_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, n.tenantId, n.referencePattern, n.direction ?? 'credit', n.amount.asset, n.amount.decimals, n.amount.raw.toString(), memoType, memoValue, memoText, JSON.stringify(n.payers ?? []), JSON.stringify(n.cadence), n.startAt, n.endAt ?? null, null, now, now],
+    )
+    const [row] = await this.run<ScheduleRow>(`SELECT * FROM ${this.s}.schedules WHERE id = ?`, [id])
+    return toSchedule(row!)
+  }
+
+  async endSchedule(tenantId: string, id: string, endedAt: Date): Promise<Schedule> {
+    const result = await this.exec(
+      `UPDATE ${this.s}.schedules SET ended_at = ?, updated_at = ? WHERE tenant_id = ? AND id = ?`,
+      [endedAt, this.now(), tenantId, id],
+    )
+    if (result.affectedRows === 0) throw new NotFoundError('expectation', id)
+    const [row] = await this.run<ScheduleRow>(`SELECT * FROM ${this.s}.schedules WHERE tenant_id = ? AND id = ?`, [tenantId, id])
+    return toSchedule(row!)
+  }
+
+  async recordDecision(n: NewDecisionSnapshot): Promise<DecisionRecord> {
+    await this.run(
+      `INSERT INTO ${this.s}.decisions (tenant_id, movement_id, decided_at, snapshot)
+       VALUES (?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE decided_at = VALUES(decided_at), snapshot = VALUES(snapshot)`,
+      [n.tenantId, n.movementId, n.decidedAt, JSON.stringify(n.snapshot)],
+    )
+    const [row] = await this.run<DecisionRow>(
+      `SELECT * FROM ${this.s}.decisions WHERE tenant_id = ? AND movement_id = ?`,
+      [n.tenantId, n.movementId],
+    )
+    return toDecisionRecord(row!)
+  }
+
   async insertExpectation(n: NewExpectation): Promise<Expectation> {
     assertValidNewExpectation(n)
     const taken = () =>
@@ -1395,9 +1480,9 @@ class MysqlTx extends MysqlReader implements StoreTx {
     const id = this.ids()
     await this.run(
       `INSERT INTO ${this.s}.allocations (
-         id, tenant_id, movement_id, expectation_id, asset, decimals, amount, strategy, score, created_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, n.tenantId, m.id, e.id, n.amount.asset, n.amount.decimals, n.amount.raw.toString(), n.strategy, n.score ?? null, now],
+         id, tenant_id, movement_id, expectation_id, asset, decimals, amount, strategy, score, decision, created_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [id, n.tenantId, m.id, e.id, n.amount.asset, n.amount.decimals, n.amount.raw.toString(), n.strategy, n.score ?? null, n.decision == null ? null : JSON.stringify(n.decision), now],
     )
     await this.run(
       `UPDATE ${this.s}.expectations SET status = ?, updated_at = ? WHERE id = ?`,

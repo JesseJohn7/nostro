@@ -9,9 +9,11 @@
  * Tenant ids are left out: whoever is asking already knows which tenant.
  */
 import type { RefundLink } from '../store/store.js'
+import type { Schedule } from './types.js'
 import type { AssetId } from '../money/index.js'
 import type {
   Allocation,
+  DecisionSnapshot,
   Direction,
   Disposition,
   Enrichment,
@@ -90,6 +92,8 @@ export interface AllocationJson {
   readonly asset: AssetId
   readonly strategy: string
   readonly score: number | null
+  /** Why the engine made this allocation; null for manual or migrated rows. */
+  readonly decision: DecisionSnapshot | null
   readonly createdAt: string
 }
 
@@ -198,6 +202,7 @@ export function allocationJson(a: Allocation): AllocationJson {
     asset: a.amount.asset,
     strategy: a.strategy,
     score: a.score,
+    decision: a.decision ?? null,
     createdAt: a.createdAt.toISOString(),
   }
 }
@@ -241,6 +246,42 @@ export function journalEntryJson(j: JournalEntry): JournalEntryJson {
       expectationId: l.expectationId,
       exceptionId: l.exceptionId,
     })),
+  }
+}
+
+export interface ScheduleJson {
+  id: string
+  referencePattern: string
+  account: string
+  direction: Schedule['direction']
+  amount: string
+  asset: string
+  memo: Schedule['memo']
+  payers: readonly string[]
+  cadence: Schedule['cadence']
+  startAt: string
+  endAt: string | null
+  endedAt: string | null
+  createdAt: string
+  updatedAt: string
+}
+
+export function scheduleJson(s: Schedule): ScheduleJson {
+  return {
+    id: s.id,
+    referencePattern: s.referencePattern,
+    account: s.account,
+    direction: s.direction,
+    amount: s.amount.toString(),
+    asset: s.amount.asset,
+    memo: s.memo ?? null,
+    payers: s.payers,
+    cadence: s.cadence,
+    startAt: s.startAt.toISOString(),
+    endAt: iso(s.endAt),
+    endedAt: iso(s.endedAt),
+    createdAt: s.createdAt.toISOString(),
+    updatedAt: s.updatedAt.toISOString(),
   }
 }
 

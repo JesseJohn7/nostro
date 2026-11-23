@@ -293,7 +293,7 @@ if (pool === undefined) {
 
     it('reports a reference taken by a concurrent transaction, and leaves this one usable', async () => {
       const store = await freshStore()
-      const insert = (tx: Parameters<Parameters<PostgresStore['transaction']>[0]>[0]) =>
+      const insert = (tx: StoreTx) =>
         tx.insertExpectation({ tenantId: 't', reference: 'INV-RACE', account: `G${'A'.repeat(55)}`, amount: Money.parse('1', NATIVE) })
       let release!: () => void
       const held = new Promise<void>((r) => (release = r))

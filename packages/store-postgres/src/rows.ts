@@ -4,7 +4,7 @@
  * node-postgres returns `numeric` and `bigint` as strings, which is what we
  * want: they become `bigint` here and never pass through `number`.
  */
-import type { AccountEntity, AccountOpening, Allocation, AssetId, DeliveryAttempt, Entity, ExceptionRecord, Expectation, InternalTransferLink, JournalEntry, JournalLine, Json, Memo, Movement, MovementValuation, OpeningBalance, OutboxEvent, Rewind } from '@nostro-labs/nostro'
+import type { AccountEntity, AccountOpening, Allocation, AssetId, DecisionRecord, DecisionSnapshot, DeliveryAttempt, Entity, ExceptionRecord, Expectation, InternalTransferLink, JournalEntry, JournalLine, Json, Memo, Movement, MovementValuation, OpeningBalance, OutboxEvent, Rewind, Schedule } from '@nostro-labs/nostro'
 import { Money, parseAsset } from '@nostro-labs/nostro'
 
 export interface MovementRow {
@@ -246,7 +246,16 @@ export interface AllocationRow {
   amount: string
   strategy: string
   score: number | null
+  decision: DecisionSnapshot | null
   created_at: Date
+}
+
+export interface DecisionRow {
+  seq: string
+  tenant_id: string
+  movement_id: string
+  decided_at: Date
+  snapshot: DecisionSnapshot
 }
 
 export interface ExceptionRow {
@@ -342,6 +351,46 @@ export function toExpectation(r: ExpectationRow): Expectation {
   })
 }
 
+export interface ScheduleRow {
+  id: string
+  tenant_id: string
+  reference_pattern: string
+  account: string
+  direction: Schedule['direction']
+  asset: string
+  decimals: number
+  amount: string
+  memo_type: Memo['type'] | null
+  memo_value: string | null
+  memo_text: Buffer | null
+  payers: string[]
+  cadence: Schedule['cadence']
+  start_at: Date
+  end_at: Date | null
+  ended_at: Date | null
+  created_at: Date
+  updated_at: Date
+}
+
+export function toSchedule(r: ScheduleRow): Schedule {
+  return Object.freeze({
+    id: r.id,
+    tenantId: r.tenant_id,
+    referencePattern: r.reference_pattern,
+    account: r.account,
+    direction: r.direction,
+    amount: money(r.amount, r.asset, r.decimals),
+    memo: memoOf(r),
+    payers: Object.freeze([...r.payers]),
+    cadence: r.cadence,
+    startAt: r.start_at,
+    endAt: r.end_at,
+    endedAt: r.ended_at,
+    createdAt: r.created_at,
+    updatedAt: r.updated_at,
+  })
+}
+
 export function toAllocation(r: AllocationRow): Allocation {
   return Object.freeze({
     id: r.id,
@@ -351,7 +400,18 @@ export function toAllocation(r: AllocationRow): Allocation {
     amount: money(r.amount, r.asset, r.decimals),
     strategy: r.strategy,
     score: r.score,
+    decision: r.decision ?? null,
     createdAt: r.created_at,
+  })
+}
+
+export function toDecisionRecord(r: DecisionRow): DecisionRecord {
+  return Object.freeze({
+    tenantId: r.tenant_id,
+    movementId: r.movement_id,
+    seq: Number(r.seq),
+    decidedAt: r.decided_at,
+    snapshot: r.snapshot,
   })
 }
 

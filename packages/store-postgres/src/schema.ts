@@ -228,10 +228,22 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       amount         numeric(40, 0) NOT NULL CHECK (amount > 0),
       strategy       text NOT NULL,
       score          double precision CHECK (score BETWEEN 0 AND 1),
+      -- json, not jsonb: the recorded snapshot may quote memo text with \\u0000.
+      decision       json,
       created_at     timestamptz NOT NULL,
       CONSTRAINT allocations_unique UNIQUE (movement_id, expectation_id)
     );
     CREATE INDEX allocations_expectation ON ${s}.allocations (expectation_id);
+
+    CREATE TABLE ${s}.decisions (
+      seq         bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
+      tenant_id   text NOT NULL,
+      movement_id text NOT NULL UNIQUE REFERENCES ${s}.movements (id),
+      decided_at  timestamptz NOT NULL,
+      snapshot    json NOT NULL,
+      CONSTRAINT decisions_unique UNIQUE (tenant_id, movement_id)
+    );
+    CREATE INDEX decisions_range ON ${s}.decisions (tenant_id, decided_at, seq);
 
     CREATE TABLE ${s}.exceptions (
       id              text PRIMARY KEY,
@@ -758,4 +770,42 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
   // Row-level security is available in the schema. Applications opt in by
   // setting the tenant GUC; the migration bypass is set only by migrate().
   (s) => rlsPolicySql(s),
+  // 19: the engine decision behind every automatic allocation and every other
+  // decided disposition, for audit and read-only replay.
+  (s) => `
+    ALTER TABLE ${s}.allocations ADD COLUMN IF NOT EXISTS decision json;
+    CREATE TABLE IF NOT EXISTS ${s}.decisions (
+      seq         bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
+      tenant_id   text NOT NULL,
+      movement_id text NOT NULL UNIQUE REFERENCES ${s}.movements (id),
+      decided_at  timestamptz NOT NULL,
+      snapshot    json NOT NULL,
+      CONSTRAINT decisions_unique UNIQUE (tenant_id, movement_id)
+    );
+    CREATE INDEX IF NOT EXISTS decisions_range ON ${s}.decisions (tenant_id, decided_at, seq);
+  `,
+  (s) => `
+    CREATE TABLE IF NOT EXISTS ${s}.schedules (
+      id                text PRIMARY KEY,
+      tenant_id         text NOT NULL,
+      reference_pattern text NOT NULL,
+      account           text NOT NULL,
+      direction         text NOT NULL CHECK (direction IN ('credit','debit')),
+      asset             text NOT NULL,
+      decimals          integer NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount            text NOT NULL CHECK (amount ~ '^[1-9][0-9]*
+),
+      memo_type         text CHECK (memo_type IN ('text','id','hash','return')),
+      memo_value        text,
+      memo_text         bytea,
+      payers            jsonb NOT NULL,
+      cadence           jsonb NOT NULL,
+      start_at          timestamptz NOT NULL,
+      end_at            timestamptz,
+      ended_at          timestamptz,
+      created_at        timestamptz NOT NULL,
+      updated_at        timestamptz NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS schedules_tenant ON ${s}.schedules (tenant_id, ended_at, start_at);
+  `,
 ]

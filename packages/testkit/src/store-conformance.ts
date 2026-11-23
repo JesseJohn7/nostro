@@ -548,7 +548,25 @@ export function describeStoreConformance(name: string, makeStore: () => Store | 
         for (const inv of invoices) await alloc(wire.id, inv.id, usdc('10'))
         const statuses = await Promise.all(invoices.map((i) => store.getExpectation(T, i.id)))
         expect(statuses.map((s) => s!.status)).toEqual(['settled', 'settled', 'settled'])
-        expect(await store.listAllocations({ tenantId: T, movementId: wire.id })).toHaveLength(3)
+        const allocations = await store.listAllocations({ tenantId: T, movementId: wire.id })
+        expect(allocations).toHaveLength(3)
+        expect(allocations.every((a) => a.decision === null)).toBe(true)
+      })
+
+      it('records and reads decision snapshots', async () => {
+        const m = await record({ memo: { type: 'text', value: 'INV-DECISION' } })
+        const snapshot = {
+          engineVersion: '0.1.0',
+          decidedAt: new Date('2026-10-01T00:00:00Z').toISOString(),
+          options: { threshold: 0.7, margin: 0.15, strategies: ['memo_text'] },
+          inputs: { movement: { id: m.id, seq: m.seq, tenantId: T, network: m.network, source: m.source, externalId: m.externalId, account: m.account, direction: m.direction, kind: m.kind, amount: m.amount.toString(), asset: m.amount.asset, decimals: m.amount.decimals, muxedId: null, memo: { type: 'text', value: 'INV-DECISION' }, occurredAt: m.occurredAt.toISOString(), createdAt: m.createdAt.toISOString() }, candidates: [] },
+          evidence: { outcome: 'exception' },
+          result: { outcome: 'exception', code: 'UNMATCHED_NO_CANDIDATE', expectationId: null, amount: null, detail: 'no candidate' },
+        } as any
+        const rec = await store.transaction((tx) => tx.recordDecision({ tenantId: T, movementId: m.id, decidedAt: new Date('2026-10-01T00:00:00Z'), snapshot }))
+        expect(rec.movementId).toBe(m.id)
+        expect((await store.getDecision(T, m.id))?.snapshot.result).toMatchObject({ outcome: 'exception', code: 'UNMATCHED_NO_CANDIDATE' })
+        expect((await store.listDecisions({ tenantId: T })).map((d) => d.movementId)).toContain(m.id)
       })
 
       it('refuses to over-allocate a movement', async () => {

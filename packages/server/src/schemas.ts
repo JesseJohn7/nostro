@@ -67,6 +67,14 @@ export const query = {
     code: { enum: [...EXCEPTION_CODES] },
   }),
   events: listQuery({}),
+  schedules: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      limit: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
+      activeOnly: { type: 'string', enum: ['true', 'false'] },
+    },
+  } as const,
   webhookAttempts: {
     type: 'object',
     additionalProperties: false,
@@ -81,6 +89,23 @@ export const query = {
     type: 'object',
     additionalProperties: false,
     properties: { ...range, entityId: { type: 'string', minLength: 1, maxLength: 100 } },
+  },
+  decisionReplay: {
+    type: 'object',
+    additionalProperties: false,
+    properties: {
+      from: { type: 'string', format: 'date-time' },
+      to: { type: 'string', format: 'date-time' },
+      threshold: { type: 'number', minimum: 0, maximum: 1 },
+      margin: { type: 'number', minimum: 0, maximum: 1 },
+      strategy: {
+        anyOf: [
+          { type: 'string', minLength: 1 },
+          { type: 'array', items: { type: 'string', minLength: 1 } },
+        ],
+      },
+      limit: { type: 'integer', minimum: 1, maximum: 5000, default: 1000 },
+    },
   },
 } as const
 
@@ -124,7 +149,7 @@ export const expectationBody = {
   },
 } as const
 
-export const resolveBody = {
+const resolveDecision = {
   oneOf: [
     {
       type: 'object',
@@ -166,6 +191,31 @@ export const resolveBody = {
       },
     },
   ],
+} as const
+
+export const resolveBody = resolveDecision
+
+export const batchResolveBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['mode', 'decisions'],
+  properties: {
+    mode: { enum: ['atomic', 'row'] },
+    decisions: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 200,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['exceptionId', 'decision'],
+        properties: {
+          exceptionId: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[^\\u0000]+$' },
+          decision: resolveDecision,
+        },
+      },
+    },
+  },
 } as const
 
 
@@ -371,6 +421,7 @@ export const components = {
     asset: str,
     strategy: str,
     score: nullable({ type: 'number', minimum: 0, maximum: 1 }),
+    decision: nullable({ description: 'Why the engine made this allocation; null for manual or migrated rows.' }),
     createdAt: time,
   }),
   Exception: record({
@@ -457,6 +508,35 @@ export const components = {
     exceptions: { type: 'array', items: ref('Exception') },
     journal: { type: 'array', items: ref('JournalEntry') },
     refunds: { type: 'array', items: ref('RefundLink') },
+    decision: nullable({ description: 'The recorded engine decision snapshot for this movement, or null.' }),
+  }),
+  ExplainDecision: record({
+    movementId: str,
+    status: { enum: ['agree', 'disagree', 'unreplayable'] },
+    engineVersion: str,
+    recordedEngineVersion: str,
+    recorded: nullable({}),
+    current: nullable({}),
+    reason: nullable(str),
+  }),
+  ReplayRow: record({
+    movementId: str,
+    decidedAt: time,
+    recorded: {},
+    proposed: nullable({}),
+    change: { enum: ['none', 'would_settle', 'would_go_to_person', 'would_change_expectation', 'unreplayable'] },
+    laterManual: nullable(record({ expectationId: str, agrees: { type: 'boolean' } })),
+    reason: nullable(str),
+  }),
+  ReplayReport: record({
+    engineVersion: str,
+    replayed: int,
+    unchanged: int,
+    wouldSettle: int,
+    wouldGoToPerson: int,
+    wouldChangeExpectation: int,
+    unreplayable: int,
+    rows: { type: 'array', items: ref('ReplayRow') },
   }),
   ExpectationDetail: record({
     expectation: ref('Expectation'),
@@ -468,6 +548,19 @@ export const components = {
     closed: { type: 'array', items: ref('Exception') },
     opened: nullable(ref('Exception')),
     journalEntry: nullable(ref('JournalEntry')),
+    alreadyApplied: { type: 'boolean' },
+  }),
+  BatchResolveResult: record({
+    index: int,
+    exceptionId: str,
+    result: nullable(ref('Resolution')),
+    error: nullable(record({ code: str, detail: str })),
+  }),
+  BatchResolution: record({
+    mode: { enum: ['atomic', 'row'] },
+    applied: int,
+    errors: int,
+    results: { type: 'array', items: ref('BatchResolveResult') },
   }),
   Problem: record({
     type: { const: 'about:blank' },
@@ -502,3 +595,39 @@ export const components = {
 } as const
 
 export { ref }
+
+
+export const scheduleBody = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['referencePattern','account','amount','cadence','startAt'],
+  properties: {
+    referencePattern: { type: 'string', minLength: 1 },
+    account: { type: 'string', minLength: 1 },
+    amount: { type: 'string', pattern: '^[0-9]+(\\.[0-9]+)?$' },
+    asset: { type: 'string' },
+    direction: { type: 'string', enum: ['credit','debit'] },
+    memo: { type: 'object', additionalProperties: false, required: ['type','value'], properties: { type: { type: 'string', enum: ['text','id','hash','return'] }, value: { type: 'string' } } },
+    payers: { type: 'array', items: { type: 'string' } },
+    cadence: {
+      oneOf: [
+        { type: 'object', additionalProperties: false, required: ['kind'], properties: { kind: { const: 'daily' } } },
+        { type: 'object', additionalProperties: false, required: ['kind','day'], properties: { kind: { const: 'weekly' }, day: { type: 'integer', minimum: 0, maximum: 6 } } },
+        { type: 'object', additionalProperties: false, required: ['kind','day'], properties: { kind: { const: 'monthly' }, day: { type: 'integer', minimum: 1, maximum: 28 } } },
+      ],
+    },
+    startAt: { type: 'string', format: 'date-time' },
+    endAt: { type: 'string', format: 'date-time' },
+  },
+} as const
+
+
+export const schedules = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    after: { type: 'integer', minimum: 0 },
+    limit: { type: 'integer', minimum: 1, maximum: 500, default: 100 },
+    activeOnly: { type: 'string', enum: ['true', 'false'] },
+  },
+} as const

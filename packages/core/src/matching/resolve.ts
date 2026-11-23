@@ -23,7 +23,7 @@ import type { PostOptions } from '../journal/index.js'
 import { postMovement } from '../journal/index.js'
 import type { Allocation, ExceptionCode, ExceptionRecord, JournalEntry, Movement } from '../model/index.js'
 import { ValidationError, allocationJson, exceptionJson, journalEntryJson, movementJson } from '../model/index.js'
-import { Money } from '../money/index.js'
+import { Money, PrecisionError } from '../money/index.js'
 import type { Store, StoreTx } from '../store/index.js'
 import { ConstraintError, NotFoundError, sumAmounts } from '../store/index.js'
 
@@ -38,6 +38,8 @@ export interface ResolutionReport {
   readonly opened: ExceptionRecord | null
   /** The adjustment posted, if the books needed one. */
   readonly journalEntry: JournalEntry | null
+  /** True when a retried row was already in the requested state. */
+  readonly alreadyApplied?: boolean
 }
 
 /** A resolution that acted on a movement, which it always has when it was asked to. */
@@ -80,71 +82,76 @@ async function undecided(tx: StoreTx, tenantId: string, id: string): Promise<Mov
 /** Codes under which what is left is owed back to a known payer, as opposed to unexplained. */
 const OWED_BACK: readonly ExceptionCode[] = ['OVERPAYMENT', 'DUPLICATE_PAYMENT']
 
-export async function applyMovement(options: ApplyOptions): Promise<MovementResolution> {
-  const { store, tenantId, movementId, note } = options
+async function applyMovementTx(tx: StoreTx, options: Omit<ApplyOptions, 'store'>): Promise<MovementResolution> {
+  const { tenantId, movementId, note } = options
   required('note', note)
   if (options.allocations.length === 0) throw new ValidationError('allocations', 'name at least one expectation')
+  const movement = await undecided(tx, tenantId, movementId)
+  const already = await tx.listAllocations({ tenantId, movementId })
+  let left = movement.amount.subtract(sumAmounts(already.map((a) => a.amount), movement.amount))
 
-  return store.transaction(async (tx) => {
-    const movement = await undecided(tx, tenantId, movementId)
-    const already = await tx.listAllocations({ tenantId, movementId })
-    let left = movement.amount.subtract(sumAmounts(already.map((a) => a.amount), movement.amount))
-
-    const allocations: Allocation[] = []
-    for (const { expectationId, amount } of options.allocations) {
-      const expectation = await tx.getExpectation(tenantId, expectationId)
-      if (expectation === null) throw new NotFoundError('expectation', expectationId)
-      let applying = amount
-      if (applying === undefined) {
-        if (expectation.amount.asset !== left.asset || expectation.amount.decimals !== left.decimals) {
-          throw new ConstraintError('allocation_asset', `the movement is in ${left.asset} but ${expectation.reference} is owed in ${expectation.amount.asset}`)
-        }
-        const paid = await tx.listAllocations({ tenantId, expectationId })
-        const owing = expectation.amount.subtract(sumAmounts(paid.map((a) => a.amount), expectation.amount))
-        applying = left.compare(owing) < 0 ? left : owing
-        if (!owing.isPositive()) throw new ConstraintError('allocation_over_expectation', `nothing is left owing on ${expectation.reference}`)
-        if (!left.isPositive()) throw new ConstraintError('allocation_over_movement', `nothing is left of movement ${movementId}`)
+  const allocations: Allocation[] = []
+  for (const { expectationId, amount } of options.allocations) {
+    const expectation = await tx.getExpectation(tenantId, expectationId)
+    if (expectation === null) throw new NotFoundError('expectation', expectationId)
+    let applying = amount
+    if (applying === undefined) {
+      if (expectation.amount.asset !== left.asset || expectation.amount.decimals !== left.decimals) {
+        throw new ConstraintError('allocation_asset', `the movement is in ${left.asset} but ${expectation.reference} is owed in ${expectation.amount.asset}`)
       }
-      allocations.push(
-        await tx.allocate({ tenantId, movementId, expectationId, amount: applying, strategy: 'manual', score: null }),
-      )
-      left = left.subtract(applying)
+      const paid = await tx.listAllocations({ tenantId, expectationId })
+      const owing = expectation.amount.subtract(sumAmounts(paid.map((a) => a.amount), expectation.amount))
+      applying = left.compare(owing) < 0 ? left : owing
+      if (!owing.isPositive()) throw new ConstraintError('allocation_over_expectation', `nothing is left owing on ${expectation.reference}`)
+      if (!left.isPositive()) throw new ConstraintError('allocation_over_movement', `nothing is left of movement ${movementId}`)
     }
+    allocations.push(
+      await tx.allocate({ tenantId, movementId, expectationId, amount: applying, strategy: 'manual', score: null }),
+    )
+    left = left.subtract(applying)
+  }
 
-    const open = await tx.listExceptions({ tenantId, movementId, status: 'open' })
-    const closed: ExceptionRecord[] = []
-    for (const x of open) closed.push(await tx.resolveException(tenantId, x.id, { status: 'resolved', note }))
+  const open = await tx.listExceptions({ tenantId, movementId, status: 'open' })
+  const closed: ExceptionRecord[] = []
+  for (const x of open) closed.push(await tx.resolveException(tenantId, x.id, { status: 'resolved', note }))
 
-    let opened: ExceptionRecord | null = null
-    if (left.isPositive()) {
-      const owedBack = open.find((x) => OWED_BACK.includes(x.code))
-      opened = await tx.openException({
-        tenantId,
-        code: owedBack?.code ?? 'PARTIAL_UNRESOLVED',
-        movementId,
-        account: movement.account,
-        amount: left,
-        detail: `Applied by hand, with ${left.toString()} of ${movement.amount.toString()} left to explain.`,
-        evidence: { note },
-      })
-    }
-    const next = await tx.setDisposition(tenantId, movementId, left.isPositive() ? 'partial' : 'allocated')
-    return { movement: next, allocations, closed, opened, journalEntry: await postMovement(tx, tenantId, movementId, options) }
-  })
+  let opened: ExceptionRecord | null = null
+  if (left.isPositive()) {
+    const owedBack = open.find((x) => OWED_BACK.includes(x.code))
+    opened = await tx.openException({
+      tenantId,
+      code: owedBack?.code ?? 'PARTIAL_UNRESOLVED',
+      movementId,
+      account: movement.account,
+      amount: left,
+      detail: `Applied by hand, with ${left.toString()} of ${movement.amount.toString()} left to explain.`,
+      evidence: { note },
+    })
+  }
+  const next = await tx.setDisposition(tenantId, movementId, left.isPositive() ? 'partial' : 'allocated')
+  return { movement: next, allocations, closed, opened, journalEntry: await postMovement(tx, tenantId, movementId, options) }
+}
+
+export async function applyMovement(options: ApplyOptions): Promise<MovementResolution> {
+  const { store, ...rest } = options
+  return store.transaction((tx) => applyMovementTx(tx, rest))
+}
+
+async function ignoreMovementTx(tx: StoreTx, options: Omit<IgnoreOptions, 'store'>): Promise<MovementResolution> {
+  const { tenantId, movementId, reason } = options
+  required('reason', reason)
+  await undecided(tx, tenantId, movementId)
+  const closed: ExceptionRecord[] = []
+  for (const x of await tx.listExceptions({ tenantId, movementId, status: 'open' })) {
+    closed.push(await tx.resolveException(tenantId, x.id, { status: 'dismissed', note: reason }))
+  }
+  const next = await tx.setDisposition(tenantId, movementId, 'ignored', reason)
+  return { movement: next, allocations: [], closed, opened: null, journalEntry: await postMovement(tx, tenantId, movementId, options) }
 }
 
 export async function ignoreMovement(options: IgnoreOptions): Promise<MovementResolution> {
-  const { store, tenantId, movementId, reason } = options
-  required('reason', reason)
-  return store.transaction(async (tx) => {
-    await undecided(tx, tenantId, movementId)
-    const closed: ExceptionRecord[] = []
-    for (const x of await tx.listExceptions({ tenantId, movementId, status: 'open' })) {
-      closed.push(await tx.resolveException(tenantId, x.id, { status: 'dismissed', note: reason }))
-    }
-    const next = await tx.setDisposition(tenantId, movementId, 'ignored', reason)
-    return { movement: next, allocations: [], closed, opened: null, journalEntry: await postMovement(tx, tenantId, movementId, options) }
-  })
+  const { store, ...rest } = options
+  return store.transaction((tx) => ignoreMovementTx(tx, rest))
 }
 
 export interface CloseOptions {
@@ -161,25 +168,28 @@ export interface CloseOptions {
  * Refuses the last open exception of an undecided movement, which needs
  * `applyMovement` or `ignoreMovement`.
  */
-export async function closeException(options: CloseOptions): Promise<ExceptionRecord> {
-  const { store, tenantId, exceptionId, status, note } = options
+async function closeExceptionTx(tx: StoreTx, options: Omit<CloseOptions, 'store'>): Promise<ExceptionRecord> {
+  const { tenantId, exceptionId, status, note } = options
   required('note', note)
-  return store.transaction(async (tx) => {
-    const exception = await tx.getException(tenantId, exceptionId)
-    if (exception === null) throw new NotFoundError('exception', exceptionId)
-    if (exception.movementId !== null) {
-      const movement = await tx.getMovement(tenantId, exception.movementId)
-      const undecidedMovement = movement!.disposition === 'exception' || movement!.disposition === 'partial'
-      const open = await tx.listExceptions({ tenantId, movementId: exception.movementId, status: 'open' })
-      if (undecidedMovement && !open.some((x) => x.id !== exceptionId)) {
-        throw new ConstraintError(
-          'disposition_unsupported',
-          `movement ${exception.movementId} depends on exception ${exceptionId}: apply the movement or ignore it instead`,
-        )
-      }
+  const exception = await tx.getException(tenantId, exceptionId)
+  if (exception === null) throw new NotFoundError('exception', exceptionId)
+  if (exception.movementId !== null) {
+    const movement = await tx.getMovement(tenantId, exception.movementId)
+    const undecidedMovement = movement!.disposition === 'exception' || movement!.disposition === 'partial'
+    const open = await tx.listExceptions({ tenantId, movementId: exception.movementId, status: 'open' })
+    if (undecidedMovement && !open.some((x) => x.id !== exceptionId)) {
+      throw new ConstraintError(
+        'disposition_unsupported',
+        `movement ${exception.movementId} depends on exception ${exceptionId}: apply the movement or ignore it instead`,
+      )
     }
-    return tx.resolveException(tenantId, exceptionId, { status, note })
-  })
+  }
+  return tx.resolveException(tenantId, exceptionId, { status, note })
+}
+
+export async function closeException(options: CloseOptions): Promise<ExceptionRecord> {
+  const { store, ...rest } = options
+  return store.transaction((tx) => closeExceptionTx(tx, rest))
 }
 
 /** A person's decision about an exception, in the terms they know it by. */
@@ -198,34 +208,39 @@ export interface DecideExceptionOptions extends PostOptions {
   readonly decision: ExceptionDecision
 }
 
-/** Act on an exception: what the HTTP API and the command line both call. */
-export async function decideException(options: DecideExceptionOptions): Promise<ResolutionReport> {
-  const { store, tenantId, exceptionId, decision } = options
-  const exception = await store.getException(tenantId, exceptionId)
+async function decideExceptionTx(tx: StoreTx, options: Omit<DecideExceptionOptions, 'store'>): Promise<ResolutionReport> {
+  const { tenantId, exceptionId, decision } = options
+  const exception = await tx.getException(tenantId, exceptionId)
   if (exception === null) throw new NotFoundError('exception', exceptionId)
 
   if (decision.action === 'close') {
-    const closed = await closeException({ store, tenantId, exceptionId, status: decision.status ?? 'resolved', note: decision.note })
-    const movement = closed.movementId === null ? null : await store.getMovement(tenantId, closed.movementId)
+    const closed = await closeExceptionTx(tx, { tenantId, exceptionId, status: decision.status ?? 'resolved', note: decision.note })
+    const movement = closed.movementId === null ? null : await tx.getMovement(tenantId, closed.movementId)
     return { movement, allocations: [], closed: [closed], opened: null, journalEntry: null }
   }
 
   const movementId = exception.movementId
   if (movementId === null) throw new ValidationError('action', 'this exception is about no movement: close it instead')
-  const shared = { store, tenantId, movementId, ...(options.chart === undefined ? {} : { chart: options.chart }) }
-  if (decision.action === 'ignore') return ignoreMovement({ ...shared, reason: decision.note })
+  const shared = { tenantId, movementId, ...(options.chart === undefined ? {} : { chart: options.chart }) }
+  if (decision.action === 'ignore') return ignoreMovementTx(tx, { ...shared, reason: decision.note })
 
-  const movement = await store.getMovement(tenantId, movementId)
+  const movement = await tx.getMovement(tenantId, movementId)
   const allocations = []
   for (const { reference, amount } of decision.allocations) {
-    const expectation = await store.getExpectationByReference(tenantId, reference)
+    const expectation = await tx.getExpectationByReference(tenantId, reference)
     if (expectation === null) throw new NotFoundError('expectation', reference)
     allocations.push({
       expectationId: expectation.id,
       ...(amount === undefined ? {} : { amount: Money.parse(amount, movement!.amount.asset, movement!.amount.decimals) }),
     })
   }
-  return applyMovement({ ...shared, allocations, note: decision.note })
+  return applyMovementTx(tx, { ...shared, allocations, note: decision.note })
+}
+
+/** Act on an exception: what the HTTP API and the command line both call. */
+export async function decideException(options: DecideExceptionOptions): Promise<ResolutionReport> {
+  const { store, ...rest } = options
+  return store.transaction((tx) => decideExceptionTx(tx, rest))
 }
 
 /** A resolution as plain JSON, like every other record. */
@@ -236,5 +251,126 @@ export function resolutionJson(report: ResolutionReport) {
     closed: report.closed.map(exceptionJson),
     opened: report.opened === null ? null : exceptionJson(report.opened),
     journalEntry: report.journalEntry === null ? null : journalEntryJson(report.journalEntry),
+    alreadyApplied: report.alreadyApplied ?? false,
   }
+}
+
+export type BatchResolveMode = 'atomic' | 'row'
+
+export interface BatchDecisionItem {
+  readonly exceptionId: string
+  readonly decision: ExceptionDecision
+}
+
+export interface BatchResolveResult {
+  readonly index: number
+  readonly exceptionId: string
+  readonly result?: ResolutionReport
+  readonly error?: { readonly code: string; readonly detail: string }
+}
+
+export interface BatchResolveReport {
+  readonly mode: BatchResolveMode
+  readonly applied: number
+  readonly errors: number
+  readonly results: readonly BatchResolveResult[]
+}
+
+export const BATCH_DECISION_LIMIT = 200
+
+function asBatchError(err: unknown): { code: string; detail: string } {
+  if (err instanceof NotFoundError) return { code: 'not_found', detail: `No ${err.entity} ${err.id}.` }
+  if (err instanceof ConstraintError) return { code: 'resolution_refused', detail: err.message }
+  if (err instanceof ValidationError || err instanceof PrecisionError) return { code: 'invalid_resolution', detail: err.message }
+  if (err instanceof Error) return { code: 'invalid_resolution', detail: err.message }
+  return { code: 'invalid_resolution', detail: 'unknown error' }
+}
+
+async function alreadyAppliedReport(store: Store, tenantId: string, item: BatchDecisionItem): Promise<ResolutionReport | null> {
+  const exception = await store.getException(tenantId, item.exceptionId)
+  if (exception === null) throw new NotFoundError('exception', item.exceptionId)
+  const d = item.decision
+  if (d.action === 'close') {
+    const wanted = d.status ?? 'resolved'
+    if (exception.status === wanted) {
+      const movement = exception.movementId === null ? null : await store.getMovement(tenantId, exception.movementId)
+      return { movement, allocations: [], closed: [exception], opened: null, journalEntry: null, alreadyApplied: true }
+    }
+    return null
+  }
+  if (exception.movementId === null) return null
+  const movement = await store.getMovement(tenantId, exception.movementId)
+  if (movement === null) return null
+  if (d.action === 'ignore') {
+    if (movement.disposition === 'ignored' && exception.status === 'dismissed') {
+      return { movement, allocations: [], closed: [exception], opened: null, journalEntry: null, alreadyApplied: true }
+    }
+    return null
+  }
+  if (movement.disposition === 'exception' || movement.disposition === 'partial') return null
+  const allocations = await store.listAllocations({ tenantId, movementId: movement.id })
+  for (const a of d.allocations) {
+    const expectation = await store.getExpectationByReference(tenantId, a.reference)
+    if (expectation === null) return null
+    const has = allocations.some((x) => x.expectationId === expectation.id)
+    if (!has) return null
+  }
+  const closed = exception.status === 'resolved' ? [exception] : []
+  return { movement, allocations, closed, opened: null, journalEntry: null, alreadyApplied: true }
+}
+
+async function decideOne(store: Store, options: Omit<DecideExceptionOptions, 'exceptionId' | 'decision'> & { item: BatchDecisionItem }): Promise<ResolutionReport> {
+  const existing = await alreadyAppliedReport(store, options.tenantId, options.item)
+  if (existing !== null) return existing
+  return decideException({ ...options, exceptionId: options.item.exceptionId, decision: options.item.decision })
+}
+
+export async function decideExceptions(options: {
+  readonly store: Store
+  readonly tenantId: string
+  readonly decisions: readonly BatchDecisionItem[]
+  readonly mode: BatchResolveMode
+  readonly chart?: DecideExceptionOptions['chart']
+}): Promise<BatchResolveReport> {
+  const { store, tenantId, decisions, mode } = options
+  if (decisions.length === 0) throw new ValidationError('decisions', 'must not be empty')
+  if (decisions.length > BATCH_DECISION_LIMIT) {
+    throw new ValidationError('decisions', `must not exceed ${BATCH_DECISION_LIMIT} rows`)
+  }
+
+  if (mode === 'atomic') {
+    const results: BatchResolveResult[] = []
+    try {
+      await store.transaction(async (tx) => {
+        for (let i = 0; i < decisions.length; i++) {
+          const item = decisions[i]!
+          const existing = await alreadyAppliedReport({ getException: (t,id)=>tx.getException(t,id), getMovement:(t,id)=>tx.getMovement(t,id), listAllocations:(q)=>tx.listAllocations(q), getExpectationByReference:(t,r)=>tx.getExpectationByReference(t,r) } as Store, tenantId, item)
+          const result = existing ?? await decideExceptionTx(tx, { tenantId, exceptionId: item.exceptionId, decision: item.decision, ...(options.chart === undefined ? {} : { chart: options.chart }) })
+          results.push({ index: i, exceptionId: item.exceptionId, result })
+        }
+      })
+    } catch (err) {
+      const index = results.length
+      const item = decisions[index]
+      const error = asBatchError(err)
+      return { mode, applied: 0, errors: 1, results: item === undefined ? [] : [{ index, exceptionId: item.exceptionId, error }] }
+    }
+    return { mode, applied: results.length, errors: 0, results }
+  }
+
+  const results: BatchResolveResult[] = []
+  let applied = 0
+  let errors = 0
+  for (let i = 0; i < decisions.length; i++) {
+    const item = decisions[i]!
+    try {
+      const result = await decideOne(store, { store, tenantId, item, ...(options.chart === undefined ? {} : { chart: options.chart }) })
+      results.push({ index: i, exceptionId: item.exceptionId, result })
+      applied++
+    } catch (err) {
+      results.push({ index: i, exceptionId: item.exceptionId, error: asBatchError(err) })
+      errors++
+    }
+  }
+  return { mode, applied, errors, results }
 }

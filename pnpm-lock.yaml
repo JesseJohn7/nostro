@@ -206,6 +206,9 @@ importers:
 
   packages/testkit:
     dependencies:
+      '@nostro-labs/store-conformance':
+        specifier: workspace:*
+        version: link:../store-conformance
       fast-check:
         specifier: 4.10.2
         version: 4.10.2

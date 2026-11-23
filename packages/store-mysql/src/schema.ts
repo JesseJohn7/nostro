@@ -553,7 +553,41 @@ export const MIGRATIONS: readonly ((s: string) => readonly string[])[] = [
        caught_up       TINYINT(1) NOT NULL,
        last_error      TEXT,
        last_error_at   ${TIME},
-       PRIMARY KEY (tenant_id, network, source, account)
-     )${ENGINE}`,
-  ],
+        PRIMARY KEY (tenant_id, network, source, account)
+      )${ENGINE}`,
+   ],
+
+   (s) => [
+     `ALTER TABLE ${s}.allocations ADD COLUMN decision LONGTEXT`,
+     `CREATE TABLE IF NOT EXISTS ${s}.decisions (
+        seq         BIGINT NOT NULL AUTO_INCREMENT UNIQUE KEY,
+        tenant_id   ${T} NOT NULL,
+        movement_id ${T} NOT NULL REFERENCES ${s}.movements (id),
+        decided_at  ${TIME} NOT NULL,
+        snapshot    LONGTEXT NOT NULL,
+        CONSTRAINT decisions_unique UNIQUE (tenant_id, movement_id)
+      )${ENGINE}`,
+     `CREATE INDEX decisions_range ON ${s}.decisions (tenant_id, decided_at, seq)`,
+     `CREATE TABLE IF NOT EXISTS ${s}.schedules (
+        id                ${T} PRIMARY KEY,
+        tenant_id         ${T} NOT NULL,
+        reference_pattern ${T} NOT NULL,
+        account           ${T} NOT NULL,
+        direction         ${T} NOT NULL CONSTRAINT schedules_direction_check CHECK (direction IN (${DIRECTIONS})),
+        asset             ${T} NOT NULL,
+        decimals          SMALLINT NOT NULL CONSTRAINT schedules_decimals_check CHECK (decimals BETWEEN 0 AND 38),
+        amount            ${MONEY} NOT NULL CONSTRAINT schedules_amount_check CHECK (amount > 0),
+        memo_type         ${T} CONSTRAINT schedules_memo_type_check CHECK (memo_type IN (${MEMO_TYPES})),
+        memo_value        ${T},
+        memo_text         BLOB,
+        payers            LONGTEXT NOT NULL,
+        cadence           LONGTEXT NOT NULL,
+        start_at          ${TIME} NOT NULL,
+        end_at            ${TIME},
+        ended_at          ${TIME},
+        created_at        ${TIME} NOT NULL,
+        updated_at        ${TIME} NOT NULL
+      )${ENGINE}`,
+     `CREATE INDEX schedules_tenant ON ${s}.schedules (tenant_id, ended_at, start_at)`,
+   ],
 ]

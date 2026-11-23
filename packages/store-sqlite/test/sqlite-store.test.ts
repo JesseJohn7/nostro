@@ -319,8 +319,9 @@ describe('SqliteStore', () => {
       { side: 'credit', amount: (2n ** 64n).toString() },
       { side: 'credit', amount: '100' },
     ])
+    const signedSum = 'nostro_signed_sum'
     const net = db
-      .prepare("SELECT nostra_signed_sum(side, amount) AS net FROM journal_lines WHERE entry_id = 'raw-huge'")
+      .prepare(`SELECT ${signedSum}(side, amount) AS net FROM journal_lines WHERE entry_id = 'raw-huge'`)
       .get() as { net: string }
     expect(net.net).toBe('0')
     db.close()

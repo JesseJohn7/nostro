@@ -81,6 +81,7 @@ const journalChecks = (entry: string) => `
         )
           THEN RAISE(ABORT, 'journal entry does not balance')
         WHEN (SELECT movement_id FROM journal_entries WHERE id = ${entry}) IS NULL
+          AND (SELECT kind FROM journal_entries WHERE id = ${entry}) <> 'opening'
           AND EXISTS (SELECT 1 FROM journal_lines WHERE entry_id = ${entry} AND role IN ('cash', 'issued'))
           THEN RAISE(ABORT, 'a movementless entry cannot have a cash leg')
         WHEN (SELECT movement_id FROM journal_entries WHERE id = ${entry}) IS NOT NULL
@@ -781,5 +782,41 @@ PRIMARY KEY (tenant_id, destination)
     BEGIN
       ${journalChecks('NEW.entry_id')}
     END;
+  `,
+  `
+    ALTER TABLE allocations ADD COLUMN decision TEXT CHECK (decision IS NULL OR json_valid(decision));
+
+    CREATE TABLE decisions (
+      seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+      tenant_id   TEXT NOT NULL,
+      movement_id TEXT NOT NULL UNIQUE REFERENCES movements (id),
+      decided_at  INTEGER NOT NULL,
+      snapshot    TEXT NOT NULL CHECK (json_valid(snapshot)),
+      UNIQUE (tenant_id, movement_id)
+    );
+    CREATE INDEX decisions_range ON decisions (tenant_id, decided_at, seq);
+  `,
+  `
+    CREATE TABLE schedules (
+      id                TEXT NOT NULL PRIMARY KEY,
+      tenant_id         TEXT NOT NULL,
+      reference_pattern TEXT NOT NULL,
+      account           TEXT NOT NULL,
+      direction         TEXT NOT NULL CHECK (direction IN (${DIRECTIONS})),
+      asset             TEXT NOT NULL,
+      decimals          INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount            TEXT NOT NULL ${positive('amount')},
+      memo_type         TEXT CHECK (memo_type IN (${MEMO_TYPES})),
+      memo_value        TEXT,
+      memo_text         BLOB,
+      payers            TEXT NOT NULL CHECK (json_valid(payers)),
+      cadence           TEXT NOT NULL CHECK (json_valid(cadence)),
+      start_at          INTEGER NOT NULL,
+      end_at            INTEGER,
+      ended_at          INTEGER,
+      created_at        INTEGER NOT NULL,
+      updated_at        INTEGER NOT NULL
+    );
+    CREATE INDEX schedules_tenant ON schedules (tenant_id, ended_at, start_at);
   `,
 ]

@@ -880,3 +880,49 @@ describe('refund movement details',()=>{
     }
   })
 })
+
+describe('batch exception resolution', () => {
+  async function setup() {
+    const store = new MemoryStore()
+    const app = server(store)
+    await store.transaction(async (tx) => {
+      await tx.insertExpectation({ tenantId: 'acme', reference: 'INV-A', account: A, amount: Money.parse('10', NATIVE) })
+      await tx.insertExpectation({ tenantId: 'acme', reference: 'INV-B', account: A, amount: Money.parse('10', NATIVE) })
+    })
+    for (const externalId of ['m1', 'm2']) {
+      await store.transaction((tx) => tx.insertMovements([{ tenantId: 'acme', network: 'testnet', source: 'x', externalId, account: A, direction: 'credit', kind: 'transfer', amount: Money.parse('10', NATIVE), ledger: 1, occurredAt: new Date() }]))
+    }
+    await reconcile({ store, tenantId: 'acme' })
+    const exceptions = await store.listExceptions({ tenantId: 'acme', status: 'open' })
+    return { store, app, exceptions }
+  }
+
+  it('atomic batch with bad row changes nothing', async () => {
+    const { store, app, exceptions } = await setup()
+    const res = await app.inject({
+      method: 'POST', url: '/v1/exceptions/resolve', headers: auth(),
+      payload: { mode: 'atomic', decisions: [
+        { exceptionId: exceptions[0]!.id, decision: { action: 'apply', allocations: [{ reference: 'INV-A' }], note: 'ok' } },
+        { exceptionId: 'missing', decision: { action: 'close', note: 'bad' } },
+      ] },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().errors).toBe(1)
+    expect(res.json().applied).toBe(0)
+    expect((await store.getException('acme', exceptions[0]!.id))!.status).toBe('open')
+  })
+
+  it('row batch reports per-row errors', async () => {
+    const { app, exceptions } = await setup()
+    const res = await app.inject({
+      method: 'POST', url: '/v1/exceptions/resolve', headers: auth(),
+      payload: { mode: 'row', decisions: [
+        { exceptionId: exceptions[0]!.id, decision: { action: 'apply', allocations: [{ reference: 'INV-A' }], note: 'ok' } },
+        { exceptionId: 'missing', decision: { action: 'close', note: 'bad' } },
+      ] },
+    })
+    expect(res.statusCode).toBe(207)
+    expect(res.json().applied).toBe(1)
+    expect(res.json().errors).toBe(1)
+  })
+})
