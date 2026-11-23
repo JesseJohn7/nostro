@@ -28,6 +28,7 @@ import {
   consumerStatusJson,
   decideException,
   decideExceptions,
+  movementDetail,
   deliveryAttemptJson,
   exceptionJson,
   expectationJson,
@@ -37,7 +38,6 @@ import {
   incomeStatement,
   journalCsvRows,
   journalEntryJson,
-  refundLinkJson,
   moveAccount,
   movementJson,
   outboxEventJson,
@@ -424,15 +424,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
       v1.get<{ Params: { id: string } }>('/movements/:id', { schema: { params: idParams } }, async ({ tenantId, params }) => {
         const movement = await store.getMovement(tenantId, params.id)
         if (movement === null) throw new HttpProblem(404, 'not_found', `No movement ${params.id}.`)
-        const movementId = movement.id
-        return {
-          movement: movementJson(movement),
-          refunds: (await store.listRefundLinks({ tenantId, movementIds: [movementId] })).map(refundLinkJson),
-          allocations: (await store.listAllocations({ tenantId, movementId })).map(allocationJson),
-          exceptions: (await store.listExceptions({ tenantId, movementId })).map(exceptionJson),
-          journal: (await store.listJournalEntries({ tenantId, movementId })).map(journalEntryJson),
-          decision: (await store.getDecision(tenantId, movementId))?.snapshot ?? null,
-        }
+        return movementDetail({ store, tenantId, movement })
       })
 
       v1.get<{ Params: { id: string } }>('/movements/:id/explain', { schema: { params: idParams } }, async ({ tenantId, params }) =>

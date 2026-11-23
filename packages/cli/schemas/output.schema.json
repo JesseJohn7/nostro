@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/nostro-labs/nostro/packages/cli/schemas/output.schema.json",
+  "title": "nostro CLI --json output, contract version 1",
+  "description": "What `nostro <command> --json` prints on stdout, and the error object it prints on stderr. Required fields are part of the contract; extra fields may appear in a minor release and must be ignored by readers. Removing or renaming a field, or changing its type, is a breaking change.",
+  "$defs": {
+    "amount": {
+      "type": "string",
+      "pattern": "^[0-9]+(\\.[0-9]+)?$",
+      "description": "A non-negative decimal amount with exactly seven fractional digits, as Money prints it."
+    },
+    "timestamp": {
+      "type": "string",
+      "description": "An ISO 8601 instant in UTC, e.g. 2026-11-30T17:00:00.000Z."
+    },
+    "nullableTimestamp": {
+      "anyOf": [{ "$ref": "#/$defs/timestamp" }, { "type": "null" }]
+    },
+    "nullableString": {
+      "type": ["string", "null"]
+    },
+    "asset": {
+      "type": "string",
+      "description": "NATIVE for XLM, otherwise CODE:ISSUER."
+    },
+    "memo": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["type", "value"],
+          "properties": {
+            "type": { "enum": ["text", "id", "hash", "return"] },
+            "value": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "exception": {
+      "type": "object",
+      "required": [
+        "id", "seq", "code", "status", "movementId", "expectationId", "account", "amount", "asset",
+        "detail", "evidence", "openedAt", "resolvedAt", "resolutionNote"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "code": { "type": "string" },
+        "status": { "enum": ["open", "resolved", "dismissed"] },
+        "movementId": { "$ref": "#/$defs/nullableString" },
+        "expectationId": { "$ref": "#/$defs/nullableString" },
+        "account": { "$ref": "#/$defs/nullableString" },
+        "amount": { "anyOf": [{ "$ref": "#/$defs/amount" }, { "type": "null" }] },
+        "asset": { "anyOf": [{ "$ref": "#/$defs/asset" }, { "type": "null" }] },
+        "detail": { "type": "string" },
+        "evidence": {},
+        "openedAt": { "$ref": "#/$defs/timestamp" },
+        "resolvedAt": { "$ref": "#/$defs/nullableTimestamp" },
+        "resolutionNote": { "$ref": "#/$defs/nullableString" }
+      }
+    },
+    "expectation": {
+      "type": "object",
+      "required": [
+        "id", "seq", "reference", "account", "direction", "amount", "asset", "muxedId", "memo", "payers",
+        "dueAt", "expiresAt", "status", "cancelReason", "metadata", "createdAt", "updatedAt", "paid"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "reference": { "type": "string" },
+        "account": { "type": "string" },
+        "direction": { "enum": ["credit", "debit"] },
+        "amount": { "$ref": "#/$defs/amount" },
+        "asset": { "$ref": "#/$defs/asset" },
+        "muxedId": { "$ref": "#/$defs/nullableString" },
+        "memo": { "$ref": "#/$defs/memo" },
+        "payers": { "type": "array", "items": { "type": "string" } },
+        "dueAt": { "$ref": "#/$defs/nullableTimestamp" },
+        "expiresAt": { "$ref": "#/$defs/nullableTimestamp" },
+        "status": { "enum": ["open", "partially_paid", "settled", "cancelled"] },
+        "cancelReason": { "$ref": "#/$defs/nullableString" },
+        "metadata": { "type": "object", "additionalProperties": { "type": "string" } },
+        "createdAt": { "$ref": "#/$defs/timestamp" },
+        "updatedAt": { "$ref": "#/$defs/timestamp" },
+        "paid": { "$ref": "#/$defs/amount" }
+      }
+    },
+    "movement": {
+      "type": "object",
+      "required": [
+        "id", "seq", "network", "source", "externalId", "revision", "account", "entityId", "direction",
+        "kind", "amount", "asset", "counterparty", "muxedId", "memo", "ledger", "txHash", "operationId",
+        "occurredAt", "enrichment", "disposition", "ignoredReason", "createdAt"
+      ],
+      "properties": {
+        "id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "amount": { "$ref": "#/$defs/amount" },
+        "asset": { "$ref": "#/$defs/asset" },
+        "direction": { "enum": ["credit", "debit"] },
+        "disposition": { "enum": ["pending", "allocated", "partial", "exception", "ignored"] },
+        "counterparty": { "$ref": "#/$defs/nullableString" },
+        "memo": { "$ref": "#/$defs/memo" },
+        "ledger": { "type": "integer", "minimum": 0 },
+        "txHash": { "$ref": "#/$defs/nullableString" },
+        "occurredAt": { "$ref": "#/$defs/timestamp" },
+        "createdAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "allocation": {
+      "type": "object",
+      "required": ["id", "movementId", "expectationId", "amount", "asset", "strategy", "score", "decision", "createdAt"],
+      "properties": {
+        "id": { "type": "string" },
+        "movementId": { "type": "string" },
+        "expectationId": { "type": "string" },
+        "amount": { "$ref": "#/$defs/amount" },
+        "asset": { "$ref": "#/$defs/asset" },
+        "strategy": { "type": "string" },
+        "score": { "anyOf": [{ "type": "number", "minimum": 0, "maximum": 1 }, { "type": "null" }] },
+        "createdAt": { "$ref": "#/$defs/timestamp" }
+      }
+    },
+    "journalEntry": {
+      "type": "object",
+      "required": ["id", "seq", "movementId", "postingNo", "kind", "effectiveAt", "postedAt", "description", "lines"],
+      "properties": {
+        "id": { "type": "string" },
+        "seq": { "type": "integer", "minimum": 0 },
+        "postingNo": { "anyOf": [{ "type": "integer", "minimum": 1 }, { "type": "null" }] },
+        "effectiveAt": { "$ref": "#/$defs/timestamp" },
+        "postedAt": { "$ref": "#/$defs/timestamp" },
+        "description": { "type": "string" },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["account", "entityId", "role", "side", "amount", "asset", "expectationId", "exceptionId"],
+            "properties": {
+              "side": { "enum": ["debit", "credit"] },
+              "amount": { "$ref": "#/$defs/amount" }
+            }
+          }
+        }
+      }
+    },
+    "error": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "enum": ["usage", "no_database", "schema_mismatch", "horizon", "failed", "internal"] },
+            "message": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

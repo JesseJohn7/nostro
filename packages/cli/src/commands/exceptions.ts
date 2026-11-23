@@ -1,6 +1,6 @@
 import type { ExceptionCode, ExceptionStatus } from '@nostro-labs/nostro'
 import { EXCEPTION_CODES, exceptionJson } from '@nostro-labs/nostro'
-import { COMMON, UsageError, flag, integer, positionals, string, tenant } from '../args.js'
+import { COMMON, UsageError, afterSeq, integer, machineFormat, positionals, string, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
 import { assetLabel, when } from '../format.js'
@@ -20,8 +20,17 @@ Options:
   --status <s>        open (the default), resolved, dismissed or all
   --code <CODE>       Only this reason, e.g. AMBIGUOUS_MATCH
   --limit <n>         At most this many (default 100)
+  --after <seq>       Only records after this seq: pass the last seq of the previous page
+  --jsonl             One JSON record per line, for streaming; --json prints one array
 ${COMMON_HELP}`,
-  options: { ...COMMON, status: { type: 'string' }, code: { type: 'string' }, limit: { type: 'string' } },
+  options: {
+    ...COMMON,
+    status: { type: 'string' },
+    code: { type: 'string' },
+    limit: { type: 'string' },
+    after: { type: 'string' },
+    jsonl: { type: 'boolean' },
+  },
   async run(args, io) {
     positionals(args, 0)
     const tenantId = tenant(args, io)
@@ -34,17 +43,24 @@ ${COMMON_HELP}`,
     if (code !== undefined && !(EXCEPTION_CODES as readonly string[]).includes(code)) {
       throw new UsageError(`--code takes one of ${EXCEPTION_CODES.join(', ')}; not ${JSON.stringify(code)}.`)
     }
+    const after = afterSeq(args)
+    const format = machineFormat(args)
 
     const list = await withStore(args, io, (store) =>
       store.listExceptions({
         tenantId,
         limit,
+        ...(after === undefined ? {} : { afterSeq: after }),
         ...(status === 'all' ? {} : { status: status as ExceptionStatus }),
         ...(code === undefined ? {} : { code: code as ExceptionCode }),
       }),
     )
 
-    if (flag(args, 'json')) {
+    if (format === 'jsonl') {
+      await write(io.stdout, list.map((x) => `${JSON.stringify(exceptionJson(x))}\n`).join(''))
+      return 0
+    }
+    if (format === 'json') {
       await write(io.stdout, json(list.map(exceptionJson)))
       return 0
     }

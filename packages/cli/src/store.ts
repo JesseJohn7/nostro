@@ -59,7 +59,7 @@ export async function openStore(db: string, io: Io, options: { create: boolean }
   }
   const filename = resolve(io.cwd, path)
   if (!options.create && !existsSync(filename)) {
-    throw new CliError(`No database at ${filename}. Create it with "nostro migrate".`)
+    throw new CliError(`No database at ${filename}. Create it with "nostro migrate".`, "no_database")
   }
   const { SqliteStore } = await import('@nostro-labs/store-sqlite')
   return { store: new SqliteStore({ filename }), label: filename }
@@ -69,11 +69,12 @@ export async function openStore(db: string, io: Io, options: { create: boolean }
 export async function assertCurrent({ store, label }: OpenedStore): Promise<void> {
   const { current, latest } = await store.schemaVersion()
   if (current === latest) return
-  if (current === 0) throw new CliError(`${label} has not been set up. Run "nostro migrate" first.`)
+  if (current === 0) throw new CliError(`${label} has not been set up. Run "nostro migrate" first.`, "schema_mismatch")
   if (current < latest) {
-    throw new CliError(`${label} is at schema version ${current}; this nostro needs ${latest}. Run "nostro migrate".`)
+    throw new CliError(`${label} is at schema version ${current}; this nostro needs ${latest}. Run "nostro migrate".`, "schema_mismatch")
   }
   throw new CliError(
     `${label} is at schema version ${current}, newer than this nostro understands (${latest}). Upgrade @nostro-labs/cli.`,
+    "schema_mismatch",
   )
 }
