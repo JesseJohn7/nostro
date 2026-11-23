@@ -6,6 +6,7 @@
     // Typecheck against core's source, the same module the tests run against.
     "paths": {
       "@nostro-labs/nostro": ["../core/src/index.ts"],
+      "@nostro-labs/store-conformance": ["../store-conformance/src/index.ts"],
       "nostro-testkit": ["../testkit/src/index.ts"]
     }
   },

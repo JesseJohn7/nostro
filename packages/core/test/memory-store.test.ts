@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest'
 import type { ExpectationChanges, ExpectationStatus, NewMovement } from '../src/index.js'
-import { MemoryStore, Money, NATIVE, amendExpectationRecord } from '../src/index.js'
-import { describeStoreConformance, describeStoreProperties } from 'nostro-testkit'
+import { STORE_CONTRACT_VERSION, MemoryStore, Money, NATIVE, amendExpectationRecord } from '../src/index.js'
+import { describeStoreConformance, describeStoreProperties } from '@nostro-labs/store-conformance'
 
-describeStoreConformance('MemoryStore', () => new MemoryStore())
-describeStoreProperties('MemoryStore', (now) => new MemoryStore({ now }), { runs: 200 })
+describeStoreConformance('MemoryStore', () => new MemoryStore(), { contractVersion: STORE_CONTRACT_VERSION })
+describeStoreProperties('MemoryStore', (now) => new MemoryStore({ now }), { runs: 200, contractVersion: STORE_CONTRACT_VERSION })
 
 describe('MemoryStore', () => {
   it('uses injected ids and clock so fixture runs are deterministic', async () => {

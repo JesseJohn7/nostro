@@ -1,0 +1,60 @@
+{
+  "name": "@nostro-labs/store-mysql",
+  "version": "0.1.0",
+  "description": "MySQL store for nostro.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nostro-labs/nostro.git",
+    "directory": "packages/store-mysql"
+  },
+  "homepage": "https://github.com/nostro-labs/nostro/tree/main/packages/store-mysql",
+  "bugs": {
+    "url": "https://github.com/nostro-labs/nostro/issues"
+  },
+  "keywords": [
+    "stellar",
+    "reconciliation",
+    "mysql"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.test.json",
+    "test": "vitest run --coverage"
+  },
+  "dependencies": {
+    "mysql2": "^3.11.0"
+  },
+  "peerDependencies": {
+    "@nostro-labs/nostro": "workspace:^"
+  },
+  "devDependencies": {
+    "@nostro-labs/nostro": "workspace:*",
+    "@nostro-labs/store-conformance": "workspace:*",
+    "@vitest/coverage-v8": "^2.1.8",
+    "nostro-testkit": "workspace:*",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

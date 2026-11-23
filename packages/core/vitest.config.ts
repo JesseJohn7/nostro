@@ -3,9 +3,10 @@ import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   resolve: {
-    // The shared testkit imports `nostro`; point it at this package's source
-    // so tests, testkit and coverage all see one copy of every class.
+    // The shared suites import `nostro`; point them at this package's source
+    // so tests, conformance suites and coverage all see one copy of every class.
     alias: {
+      '@nostro-labs/store-conformance': fileURLToPath(new URL('../store-conformance/src/index.ts', import.meta.url)),
       'nostro-testkit': fileURLToPath(new URL('../testkit/src/index.ts', import.meta.url)),
       '@nostro-labs/nostro': fileURLToPath(new URL('./src/index.ts', import.meta.url)),
     },

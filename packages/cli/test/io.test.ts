@@ -37,5 +37,6 @@ describe('redact', () => {
     expect(redact('postgres://nostro:s3cret@db.example:5432/books')).toBe('postgres://nostro:***@db.example:5432/books')
     expect(redact('postgres://nostro@db.example/books')).toBe('postgres://nostro@db.example/books')
     expect(redact('postgres://nostro:s3cret@[db/books')).toBe('postgres://***@[db/books')
+    expect(redact('mysql://nostro:s3cret@db.example:3306/books')).toBe('mysql://nostro:***@db.example:3306/books')
   })
 })

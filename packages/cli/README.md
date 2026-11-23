@@ -1,8 +1,8 @@
 # @nostro-labs/cli
 
 The command line for [nostro](https://github.com/nostro-labs/nostro): ingest a Stellar account's
-history from Horizon and reconcile it, from a shell or a cron job, against a SQLite file or
-PostgreSQL.
+history from Horizon and reconcile it, from a shell or a cron job, against a SQLite file,
+PostgreSQL or MySQL.
 
 ```sh
 npm install -g @nostro-labs/cli
@@ -10,6 +10,7 @@ npm install -g @nostro-labs/cli
 
 ```sh
 nostro migrate                                       # create ./nostro.db
+nostro migrate --db mysql://localhost/nostro         # or a MySQL 8 database named in the URL
 nostro sync --account G...                           # ingest every effect and fee Horizon keeps
 nostro expect INV-1042 --account G... --amount 25    # record what you are owed
 nostro reconcile                                     # decide every pending movement, and post it
@@ -46,8 +47,8 @@ tenant syncs and delivers on its own timers, so one failing tenant does not hold
 `--config`, the single-tenant flags describe one tenant (`--tenant`, default `default`). The API serves
 every tenant that has a key.
 
-Every command takes `--db` (a SQLite file, `sqlite:<path>`, or a `postgres://` URL; default
-`./nostro.db`) and `--tenant` (default `default`), and all but `export` take `--json`. `nostro <command> --help` lists the
+Every command takes `--db` (a SQLite file, `sqlite:<path>`, a `postgres://` URL or a `mysql://` URL
+with a database name; default `./nostro.db`) and `--tenant` (default `default`), and all but `export` take `--json`. `nostro <command> --help` lists the
 rest. Options can also come from the environment:
 
 | Variable | Option |
@@ -64,7 +65,7 @@ rest. Options can also come from the environment:
 | `NOSTRO_PORT`, `NOSTRO_HOST` | `serve`: `--port`, `--host` |
 
 Exit status is 0 on success, 1 when the command failed or found a problem, and 2 when the command
-line was wrong. A password in a `postgres://` URL is never printed. Text that came from a payment,
+line was wrong. A password in a `postgres://` or `mysql://` URL is never printed. Text that came from a payment,
 such as a memo, is printed with control characters escaped, so it cannot rewrite your terminal.
 
 nostro never signs a transaction and never needs a secret key.

@@ -154,6 +154,32 @@ function statement(db: Database.Database, sql: string): Database.Statement {
 }
 type Param = string | number | bigint | Buffer | null
 
+interface SumState {
+  net: bigint
+}
+
+const addSigned = (state: SumState, side: unknown, amount: unknown): void => {
+  const raw = BigInt(amount as string)
+  state.net += side === 'debit' ? raw : -raw
+}
+
+export function registerJournalFunctions(db: Database.Database): void {
+  db.aggregate('nostro_signed_sum', {
+    deterministic: true,
+    start: (): SumState => ({ net: 0n }),
+    step: addSigned,
+    result: (state: SumState): string => state.net.toString(),
+  })
+  db.aggregate('nostro_cash_sum', {
+    deterministic: true,
+    start: (): SumState => ({ net: 0n }),
+    step: (state: SumState, role: unknown, side: unknown, amount: unknown): void => {
+      if (role === 'cash' || role === 'issued') addSigned(state, side, amount)
+    },
+    result: (state: SumState): string => state.net.toString(),
+  })
+}
+
 const money = (amount: unknown, asset: unknown, decimals: unknown): Money =>
   Money.fromRaw(BigInt(amount as string), parseAsset(asset as string), decimals as number)
 const date = (ms: unknown): Date | null => (ms === null ? null : new Date(ms as number))
@@ -1389,11 +1415,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
       }
     }
     const nowMs = now.getTime()
-    const entry = this.one(
-      `INSERT INTO journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
-      [this.ids(), n.tenantId, movement?.id ?? null, n.postingNo ?? null, n.kind, entryToPost.effectiveAt.getTime(), nowMs, n.description],
-    )!
+    const entryId = this.ids()
     const lines = n.lines.map(
       (l, i) =>
         this.one(
@@ -1401,7 +1423,7 @@ class SqliteTx extends SqliteReader implements StoreTx {
              entry_id, line_no, tenant_id, account, entity_id, role, side, asset, decimals, amount, expectation_id, exception_id
            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
           [
-            entry.id as string,
+            entryId,
             i + 1,
              n.tenantId,
              l.account,
@@ -1416,6 +1438,11 @@ class SqliteTx extends SqliteReader implements StoreTx {
           ],
         )!,
     )
+    const entry = this.one(
+      `INSERT INTO journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
+      [entryId, n.tenantId, movement?.id ?? null, n.postingNo ?? null, n.kind, entryToPost.effectiveAt.getTime(), nowMs, n.description],
+    )!
     return toJournalEntry(entry, lines)
   }
 
@@ -1553,6 +1580,7 @@ export class SqliteStore extends SqliteReader implements MigratableStore {
     // Durability over speed: this is a ledger.
     writer.pragma('synchronous = FULL')
     writer.pragma('foreign_keys = ON')
+    registerJournalFunctions(writer)
     writer.function('nostro_event_prune_allowed', () => Number(this.eventPruneAuthorized))
     const reader = new Database(filename, { readonly: true, timeout: busy })
     super(() => reader)
@@ -1601,11 +1629,57 @@ export class SqliteStore extends SqliteReader implements MigratableStore {
     }
   }
 
+  private verifyJournalRules(): void {
+    const offenders = new Set<string>()
+    const collect = (sql: string) => {
+      for (const row of this.writer.prepare(sql).all() as { entry_id: string }[]) offenders.add(row.entry_id)
+    }
+    collect(`SELECT l.entry_id AS entry_id
+               FROM journal_lines l
+              GROUP BY l.entry_id, l.asset, l.decimals
+             HAVING coalesce(nostro_signed_sum(l.side, l.amount), '') <> '0'`)
+    collect(`SELECT e.id AS entry_id
+               FROM journal_entries e
+              WHERE (SELECT count(*) FROM journal_lines l WHERE l.entry_id = e.id) < 2`)
+    collect(`SELECT e.id AS entry_id
+               FROM journal_entries e
+              WHERE e.movement_id IS NULL
+                AND EXISTS (SELECT 1 FROM journal_lines l WHERE l.entry_id = e.id AND l.role IN ('cash', 'issued'))`)
+    collect(`SELECT DISTINCT e.id AS entry_id
+               FROM journal_lines l
+               JOIN journal_entries e ON e.id = l.entry_id
+               JOIN movements m ON m.id = e.movement_id
+              WHERE l.role IN ('cash', 'issued')
+                AND (l.asset <> m.asset OR l.decimals <> m.decimals)`)
+    collect(`SELECT e.id AS entry_id
+               FROM journal_entries e
+               JOIN movements m ON m.id = e.movement_id
+              WHERE EXISTS (
+                SELECT 1 FROM (
+                  SELECT em.movement_id AS movement_id, nostro_cash_sum(l.role, l.side, l.amount) AS net
+                  FROM journal_lines l
+                  JOIN journal_entries em ON em.id = l.entry_id
+                  WHERE em.movement_id IS NOT NULL
+                  GROUP BY em.movement_id
+                ) cash
+                WHERE cash.movement_id = e.movement_id
+                  AND coalesce(cash.net, '') NOT IN (
+                    '0',
+                    CASE m.direction WHEN 'credit' THEN m.amount ELSE '-' || m.amount END
+                  )
+              )`)
+    if (offenders.size > 0) {
+      throw new Error(`journal rules migration refused for entries: ${[...offenders].sort().join(', ')}`)
+    }
+  }
+
   /** Apply any pending migrations. Safe to call from several processes at once. */
   migrate(): Promise<void> {
     return this.serial(async () => {
       const version = this.writer.pragma('user_version', { simple: true }) as number
+      const journalRulesMigration = MIGRATIONS.length
       for (let v = version + 1; v <= MIGRATIONS.length; v++) {
+        if (v === journalRulesMigration && version >= 2 && version < journalRulesMigration) this.verifyJournalRules()
         this.writer.exec(MIGRATIONS[v - 1]!)
         this.writer.pragma(`user_version = ${v}`)
       }

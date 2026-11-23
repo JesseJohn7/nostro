@@ -7,8 +7,9 @@
 
 > **Status: `0.1.0`, early: the API may change before 1.0.** Implemented and tested: the `Money`/`Asset`
 > core, the record model (movements, expectations, allocations, exceptions), the transactional
-> `Store` contract with in-memory, SQLite (`@nostro-labs/store-sqlite`) and PostgreSQL
-> (`@nostro-labs/store-postgres`) stores that pass one shared conformance suite, and Horizon ingestion
+> `Store` contract with in-memory, SQLite (`@nostro-labs/store-sqlite`), PostgreSQL
+> (`@nostro-labs/store-postgres`) and MySQL (`@nostro-labs/store-mysql`) stores that pass one
+> shared conformance suite, and Horizon ingestion
 > (effects and fees) through a bounded `sync()` loop, matching through `reconcile()`, and a
 > double-entry journal posted as movements are decided, with CSV export, `doctor()`, which checks
 > all three invariants, a `nostro` command line over all of it (`@nostro-labs/cli`), and an HTTP API with
@@ -124,7 +125,7 @@ it: [docs/invariants.md](./docs/invariants.md).
 ## From the command line (works today)
 
 ```sh
-nostro migrate                                       # create ./nostro.db (or --db postgres://...)
+nostro migrate                                       # create ./nostro.db (or --db postgres://... / mysql://...)
 nostro sync --account G...                           # ingest every effect and fee, until caught up
 nostro expect INV-1042 --account G... --amount 25    # record what you are owed
 nostro reconcile                                     # decide every pending movement, and post it

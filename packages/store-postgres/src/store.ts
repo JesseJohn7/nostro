@@ -13,6 +13,7 @@
  * over-allocation and compare-and-set checks need.
  */
 import { randomUUID } from 'node:crypto'
+import { AsyncLocalStorage } from 'node:async_hooks'
 import pg from 'pg'
 import type { Pool, PoolClient, QueryResultRow } from 'pg'
 import { EventHistoryPrunedError } from '@nostro-labs/nostro'
@@ -132,7 +133,16 @@ import type {
   RewindRow,
 } from './rows.js'
 import { memoColumns, storedOpeningBalance, toAccountEntity, toAccountOpening, toAllocation, toDeliveryAttempt, toEntity, toEvent, toException, toExpectation, toInternalTransferLink, toJournalEntry, toMovement, toRewind, toValuation } from './rows.js'
-import { MIGRATIONS, quoteSchema } from './schema.js'
+import { MIGRATIONS, quoteSchema, rlsPolicySql, RLS_BYPASS_SETTING, RLS_TENANT_SETTING } from './schema.js'
+
+export interface PostgresRlsOptions {
+  /** Enable per-tenant isolation. Off by default. */
+  readonly enabled: boolean
+  /** GUC read by the RLS policies. Default `nostro.tenant`. */
+  readonly tenantSetting?: string
+  /** Role adopted by store transactions; use a NOBYPASSRLS role. */
+  readonly appRole?: string
+}
 
 export interface PostgresStoreOptions {
   /** A pool you own. The store never ends it. */
@@ -145,9 +155,99 @@ export interface PostgresStoreOptions {
   readonly ids?: () => string
   /** Clock for `createdAt` and friends. Defaults to `new Date()`. */
   readonly now?: () => Date
+  /** Optional per-tenant row-level security. */
+  readonly rls?: PostgresRlsOptions
+}
+
+export interface TenantScopedStore {
+  readonly tenantId: string
+  transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>
+  getMovement(id: string): Promise<Movement | null>
+  listMovements(query: Omit<MovementQuery, 'tenantId'>): Promise<Movement[]>
+  listEvents(query: Omit<EventQuery, 'tenantId'>): Promise<OutboxEvent[]>
+  getCursor(key: Omit<CursorKey, 'tenantId'>): Promise<string | null>
+  findApiKeyByDigest(digest: string): Promise<ApiKeyRow | null>
+  listApiKeys(): Promise<ApiKeyRow[]>
 }
 
 type Run = <R extends QueryResultRow>(sql: string, params?: readonly unknown[]) => Promise<R[]>
+
+const tenantlessMethods = new Set(['findApiKeyByDigest', 'revokeApiKey', 'recordApiKeyUse', 'migrate', 'schemaVersion', 'close', 'transaction', 'forTenant'])
+
+function tenantOf(method: string, args: readonly unknown[]): string | undefined {
+  if (tenantlessMethods.has(method)) return undefined
+  if (method === 'postAccrualExpectation') return typeof args[1] === 'string' ? args[1] : undefined
+  const first: unknown = args[0]
+  if (typeof first === 'string') return first
+  if (Array.isArray(first)) {
+    let found: string | undefined
+    for (const row of first as readonly { readonly tenantId?: unknown }[]) {
+      const tenantId = row?.tenantId
+      if (typeof tenantId !== 'string' || (found !== undefined && found !== tenantId)) {
+        throw new Error(`a batch in ${method} must belong to exactly one tenant`)
+      }
+      found = tenantId
+    }
+    return found
+  }
+  if (first !== null && typeof first === 'object' && 'tenantId' in first) {
+    const tenantId = (first as { readonly tenantId?: unknown }).tenantId
+    return typeof tenantId === 'string' ? tenantId : undefined
+  }
+  return undefined
+}
+
+class TenantPin {
+  private pinned: string | undefined
+
+  constructor(private readonly set: (tenantId: string) => Promise<void>) {}
+
+  get tenant(): string | undefined {
+    return this.pinned
+  }
+
+  async apply(tenantId: string | undefined): Promise<void> {
+    if (tenantId === undefined) return
+    if (this.pinned !== undefined && this.pinned !== tenantId) {
+      throw new Error(`a transaction is pinned to tenant ${JSON.stringify(this.pinned)}, not ${JSON.stringify(tenantId)}`)
+    }
+    if (this.pinned === undefined) {
+      await this.set(tenantId)
+      this.pinned = tenantId
+    }
+  }
+}
+
+function tenantReadProxy<T extends object>(target: T, context: AsyncLocalStorage<string>): T {
+  return new Proxy(target, {
+    get(object, property) {
+      const value = Reflect.get(object, property, object)
+      if (typeof property !== 'string' || typeof value !== 'function' || tenantlessMethods.has(property)) return value
+      return (...args: unknown[]) => {
+        const tenantId = tenantOf(property, args)
+        return context.run(tenantId ?? '', () => (value as (...a: unknown[]) => unknown).apply(object, args))
+      }
+    },
+  })
+}
+
+function tenantTxProxy(tx: PgTx, pin: TenantPin): StoreTx {
+  return new Proxy(tx, {
+    get(object, property) {
+      const value = Reflect.get(object, property, object)
+      if (typeof property !== 'string' || typeof value !== 'function' || property === 'close' || property === 'run') return value
+      return async (...args: unknown[]) => {
+        await pin.apply(tenantOf(property, args))
+        return (value as (...a: unknown[]) => unknown).apply(object, args)
+      }
+    },
+  }) as StoreTx
+}
+
+function quoteRole(role: string): string {
+  if (role.trim() === '') throw new Error('appRole must be a non-empty PostgreSQL role name')
+  return `"${role.replaceAll('"', '""')}"`
+}
 
 /** Builds `WHERE` clauses with numbered parameters. */
 class Where {
@@ -618,6 +718,7 @@ class PgTx extends PgReader implements StoreTx {
     client: PoolClient,
     private readonly ids: () => string,
     private readonly now: () => Date,
+    private readonly pin?: TenantPin,
   ) {
     super(s, async (sql, params) => {
       if (!this.open) throw new TransactionClosedError()
@@ -663,6 +764,9 @@ class PgTx extends PgReader implements StoreTx {
    */
   private async emit(event: NewOutboxEvent | null): Promise<void> {
     if (event === null) return
+    if (this.pin?.tenant !== undefined && this.pin.tenant !== event.tenantId) {
+      throw new Error(`event tenant ${JSON.stringify(event.tenantId)} does not match the pinned tenant`)
+    }
     await this.run('SELECT pg_advisory_xact_lock(hashtext($1))', [`nostro:events:${this.s}:${event.tenantId}`])
     await this.run(
       `INSERT INTO ${this.s}.events (id, tenant_id, type, subject_id, payload, created_at) VALUES ($1, $2, $3, $4, $5, $6)`,
@@ -1531,6 +1635,9 @@ export class PostgresStore extends PgReader implements MigratableStore {
   private readonly schema: string
   private readonly ids: () => string
   private readonly now: () => Date
+  private readonly rls: PostgresRlsOptions | undefined
+  private readonly rlsContext: AsyncLocalStorage<string> | undefined
+  private readonly rlsSetting: string
 
   constructor(options: PostgresStoreOptions) {
     if (options.pool === undefined && options.connectionString === undefined) {
@@ -1538,14 +1645,43 @@ export class PostgresStore extends PgReader implements MigratableStore {
     }
     const pool = options.pool ?? new pg.Pool({ connectionString: options.connectionString })
     const schema = options.schema ?? 'nostro'
-    super(quoteSchema(schema), async (sql, params) =>
-      (await pool.query(sql, params === undefined ? undefined : [...params])).rows,
-    )
+    const rls = options.rls?.enabled === true ? options.rls : undefined
+    const rlsSetting = rls?.tenantSetting ?? RLS_TENANT_SETTING
+    if (!/^[a-z_][a-z0-9_.]*$/.test(rlsSetting)) {
+      throw new Error(`Invalid tenant setting ${JSON.stringify(rlsSetting)}: use lowercase letters, digits, _ and .`)
+    }
+    if (rls?.appRole !== undefined) quoteRole(rls.appRole)
+    const context = rls === undefined ? undefined : new AsyncLocalStorage<string>()
+    super(quoteSchema(schema), async (sql, params) => {
+      const args = params === undefined ? undefined : [...params]
+      if (rls === undefined) return (await pool.query(sql, args)).rows
+      const client = await pool.connect()
+      let broken: Error | undefined
+      try {
+        await client.query('BEGIN READ ONLY')
+        if (rls.appRole !== undefined) await client.query(`SET LOCAL ROLE ${quoteRole(rls.appRole)}`)
+        await client.query('SELECT set_config($1, $2, true)', [rlsSetting, context!.getStore() ?? ''])
+        const result = await client.query(sql, args)
+        await client.query('COMMIT')
+        return result.rows
+      } catch (err) {
+        await client.query('ROLLBACK').catch((rollbackError: unknown) => {
+          broken = rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError))
+        })
+        throw err
+      } finally {
+        client.release(broken)
+      }
+    })
     this.pool = pool
     this.ownsPool = options.pool === undefined
     this.schema = schema
     this.ids = options.ids ?? randomUUID
     this.now = options.now ?? (() => new Date())
+    this.rls = rls
+    this.rlsContext = context
+    this.rlsSetting = rlsSetting
+    if (rls !== undefined) return tenantReadProxy(this, context!) as PostgresStore
   }
 
   /**
@@ -1580,6 +1716,7 @@ export class PostgresStore extends PgReader implements MigratableStore {
     const client = await this.pool.connect()
     try {
       await client.query('BEGIN')
+      await client.query('SELECT set_config($1, $2, true)', [RLS_BYPASS_SETTING, 'on'])
       await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`nostro:migrate:${this.schema}`])
       await client.query(`CREATE SCHEMA IF NOT EXISTS ${this.s}`)
       await client.query(
@@ -1597,6 +1734,9 @@ export class PostgresStore extends PgReader implements MigratableStore {
         await client.query(`INSERT INTO ${this.s}.migrations (version) VALUES ($1)`, [v])
       }
       if (version < 5) await this.backfillReferenceIndex(client)
+      if (this.rls !== undefined && this.rlsSetting !== RLS_TENANT_SETTING) {
+        await client.query(rlsPolicySql(this.s, this.rlsSetting))
+      }
       await client.query('COMMIT')
     } catch (err) {
       await client.query('ROLLBACK').catch(() => undefined)
@@ -1617,10 +1757,17 @@ export class PostgresStore extends PgReader implements MigratableStore {
     return { current: row!.version, latest }
   }
 
-  async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
+  async transaction<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T>
+  async transaction<T>(tenantId: string, fn: (tx: StoreTx) => Promise<T>): Promise<T>
+  async transaction<T>(
+    tenantIdOrFn: string | ((tx: StoreTx) => Promise<T>),
+    maybeFn?: (tx: StoreTx) => Promise<T>,
+  ): Promise<T> {
+    const tenantId = typeof tenantIdOrFn === 'string' ? tenantIdOrFn : undefined
+    const fn = (typeof tenantIdOrFn === 'string' ? maybeFn : tenantIdOrFn)!
     for (let attempt = 0; ; attempt++) {
       try {
-        return await this.transactionOnce(fn)
+        return await this.transactionOnce(fn, tenantId)
       } catch (error) {
         if ((error as { code?: unknown })?.code !== '40P01' || attempt >= 3) throw error
         // The complete transaction is replayed on a fresh connection. A short
@@ -1630,27 +1777,52 @@ export class PostgresStore extends PgReader implements MigratableStore {
     }
   }
 
-  private async transactionOnce<T>(fn: (tx: StoreTx) => Promise<T>): Promise<T> {
+  private async transactionOnce<T>(fn: (tx: StoreTx) => Promise<T>, tenantId?: string): Promise<T> {
     const client = await this.pool.connect()
-    const tx = new PgTx(this.s, client, this.ids, this.now)
+    const pin = this.rls === undefined
+      ? undefined
+      : new TenantPin(async (id) => {
+          await client.query('SELECT set_config($1, $2, true)', [this.rlsSetting, id])
+        })
+    const raw = new PgTx(this.s, client, this.ids, this.now, pin)
+    const tx = pin === undefined ? raw : tenantTxProxy(raw, pin)
     let broken: Error | undefined
     try {
       await client.query('BEGIN')
+      if (this.rls?.appRole !== undefined) await client.query(`SET LOCAL ROLE ${quoteRole(this.rls.appRole)}`)
+      await pin?.apply(tenantId)
       const result = await fn(tx)
-      tx.close()
+      raw.close()
       await client.query('COMMIT')
       return result
     } catch (err) {
-      tx.close()
+      raw.close()
       await client.query('ROLLBACK').catch((rollbackError: unknown) => {
         // The connection is unusable; make the pool discard it.
         broken = rollbackError instanceof Error ? rollbackError : new Error(String(rollbackError))
       })
       throw err
     } finally {
-      tx.close()
+      raw.close()
       client.release(broken)
     }
+  }
+
+  /** A convenience handle for one tenant: writes pin the tenant, reads need no tenant argument. */
+  forTenant(tenantId: string): TenantScopedStore {
+    const store: PostgresStore = this
+    const read = <T>(fn: () => Promise<T>): Promise<T> =>
+      this.rlsContext === undefined ? fn() : this.rlsContext.run(tenantId, fn)
+    return Object.freeze({
+      tenantId,
+      transaction: <T>(fn: (tx: StoreTx) => Promise<T>) => store.transaction(tenantId, fn),
+      getMovement: (id: string) => store.getMovement(tenantId, id),
+      listMovements: (query: Omit<MovementQuery, 'tenantId'>) => store.listMovements({ ...query, tenantId }),
+      listEvents: (query: Omit<EventQuery, 'tenantId'>) => store.listEvents({ ...query, tenantId }),
+      getCursor: (key: Omit<CursorKey, 'tenantId'>) => store.getCursor({ ...key, tenantId }),
+      findApiKeyByDigest: (digest: string) => read(() => store.findApiKeyByDigest(digest)),
+      listApiKeys: () => read(() => store.listApiKeys(tenantId)),
+    })
   }
 
   async close(): Promise<void> {

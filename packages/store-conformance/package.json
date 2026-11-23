@@ -1,0 +1,59 @@
+{
+  "name": "@nostro-labs/store-conformance",
+  "version": "0.1.0",
+  "description": "The shared Store contract conformance and property suites for nostro.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nostro-labs/nostro.git",
+    "directory": "packages/store-conformance"
+  },
+  "homepage": "https://github.com/nostro-labs/nostro/tree/main/packages/store-conformance",
+  "bugs": {
+    "url": "https://github.com/nostro-labs/nostro/issues"
+  },
+  "keywords": [
+    "stellar",
+    "reconciliation",
+    "testing",
+    "conformance"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "fast-check": "4.10.2"
+  },
+  "peerDependencies": {
+    "@nostro-labs/nostro": "workspace:^",
+    "vitest": "^2.1.8"
+  },
+  "devDependencies": {
+    "@nostro-labs/nostro": "workspace:*",
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  }
+}

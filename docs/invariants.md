@@ -8,7 +8,7 @@ but some states are reached by legal steps, and a database can be changed behind
 |---|---|---|
 | **I1** | Every movement is fully allocated, partially allocated with an open exception covering the rest, carries an exception, or is ignored with a reason. Nothing is silently dropped. | every store, when a disposition is set; `doctor()` afterwards |
 | **I2** | A watched account's recorded movements add up to the balance the chain reports for it. | `doctor()` with `attest`, or `attestBalances()` |
-| **I3** | Every journal entry balances per asset, and a movement's entries agree with the movement. | every store, before posting; PostgreSQL again at COMMIT ([journal.md](./journal.md)); `doctor()` afterwards |
+| **I3** | Every journal entry balances per asset, and a movement's entries agree with the movement. | every store, before posting; PostgreSQL again at COMMIT and SQLite again at entry completion ([journal.md](./journal.md)); `doctor()` afterwards |
 
 ## Running it
 
@@ -51,7 +51,7 @@ its lock before it is reported.
 | `allocation_asset` | I1 | error | An allocation is in a different asset from its movement. | Only possible by editing the database directly; investigate. |
 | `allocation_over_movement` | I1 | error | Allocations add up to more than the movement. | As above. |
 | `balance_mismatch` | I2 | error | The chain balance and the recorded movements disagree at the ledger the balance last changed in, after retries. | For an account with pre-nostro history, open it from its current balances with `nostro open`. Otherwise a source has missed something: check that both the effects and fees sources run for the account, and that its history is within Horizon's retention. |
-| `journal_unbalanced` | I3 | error | An entry's debits and credits differ in some asset. | SQLite cannot refuse this itself; someone wrote to the database directly. |
+| `journal_unbalanced` | I3 | error | An entry's debits and credits differ in some asset. | Legacy data written before the SQLite checks, or data whose checks were removed; either way someone wrote to the database outside the store. |
 | `journal_posting_sequence` | I3 | error | A movement's posting numbers are not 1, 2, 3… | As above. |
 | `journal_asset` | I3 | error | A line is in a different asset from its movement. | As above. |
 | `journal_cash_mismatch` | I3 | error | A movement's cash lines net to something other than zero or its exact amount. | As above. |

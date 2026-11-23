@@ -56,6 +56,8 @@ import type {
   RewindQuery,
 } from './delivery.js'
 
+export const STORE_CONTRACT_VERSION = '1.0.0'
+
 export interface MovementQuery {
   readonly tenantId: string
   /** Restrict to these ids; an empty list matches no movements. */

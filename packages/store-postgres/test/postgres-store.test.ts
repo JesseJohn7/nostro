@@ -7,11 +7,12 @@
  */
 import { randomUUID } from 'node:crypto'
 import pg from 'pg'
-import { afterAll, describe, expect, it } from 'vitest'
+import { afterAll, beforeAll, describe, expect, it } from 'vitest'
 import type { StoreTx } from '@nostro-labs/nostro'
 import { Money, NATIVE, doctor } from '@nostro-labs/nostro'
-import { describeStoreConformance, describeStoreProperties } from 'nostro-testkit'
-import { PostgresStore } from '../src/index.js'
+import { describeStoreConformance, describeStoreProperties } from '@nostro-labs/store-conformance'
+import { PostgresStore, STORE_CONTRACT_VERSION } from '../src/index.js'
+import type { PostgresRlsOptions } from '../src/index.js'
 import { MIGRATIONS, quoteSchema } from '../src/schema.js'
 
 const url = process.env.NOSTRO_TEST_DATABASE_URL
@@ -21,17 +22,37 @@ if (url === undefined && process.env.CI !== undefined) {
 
 const pool = url === undefined ? undefined : new pg.Pool({ connectionString: url, max: 20 })
 const schemas: string[] = []
+const appRole = `nostro_rls_${randomUUID().replaceAll('-', '')}`
+const quotedRole = `"${appRole}"`
 
-async function freshStore(options: { schema?: string; now?: () => Date } = {}): Promise<PostgresStore> {
+async function freshStore(options: { schema?: string; now?: () => Date; rls?: PostgresRlsOptions } = {}): Promise<PostgresStore> {
   const schema = options.schema ?? `nostro_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`
   schemas.push(schema)
-  const store = new PostgresStore({ pool: pool!, schema, ...(options.now === undefined ? {} : { now: options.now }) })
+  const store = new PostgresStore({
+    pool: pool!,
+    schema,
+    ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.rls === undefined ? {} : { rls: options.rls }),
+  })
   await store.migrate()
+  if (options.rls?.enabled === true) {
+    await pool!.query(`GRANT USAGE ON SCHEMA "${schema}" TO ${quotedRole}`)
+    await pool!.query(`GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA "${schema}" TO ${quotedRole}`)
+    await pool!.query(`GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA "${schema}" TO ${quotedRole}`)
+  }
   return store
+}
+
+if (pool !== undefined) {
+  beforeAll(async () => {
+    await pool!.query(`CREATE ROLE ${quotedRole} NOLOGIN NOBYPASSRLS`)
+  })
 }
 
 afterAll(async () => {
   if (pool === undefined) return
+  await pool.query(`DROP OWNED BY ${quotedRole} CASCADE`).catch(() => undefined)
+  await pool.query(`DROP ROLE IF EXISTS ${quotedRole}`).catch(() => undefined)
   for (const schema of new Set(schemas)) await pool.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`)
   await pool.end()
 }, 300_000) // the property tests make a schema per history
@@ -41,8 +62,15 @@ if (pool === undefined) {
     it('conformance', () => {})
   })
 } else {
-  describeStoreConformance('PostgresStore', () => freshStore())
-  describeStoreProperties('PostgresStore', (now) => freshStore({ now }), { runs: 15, differential: true })
+  describeStoreConformance('PostgresStore', () => freshStore(), { contractVersion: STORE_CONTRACT_VERSION })
+  describeStoreProperties('PostgresStore', (now) => freshStore({ now }), {
+    runs: 15,
+    differential: true,
+    contractVersion: STORE_CONTRACT_VERSION,
+  })
+  describeStoreConformance('PostgresStore (RLS)', () => freshStore({ rls: { enabled: true, appRole } }), {
+    contractVersion: STORE_CONTRACT_VERSION,
+  })
 
   describe('PostgresStore', () => {
     it('migrates idempotently, even when several processes migrate at once', async () => {
@@ -158,6 +186,98 @@ if (pool === undefined) {
       expect((await store.getExpectation('t', e.id))!.amount.raw).toBe(2n ** 100n + 7n)
     })
 
+    it('applies the RLS migration to a database that already holds a valid journal', async () => {
+      const schema = `nostro_test_${randomUUID().replaceAll('-', '').slice(0, 16)}`
+      schemas.push(schema)
+      const s = quoteSchema(schema)
+      const client = await pool!.connect()
+      try {
+        await client.query(`CREATE SCHEMA ${s}`)
+        await client.query(`CREATE TABLE ${s}.migrations (version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())`)
+        await client.query('BEGIN')
+        for (const [index, migration] of MIGRATIONS.slice(0, -1).entries()) {
+          await client.query(migration(s))
+          await client.query(`INSERT INTO ${s}.migrations (version) VALUES ($1)`, [index + 1])
+        }
+        await client.query(
+          `INSERT INTO ${s}.movements
+             (id, tenant_id, network, source, external_id, revision, account, direction, kind, asset,
+              decimals, amount, ledger, occurred_at, enrichment, disposition, created_at)
+           VALUES ('m', 't', 'testnet', 'horizon', 'e', 1, 'G${'A'.repeat(55)}', 'credit', 'transfer', 'native',
+             7, '10.0000000', 1, now(), 'complete', 'pending', now())`,
+        )
+        await client.query(
+          `INSERT INTO ${s}.journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+           VALUES ('e', 't', 'm', 1, 'initial', now(), now(), 'valid')`,
+        )
+        await client.query(
+          `INSERT INTO ${s}.journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount)
+           VALUES ('e', 1, 't', 'cash', 'cash', 'debit', 'native', 7, '10.0000000'),
+                  ('e', 2, 't', 'unapplied', 'unapplied', 'credit', 'native', 7, '10.0000000')`,
+        )
+        await client.query('COMMIT')
+      } catch (err) {
+        await client.query('ROLLBACK').catch(() => undefined)
+        throw err
+      } finally {
+        client.release()
+      }
+
+      const store = new PostgresStore({ pool: pool!, schema })
+      expect((await store.schemaVersion()).current).toBe(MIGRATIONS.length - 1)
+      await store.migrate()
+      expect(await store.schemaVersion()).toEqual({ current: MIGRATIONS.length, latest: MIGRATIONS.length })
+      const check = await pool!.connect()
+      try {
+        await check.query(`SELECT set_config('nostro.tenant', 't', false)`)
+        const { rows } = await check.query<{ id: string }>(`SELECT id FROM ${s}.journal_entries`)
+        expect(rows.map((row) => row.id)).toEqual(['e'])
+        const { rows: rls } = await check.query<{ relrowsecurity: boolean; relforcerowsecurity: boolean }>(
+          `SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = '${s}.journal_entries'::regclass`,
+        )
+        expect(rls[0]).toMatchObject({ relrowsecurity: true, relforcerowsecurity: true })
+      } finally {
+        check.release()
+      }
+    })
+
+    it('isolates tenants when RLS is enabled', async () => {
+      const store = await freshStore({ rls: { enabled: true, appRole } })
+      const s = quoteSchema(schemas[schemas.length - 1]!)
+      const seedMovement = (id: string, tenantId: string) =>
+        `INSERT INTO ${s}.movements
+           (id, tenant_id, network, source, external_id, revision, account, direction, kind, asset,
+            decimals, amount, ledger, occurred_at, enrichment, disposition, created_at)
+         VALUES ('${id}', '${tenantId}', 'testnet', 'horizon', '${id}', 1, 'G${'A'.repeat(55)}',
+           'credit', 'transfer', 'native', 7, '1.0000000', 1, now(), 'complete', 'pending', now())`
+      const seed = await pool!.connect()
+      try {
+        await seed.query(`SELECT set_config('nostro.migrate_bypass', 'on', false)`)
+        await seed.query(seedMovement('m-t', 't'))
+        await seed.query(seedMovement('m-u', 'u'))
+      } finally {
+        seed.release()
+      }
+
+      const app = await pool!.connect()
+      try {
+        await app.query(`SET LOCAL ROLE ${quotedRole}`)
+        await app.query(`SELECT set_config('nostro.tenant', 't', true)`)
+        const { rows } = await app.query<{ id: string }>(`SELECT id FROM ${s}.movements ORDER BY id`)
+        expect(rows.map((row) => row.id)).toEqual(['m-t'])
+        await expect(app.query(seedMovement('bad', 'u'))).rejects.toThrow(/row-level security/)
+      } finally {
+        app.release()
+      }
+
+      expect(await store.forTenant('t').getMovement('m-t')).not.toBeNull()
+      expect(await store.forTenant('t').getMovement('m-u')).toBeNull()
+      await expect(store.transaction('t', async (tx) => {
+        await tx.getMovement('t', 'm-t')
+        await tx.getMovement('u', 'm-u')
+      })).rejects.toThrow(/pinned to tenant/)
+    })
+
     it('enforces the hard constraints in the database too, not only in code', async () => {
       const store = await freshStore()
       const s = schemas[schemas.length - 1]!
@@ -255,6 +375,94 @@ if (pool === undefined) {
         }
         const { rows } = await pool.query(`SELECT count(*)::int AS n FROM ${s}.journal_entries`)
         expect(rows[0].n).toBe(0)
+      })
+
+      it('refuses a cash leg that disagrees with the movement, even written with raw SQL', async () => {
+        const { s, movement } = await withMovement()
+        const client = await pool.connect()
+        try {
+          await client.query('BEGIN')
+          await client.query(
+            `INSERT INTO ${s}.journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+             VALUES ('cash-raw', 't', $1, 1, 'initial', now(), now(), 'raw cash')`,
+            [movement.id],
+          )
+          await client.query(
+            `INSERT INTO ${s}.journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount)
+             VALUES ('cash-raw', 1, 't', 'cash', 'cash', 'debit', 'native', 7, '9.0000000')`,
+          )
+          await client.query(
+            `INSERT INTO ${s}.journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount)
+             VALUES ('cash-raw', 2, 't', 'unapplied', 'unapplied', 'credit', 'native', 7, '9.0000000')`,
+          )
+          await expect(client.query('COMMIT')).rejects.toThrow(/cash leg nets to/)
+        } finally {
+          client.release()
+        }
+        const { rows } = await pool.query(`SELECT count(*)::int AS n FROM ${s}.journal_entries`)
+        expect(rows[0].n).toBe(0)
+      })
+
+      it('checks the cash leg exactly beyond 64 bits', async () => {
+        const store = await freshStore()
+        const s = `"${schemas[schemas.length - 1]!}"`
+        const raw = 2n ** 100n + 7n
+        const amount = Money.fromRaw(raw, NATIVE)
+        const { inserted } = await store.transaction((tx) =>
+          tx.insertMovements([
+            {
+              tenantId: 't',
+              network: 'testnet',
+              source: 'horizon',
+              externalId: 'huge',
+              account: `G${'A'.repeat(55)}`,
+              direction: 'credit',
+              kind: 'transfer',
+              amount,
+              ledger: 1,
+              occurredAt: new Date('2026-10-05T00:00:00Z'),
+            },
+          ]),
+        )
+        const movement = inserted[0]!
+        await store.transaction((tx) =>
+          tx.postJournalEntry({
+            tenantId: 't',
+            movementId: movement.id,
+            postingNo: 1,
+            kind: 'initial',
+            description: 'Huge receipt',
+            lines: [
+              { account: 'cash', role: 'cash', side: 'debit', amount },
+              { account: 'unapplied', role: 'unapplied', side: 'credit', amount },
+            ],
+          }),
+        )
+        expect(await store.listJournalEntries({ tenantId: 't' })).toHaveLength(1)
+
+        const client = await pool.connect()
+        try {
+          await client.query('BEGIN')
+          await client.query(
+            `INSERT INTO ${s}.journal_entries (id, tenant_id, movement_id, posting_no, kind, effective_at, posted_at, description)
+             VALUES ('huge-raw', 't', $1, 2, 'correction', now(), now(), 'off by one')`,
+            [movement.id],
+          )
+          await client.query(
+            `INSERT INTO ${s}.journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount)
+             VALUES ('huge-raw', 1, 't', 'cash', 'cash', 'debit', 'native', 7, $1)`,
+            [(raw - 1n).toString()],
+          )
+          await client.query(
+            `INSERT INTO ${s}.journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount)
+             VALUES ('huge-raw', 2, 't', 'unapplied', 'unapplied', 'credit', 'native', 7, $1)`,
+            [(raw - 1n).toString()],
+          )
+          await expect(client.query('COMMIT')).rejects.toThrow(/cash leg nets to/)
+        } finally {
+          client.release()
+        }
+        expect(await store.listJournalEntries({ tenantId: 't' })).toHaveLength(1)
       })
 
       it('refuses to edit, delete or truncate posted entries', async () => {

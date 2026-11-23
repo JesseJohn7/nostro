@@ -69,6 +69,44 @@ const appendOnly = (table: string) => `
       BEGIN SELECT RAISE(ABORT, 'the journal is append-only'); END;
     CREATE TRIGGER ${table}_no_delete BEFORE DELETE ON ${table}
       BEGIN SELECT RAISE(ABORT, 'the journal is append-only'); END;`
+const journalChecks = (entry: string) => `
+      SELECT CASE
+        WHEN (SELECT count(*) FROM journal_lines WHERE entry_id = ${entry}) < 2
+          THEN RAISE(ABORT, 'journal entry has fewer than two lines')
+        WHEN EXISTS (
+          SELECT 1 FROM journal_lines
+          WHERE entry_id = ${entry}
+          GROUP BY asset, decimals
+          HAVING coalesce(nostro_signed_sum(side, amount), '') <> '0'
+        )
+          THEN RAISE(ABORT, 'journal entry does not balance')
+        WHEN (SELECT movement_id FROM journal_entries WHERE id = ${entry}) IS NULL
+          AND EXISTS (SELECT 1 FROM journal_lines WHERE entry_id = ${entry} AND role IN ('cash', 'issued'))
+          THEN RAISE(ABORT, 'a movementless entry cannot have a cash leg')
+        WHEN (SELECT movement_id FROM journal_entries WHERE id = ${entry}) IS NOT NULL
+          AND EXISTS (
+            SELECT 1 FROM journal_lines l
+            JOIN journal_entries e ON e.id = l.entry_id
+            JOIN movements m ON m.id = e.movement_id
+            WHERE e.movement_id = (SELECT movement_id FROM journal_entries WHERE id = ${entry})
+              AND l.role IN ('cash', 'issued')
+              AND (l.asset <> m.asset OR l.decimals <> m.decimals)
+          )
+          THEN RAISE(ABORT, 'cash leg asset does not match the movement')
+        WHEN (SELECT movement_id FROM journal_entries WHERE id = ${entry}) IS NOT NULL
+          AND coalesce((
+            SELECT nostro_cash_sum(l.role, l.side, l.amount)
+            FROM journal_lines l
+            JOIN journal_entries e ON e.id = l.entry_id
+            WHERE e.movement_id = (SELECT movement_id FROM journal_entries WHERE id = ${entry})
+          ), '') NOT IN (
+            '0',
+            (SELECT CASE m.direction WHEN 'credit' THEN m.amount ELSE '-' || m.amount END
+               FROM movements m
+              WHERE m.id = (SELECT movement_id FROM journal_entries WHERE id = ${entry}))
+          )
+          THEN RAISE(ABORT, 'cash leg does not match the movement')
+      END;`
 const EXCEPTION_CODES = list([
   'UNMATCHED_NO_CANDIDATE',
   'AMBIGUOUS_MATCH',
@@ -705,5 +743,43 @@ PRIMARY KEY (tenant_id, destination)
       last_error_at   INTEGER,
       PRIMARY KEY (tenant_id, network, source, account)
     );
+  `,
+
+  // Journal entries complete only when their entry row is inserted, so the
+  // line-to-entry foreign key is deferred and the checks run from both sides.
+  `
+    CREATE TABLE saved_journal_lines AS SELECT * FROM journal_lines;
+    DROP TABLE journal_lines;
+    CREATE TABLE journal_lines (
+      entry_id       TEXT NOT NULL REFERENCES journal_entries (id) DEFERRABLE INITIALLY DEFERRED,
+      line_no        INTEGER NOT NULL CHECK (line_no >= 1),
+      tenant_id      TEXT NOT NULL,
+      account        TEXT NOT NULL,
+      role           TEXT NOT NULL CHECK (role IN (${CURRENT_LINE_ROLES})),
+      side           TEXT NOT NULL CHECK (side IN ('debit', 'credit')),
+      asset          TEXT NOT NULL,
+      decimals       INTEGER NOT NULL CHECK (decimals BETWEEN 0 AND 38),
+      amount         TEXT NOT NULL ${positive('amount')},
+      expectation_id TEXT REFERENCES expectations (id),
+      exception_id   TEXT REFERENCES exceptions (id),
+      entity_id      TEXT,
+      PRIMARY KEY (entry_id, line_no)
+    );
+    INSERT INTO journal_lines (entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id, entity_id)
+      SELECT entry_id, line_no, tenant_id, account, role, side, asset, decimals, amount, expectation_id, exception_id, entity_id
+      FROM saved_journal_lines;
+    DROP TABLE saved_journal_lines;
+    CREATE INDEX journal_lines_account ON journal_lines (tenant_id, account, asset);
+    CREATE INDEX journal_lines_entity ON journal_lines (tenant_id, entity_id, entry_id);
+    ${appendOnly('journal_lines')}
+    CREATE TRIGGER journal_entries_checked AFTER INSERT ON journal_entries
+    BEGIN
+      ${journalChecks('NEW.id')}
+    END;
+    CREATE TRIGGER journal_lines_checked AFTER INSERT ON journal_lines
+      WHEN EXISTS (SELECT 1 FROM journal_entries WHERE id = NEW.entry_id)
+    BEGIN
+      ${journalChecks('NEW.entry_id')}
+    END;
   `,
 ]

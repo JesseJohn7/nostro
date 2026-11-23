@@ -42,6 +42,63 @@ const LINE_ROLES = list([
 ])
 const ENTRY_KINDS = list(['initial', 'reclass', 'correction'])
 const MANUAL_ENTRY_KINDS = list(['initial', 'reclass', 'correction', 'conversion', 'manual'])
+const BALANCE_ROLES = list(['cash', 'issued'])
+
+/** Every table whose rows belong to one tenant. `migrations` is deliberately global. */
+export const TENANT_TABLES = [
+  'movements',
+  'expectations',
+  'allocations',
+  'exceptions',
+  'cursors',
+  'journal_entries',
+  'journal_lines',
+  'events',
+  'journal_period_actions',
+  'expectation_reference_index',
+  'exports',
+  'accrual_modes',
+  'event_prune_state',
+  'movement_valuations',
+  'refund_links',
+  'webhook_delivery_attempts',
+  'webhook_rewinds',
+  'account_openings',
+  'entities',
+  'account_entities',
+  'internal_transfer_links',
+  'api_keys',
+  'watched_accounts',
+  'sync_state',
+] as const
+
+export const RLS_TENANT_SETTING = 'nostro.tenant'
+export const RLS_BYPASS_SETTING = 'nostro.migrate_bypass'
+
+/** Idempotent RLS policy statements, also used to retarget a custom tenant setting. */
+export function rlsPolicySql(schema: string, setting: string = RLS_TENANT_SETTING): string {
+  if (!/^[a-z_][a-z0-9_.]*$/.test(setting)) {
+    throw new Error(`Invalid tenant setting ${JSON.stringify(setting)}: use lowercase letters, digits, _ and .`)
+  }
+  return TENANT_TABLES.map((table) => `
+    ALTER TABLE ${schema}.${table} ENABLE ROW LEVEL SECURITY;
+    ALTER TABLE ${schema}.${table} FORCE ROW LEVEL SECURITY;
+    DROP POLICY IF EXISTS ${table}_tenant ON ${schema}.${table};
+    CREATE POLICY ${table}_tenant ON ${schema}.${table} FOR ALL
+      USING (tenant_id = current_setting('${setting}', true))
+      WITH CHECK (tenant_id = current_setting('${setting}', true));
+    DROP POLICY IF EXISTS ${table}_migrate ON ${schema}.${table};
+    CREATE POLICY ${table}_migrate ON ${schema}.${table} FOR ALL
+      USING (current_setting('${RLS_BYPASS_SETTING}', true) = 'on')
+      WITH CHECK (current_setting('${RLS_BYPASS_SETTING}', true) = 'on');
+    -- FORCE RLS also applies to the owner. Keep legacy (non-opted-in) access
+    -- working for the owner; the app role must not be a member of the owner.
+    DROP POLICY IF EXISTS ${table}_owner ON ${schema}.${table};
+    CREATE POLICY ${table}_owner ON ${schema}.${table} FOR ALL
+      USING (pg_has_role(current_user, (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = '${schema}.${table}'::regclass), 'USAGE'))
+      WITH CHECK (pg_has_role(current_user, (SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = '${schema}.${table}'::regclass), 'USAGE'));
+  `).join('\n')
+}
 const CURRENT_LINE_ROLES = list([
   'cash',
   'issued',
@@ -639,7 +696,66 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       caught_up       boolean NOT NULL,
       last_error      text,
       last_error_at   timestamptz,
-      PRIMARY KEY (tenant_id, network, source, account)
-    );
+       PRIMARY KEY (tenant_id, network, source, account)
+     );
+   `,
+
+  // The balance roles are the movement's own money: a wallet's cash or an
+  // issuer's supply. Their cumulative signed amount must stay at zero or at
+  // the movement's exact signed amount, checked with NUMERIC, never a float.
+  (s) => `
+    CREATE FUNCTION ${s}.journal_check_cash(entry text) RETURNS void LANGUAGE plpgsql AS $$
+    DECLARE
+      movement_id text;
+      movement_amount numeric(40, 0);
+      movement_direction text;
+      target numeric;
+      cash numeric;
+    BEGIN
+      SELECT e.movement_id, m.amount, m.direction
+        INTO movement_id, movement_amount, movement_direction
+        FROM ${s}.journal_entries e
+        JOIN ${s}.movements m ON m.id = e.movement_id
+       WHERE e.id = entry;
+      IF movement_id IS NULL THEN RETURN; END IF;
+      target := CASE WHEN movement_direction = 'credit' THEN movement_amount ELSE -movement_amount END;
+      SELECT coalesce(sum(CASE l.side WHEN 'debit' THEN l.amount ELSE -l.amount END), 0)
+        INTO cash
+        FROM ${s}.journal_lines l
+        JOIN ${s}.journal_entries e ON e.id = l.entry_id
+       WHERE e.movement_id = movement_id
+         AND l.role IN (${BALANCE_ROLES});
+      IF cash <> 0 AND cash <> target THEN
+        RAISE EXCEPTION 'movement % cash leg nets to %, but the movement is %', movement_id, cash, target
+          USING ERRCODE = 'check_violation';
+      END IF;
+    END $$;
+    CREATE OR REPLACE FUNCTION ${s}.journal_entry_balanced() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      PERFORM ${s}.journal_check_entry(NEW.id);
+      PERFORM ${s}.journal_check_cash(NEW.id);
+      RETURN NULL;
+    END $$;
+    CREATE OR REPLACE FUNCTION ${s}.journal_line_balanced() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      PERFORM ${s}.journal_check_entry(NEW.entry_id);
+      IF NEW.role IN (${BALANCE_ROLES}) THEN
+        PERFORM ${s}.journal_check_cash(NEW.entry_id);
+      END IF;
+      RETURN NULL;
+    END $$;
+    CREATE INDEX IF NOT EXISTS journal_lines_balance_roles ON ${s}.journal_lines (entry_id, asset)
+      WHERE role IN (${BALANCE_ROLES});
+    DO $do$
+    DECLARE e record;
+    BEGIN
+      FOR e IN SELECT id FROM ${s}.journal_entries WHERE movement_id IS NOT NULL LOOP
+        PERFORM ${s}.journal_check_cash(e.id);
+      END LOOP;
+    END $do$;
   `,
+
+  // Row-level security is available in the schema. Applications opt in by
+  // setting the tenant GUC; the migration bypass is set only by migrate().
+  (s) => rlsPolicySql(s),
 ]
