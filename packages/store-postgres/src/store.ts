@@ -118,8 +118,11 @@ import {
   issueMuxedId,
   expectationAmended,
   expectationChanged,
+  expectationCreated,
   expectationReferenceKeys,
+  journalPosted,
   movementDecided,
+  movementRecorded,
   sameFacts,
 } from '@nostro-labs/nostro'
 import type {
@@ -1259,6 +1262,9 @@ class PgTx extends PgReader implements StoreTx {
         conflicts.push({ existing, incoming: movement })
       }
     }
+    for (const m of inserted) {
+      await this.emit(movementRecorded(m))
+    }
     return { inserted, duplicates, conflicts }
   }
 
@@ -1389,7 +1395,9 @@ class PgTx extends PgReader implements StoreTx {
           [n.tenantId, normalized, row!.id],
         )
       }
-      return toExpectation(row!)
+      const exp = toExpectation(row!)
+      await this.emit(expectationCreated(exp))
+      return exp
     } catch (err) {
       await this.run(`ROLLBACK TO SAVEPOINT ${savepoint}`)
       if (isUniqueViolation(err, 'expectations_reference_unique')) throw taken()
@@ -1580,7 +1588,9 @@ class PgTx extends PgReader implements StoreTx {
       [entry!.id, n.tenantId, JSON.stringify(lineRows)],
     )
     lines.sort((a, b) => a.line_no - b.line_no)
-    return toJournalEntry(entry!, lines)
+    const created = toJournalEntry(entry!, lines)
+    await this.emit(journalPosted(created))
+    return created
   }
 
   async openException(n: NewException): Promise<ExceptionRecord> {

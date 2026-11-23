@@ -12,8 +12,8 @@
  * Every store emits through the builders below, so the payloads are the
  * same whichever store wrote them.
  */
-import type { Allocation, Disposition, ExceptionRecord, Expectation, Json, Movement } from '../model/index.js'
-import { allocationJson, exceptionJson, expectationJson, movementJson } from '../model/index.js'
+import type { Allocation, Disposition, ExceptionRecord, Expectation, JournalEntry, Json, Movement } from '../model/index.js'
+import { allocationJson, exceptionJson, expectationJson, journalEntryJson, movementJson } from '../model/index.js'
 
 export type EventType =
   | 'movement.decided'
@@ -24,6 +24,9 @@ export type EventType =
   | 'exception.opened'
   | 'exception.resolved'
   | 'exception.dismissed'
+  | 'expectation.created'
+  | 'movement.recorded'
+  | 'journal.posted'
 
 export const EVENT_TYPES: readonly EventType[] = [
   'movement.decided',
@@ -34,6 +37,9 @@ export const EVENT_TYPES: readonly EventType[] = [
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
+  'expectation.created',
+  'movement.recorded',
+  'journal.posted',
 ]
 
 export interface OutboxEvent {
@@ -153,6 +159,36 @@ export function expectationAmended(
     type: 'expectation.amended',
     subjectId: expectation.id,
     payload: json({ expectation: expectationJson(expectation), previous: expectationJson(previous), reason }),
+  }
+}
+
+/** A new expectation was recorded. */
+export function expectationCreated(expectation: Expectation): NewOutboxEvent {
+  return {
+    tenantId: expectation.tenantId,
+    type: 'expectation.created',
+    subjectId: expectation.id,
+    payload: json({ expectation: expectationJson(expectation) }),
+  }
+}
+
+/** A new movement was recorded. */
+export function movementRecorded(movement: Movement): NewOutboxEvent {
+  return {
+    tenantId: movement.tenantId,
+    type: 'movement.recorded',
+    subjectId: movement.id,
+    payload: json({ movement: movementJson(movement) }),
+  }
+}
+
+/** A journal entry was posted. */
+export function journalPosted(entry: JournalEntry): NewOutboxEvent {
+  return {
+    tenantId: entry.tenantId,
+    type: 'journal.posted',
+    subjectId: entry.id,
+    payload: json({ entry: journalEntryJson(entry) }),
   }
 }
 

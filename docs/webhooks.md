@@ -29,6 +29,11 @@ from a saved position and picks up where it stopped.
 | `expectation.amended` | its details were changed by a person | `expectation`, `previous`, `reason` |
 | `exception.opened` | something needs a person | `exception` |
 | `exception.resolved`, `exception.dismissed` | someone closed it | `exception` |
+| `expectation.created` | a new expectation was recorded | `expectation` |
+| `movement.recorded` | a new movement was ingested | `movement` |
+| `journal.posted` | a journal entry was posted | `entry` |
+
+Existing records get no events after the fact.
 
 `expectation.amended` carries both the new and the old record, so a consumer can see what changed;
 `reason` is the non-empty explanation required for the amendment. An amendment writes only this

@@ -111,7 +111,7 @@ import type {
   RewindQuery,
 } from './delivery.js'
 import { DELIVERY_ATTEMPT_LIMIT, DELIVERY_ATTEMPT_TTL_MS } from './delivery.js'
-import { exceptionChanged, expectationAmended, expectationChanged, movementDecided } from './events.js'
+import { exceptionChanged, expectationAmended, expectationChanged, expectationCreated, journalPosted, movementDecided, movementRecorded } from './events.js'
 import { expectationReferenceKeys } from '../matching/reference.js'
 
 export interface MemoryStoreOptions {
@@ -878,6 +878,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       this.draft.movements.set(movement.id, movement)
       this.draft.movementKeys.set(k, movement.id)
       inserted.push(movement)
+      this.emit(movementRecorded(movement))
     }
     return { inserted, duplicates, conflicts }
   }
@@ -1158,6 +1159,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.draft.expectations.set(expectation.id, expectation)
     this.draft.expectationRefs.set(refKey, expectation.id)
     addReferenceKeys(this.draft, expectation)
+    this.emit(expectationCreated(expectation))
     return expectation
   }
 
@@ -1288,6 +1290,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
     if (movement !== null) {
       this.draft.journalByMovement.set(movement.id, [...(this.draft.journalByMovement.get(movement.id) ?? []), entry.id])
     }
+    this.emit(journalPosted(entry))
     return entry
   }
 

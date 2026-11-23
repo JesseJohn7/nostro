@@ -104,8 +104,11 @@ import {
   issueMuxedId,
   expectationAmended,
   expectationChanged,
+  expectationCreated,
   expectationReferenceKeys,
+  journalPosted,
   movementDecided,
+  movementRecorded,
   sameFacts,
 } from '@nostro-labs/nostro'
 import type {
@@ -1235,6 +1238,9 @@ class MysqlTx extends MysqlReader implements StoreTx {
         conflicts.push({ existing, incoming: movement })
       }
     }
+    for (const m of inserted) {
+      await this.emit(movementRecorded(m))
+    }
     return { inserted, duplicates, conflicts }
   }
 
@@ -1398,7 +1404,9 @@ class MysqlTx extends MysqlReader implements StoreTx {
       throw err
     }
     const [row] = await this.run<ExpectationRow>(`SELECT * FROM ${this.s}.expectations WHERE id = ?`, [id])
-    return toExpectation(row!)
+    const exp = toExpectation(row!)
+    await this.emit(expectationCreated(exp))
+    return exp
   }
 
   async cancelExpectation(tenantId: string, id: string, reason: string): Promise<Expectation> {
@@ -1563,7 +1571,9 @@ class MysqlTx extends MysqlReader implements StoreTx {
     const lines = await this.run<JournalLineRow>(
       `SELECT * FROM ${this.s}.journal_lines WHERE entry_id = ? ORDER BY line_no`, [entryId],
     )
-    return toJournalEntry(entry!, lines)
+    const created = toJournalEntry(entry!, lines)
+    await this.emit(journalPosted(created))
+    return created
   }
 
   async openException(n: NewException): Promise<ExceptionRecord> {
