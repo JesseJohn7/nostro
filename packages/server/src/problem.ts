@@ -20,6 +20,8 @@ export type ProblemCode =
   | 'config_managed'
   | 'has_open_expectations'
   | 'internal'
+  | 'not_supported'
+  | 'too_many_requests'
 
 export interface Problem {
   readonly type: 'about:blank'
@@ -37,7 +39,9 @@ const TITLES: Readonly<Record<number, string>> = {
   409: 'Conflict',
   410: 'Gone',
   422: 'Unprocessable Content',
+  429: 'Too Many Requests',
   500: 'Internal Server Error',
+  501: 'Not Implemented',
 }
 
 export class HttpProblem extends Error {

@@ -57,14 +57,31 @@ export const query = {
     disposition: { enum: [...DISPOSITIONS] },
     account: { type: 'string', pattern: ACCOUNT },
     entityId: { type: 'string', minLength: 1, maxLength: 100 },
+    txHash: { type: 'string', pattern: HASH },
+    from: { type: 'string', format: 'date-time', description: 'Occurred on or after this instant.' },
+    to: { type: 'string', format: 'date-time', description: 'Occurred strictly before this instant.' },
+    fromLedger: { type: 'integer', minimum: 1, description: 'Ledger sequence on or after this value.' },
+    toLedger: { type: 'integer', minimum: 1, description: 'Ledger sequence strictly before this value.' },
+    counterparty: { type: 'string', pattern: ACCOUNT },
+    kind: { enum: [...MOVEMENT_KINDS] },
   }),
   expectations: listQuery({
     status: { type: 'string', pattern: `^(${statuses})(,(${statuses}))*$`, description: 'One or more, comma separated.' },
     account: { type: 'string', pattern: ACCOUNT },
   }),
+  expectationByReference: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['reference'],
+    properties: {
+      reference: { type: 'string', minLength: 1, maxLength: 256, description: 'The expectation reference.' },
+    },
+  } as const,
   exceptions: listQuery({
     status: { enum: ['open', 'resolved', 'dismissed'] },
     code: { enum: [...EXCEPTION_CODES] },
+    movementId: { type: 'string', minLength: 1, maxLength: 128 },
+    expectationId: { type: 'string', minLength: 1, maxLength: 128 },
   }),
   events: listQuery({}),
   schedules: {
@@ -340,7 +357,17 @@ const PROBLEM_CODES: readonly ProblemCode[] = [
   'config_managed',
   'has_open_expectations',
   'internal',
+  'not_supported',
+  'too_many_requests',
 ]
+
+export const createRoundBody = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    account: { type: 'string', pattern: ACCOUNT },
+  },
+} as const
 
 /** A `G...` account, the only kind the watch list takes. */
 export const accountBody = {
@@ -461,14 +488,155 @@ export const components = {
     description: str,
     lines: { type: 'array', items: ref('JournalLine') },
   }),
-  Event: record({
+  MovementDecidedEvent: record({
     id: str,
     seq: int,
-    type: { enum: [...EVENT_TYPES] },
+    type: { const: 'movement.decided' },
     subjectId: str,
     createdAt: time,
-    data: { type: 'object', description: 'The records the event is about, as they were; see docs/webhooks.md.' },
+    data: record({
+      movement: ref('Movement'),
+      previous: { enum: [...DISPOSITIONS] },
+      allocations: { type: 'array', items: ref('Allocation') },
+    }),
   }),
+  ExpectationPartiallyPaidEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'expectation.partially_paid' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      expectation: ref('Expectation'),
+      allocation: ref('Allocation'),
+    }),
+  }),
+  ExpectationSettledEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'expectation.settled' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      expectation: ref('Expectation'),
+      allocation: ref('Allocation'),
+    }),
+  }),
+  ExpectationCancelledEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'expectation.cancelled' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      expectation: ref('Expectation'),
+      allocation: { type: 'null' },
+    }),
+  }),
+  ExpectationAmendedEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'expectation.amended' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      expectation: ref('Expectation'),
+      previous: ref('Expectation'),
+      reason: str,
+    }),
+  }),
+  ExceptionOpenedEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'exception.opened' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      exception: ref('Exception'),
+    }),
+  }),
+  ExceptionResolvedEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'exception.resolved' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      exception: ref('Exception'),
+    }),
+  }),
+  ExceptionDismissedEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'exception.dismissed' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      exception: ref('Exception'),
+    }),
+  }),
+  ExpectationCreatedEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'expectation.created' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      expectation: ref('Expectation'),
+    }),
+  }),
+  MovementRecordedEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'movement.recorded' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      movement: ref('Movement'),
+    }),
+  }),
+  JournalPostedEvent: record({
+    id: str,
+    seq: int,
+    type: { const: 'journal.posted' },
+    subjectId: str,
+    createdAt: time,
+    data: record({
+      entry: ref('JournalEntry'),
+    }),
+  }),
+  Event: {
+    type: 'object',
+    oneOf: [
+      ref('MovementDecidedEvent'),
+      ref('ExpectationPartiallyPaidEvent'),
+      ref('ExpectationSettledEvent'),
+      ref('ExpectationCancelledEvent'),
+      ref('ExpectationAmendedEvent'),
+      ref('ExceptionOpenedEvent'),
+      ref('ExceptionResolvedEvent'),
+      ref('ExceptionDismissedEvent'),
+      ref('ExpectationCreatedEvent'),
+      ref('MovementRecordedEvent'),
+      ref('JournalPostedEvent'),
+    ],
+    discriminator: {
+      propertyName: 'type',
+      mapping: {
+        'movement.decided': '#/components/schemas/MovementDecidedEvent',
+        'expectation.partially_paid': '#/components/schemas/ExpectationPartiallyPaidEvent',
+        'expectation.settled': '#/components/schemas/ExpectationSettledEvent',
+        'expectation.cancelled': '#/components/schemas/ExpectationCancelledEvent',
+        'expectation.amended': '#/components/schemas/ExpectationAmendedEvent',
+        'exception.opened': '#/components/schemas/ExceptionOpenedEvent',
+        'exception.resolved': '#/components/schemas/ExceptionResolvedEvent',
+        'exception.dismissed': '#/components/schemas/ExceptionDismissedEvent',
+        'expectation.created': '#/components/schemas/ExpectationCreatedEvent',
+        'movement.recorded': '#/components/schemas/MovementRecordedEvent',
+        'journal.posted': '#/components/schemas/JournalPostedEvent',
+      },
+    },
+  },
   DeliveryAttempt: record({
     id: str,
     seq: int,
@@ -542,6 +710,11 @@ export const components = {
     expectation: ref('Expectation'),
     allocations: { type: 'array', items: ref('Allocation') },
   }),
+  ExceptionDetail: record({
+    exception: ref('Exception'),
+    movement: nullable(ref('Movement')),
+    expectation: nullable(ref('Expectation')),
+  }),
   Resolution: record({
     movement: nullable(ref('Movement')),
     allocations: { type: 'array', items: ref('Allocation') },
@@ -586,6 +759,26 @@ export const components = {
     sync: { type: 'array', items: ref('SyncState') },
   }),
   WatchedAccountList: record({ data: { type: 'array', items: ref('WatchedAccount') } }),
+  RoundError: record({
+    account: nullable(str),
+    message: str,
+  }),
+  RoundSummary: record({
+    movementsInserted: int,
+    movementsDecided: int,
+    errors: { type: 'array', items: ref('RoundError') },
+  }),
+  Round: record({
+    id: str,
+    tenantId: str,
+    account: nullable(str),
+    state: { enum: ['queued', 'running', 'done', 'failed'] },
+    queuedAt: time,
+    startedAt: nullable(time),
+    finishedAt: nullable(time),
+    summary: nullable(ref('RoundSummary')),
+    error: nullable(str),
+  }),
   ...Object.fromEntries(
     ['Movement', 'Expectation', 'Exception', 'JournalEntry', 'Event', 'DeliveryAttempt'].map((name) => [
       `${name}Page`,

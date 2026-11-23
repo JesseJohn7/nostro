@@ -118,8 +118,11 @@ import {
   issueMuxedId,
   expectationAmended,
   expectationChanged,
+  expectationCreated,
   expectationReferenceKeys,
+  journalPosted,
   movementDecided,
+  movementRecorded,
   sameFacts,
 } from '@nostro-labs/nostro'
 import type {
@@ -306,6 +309,12 @@ class PgReader implements StoreReader {
       .add((p) => `account = ${p}`, q.account)
       .add((p) => `entity_id = ${p}`, q.entityId)
       .add((p) => `tx_hash = ${p}`, q.txHash)
+      .add((p) => `counterparty = ${p}`, q.counterparty)
+      .add((p) => `kind = ${p}`, q.kind)
+      .add((p) => `ledger >= ${p}`, q.fromLedger)
+      .add((p) => `ledger < ${p}`, q.toLedger)
+      .add((p) => `occurred_at >= ${p}`, q.occurredFrom)
+      .add((p) => `occurred_at < ${p}`, q.occurredBefore)
       .add((p) => `seq > ${p}`, q.afterSeq)
     const sql = `SELECT * FROM ${this.s}.movements${w} ORDER BY seq${w.limit(q.limit)}`
     return (await this.run<MovementRow>(sql, w.params)).map(toMovement)
@@ -1253,6 +1262,9 @@ class PgTx extends PgReader implements StoreTx {
         conflicts.push({ existing, incoming: movement })
       }
     }
+    for (const m of inserted) {
+      await this.emit(movementRecorded(m))
+    }
     return { inserted, duplicates, conflicts }
   }
 
@@ -1383,7 +1395,9 @@ class PgTx extends PgReader implements StoreTx {
           [n.tenantId, normalized, row!.id],
         )
       }
-      return toExpectation(row!)
+      const exp = toExpectation(row!)
+      await this.emit(expectationCreated(exp))
+      return exp
     } catch (err) {
       await this.run(`ROLLBACK TO SAVEPOINT ${savepoint}`)
       if (isUniqueViolation(err, 'expectations_reference_unique')) throw taken()
@@ -1574,7 +1588,9 @@ class PgTx extends PgReader implements StoreTx {
       [entry!.id, n.tenantId, JSON.stringify(lineRows)],
     )
     lines.sort((a, b) => a.line_no - b.line_no)
-    return toJournalEntry(entry!, lines)
+    const created = toJournalEntry(entry!, lines)
+    await this.emit(journalPosted(created))
+    return created
   }
 
   async openException(n: NewException): Promise<ExceptionRecord> {

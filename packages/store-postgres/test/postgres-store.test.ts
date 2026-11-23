@@ -177,6 +177,56 @@ if (pool === undefined) {
       expect(events[0]!.seq).toBeLessThan(events[1]!.seq)
     })
 
+    it('commits sync and reconcile events in seq order under concurrency via advisory lock', async () => {
+      const store = await freshStore()
+      const account = `G${'A'.repeat(55)}`
+      let releaseSync!: () => void
+      const holdSync = new Promise<void>((r) => (releaseSync = r))
+      let syncStarted!: () => void
+      const syncEmitted = new Promise<void>((r) => (syncStarted = r))
+
+      // Sync transaction inserts a movement and holds before commit
+      const syncTx = store.transaction(async (tx) => {
+        await tx.insertMovements([
+          {
+            tenantId: 't',
+            network: 'testnet',
+            source: 'horizon',
+            externalId: 'ext-sync-1',
+            account,
+            direction: 'credit',
+            kind: 'transfer',
+            amount: Money.parse('10', NATIVE),
+            ledger: 1000,
+            occurredAt: new Date('2026-10-01T00:00:00Z'),
+          },
+        ])
+        syncStarted()
+        await holdSync
+      })
+
+      await syncEmitted
+      let reconcileDone = false
+      // Reconcile transaction tries to emit an event for the same tenant concurrently
+      const reconcileTx = store.transaction(async (tx) => {
+        await tx.openException({ tenantId: 't', code: 'MEMO_MISSING', account, detail: 'reconcile-concurrent' })
+      }).then(() => {
+        reconcileDone = true
+      })
+
+      await new Promise((r) => setTimeout(r, 200))
+      // Reconcile must be waiting on the per-tenant advisory lock held by the sync tx
+      expect(reconcileDone).toBe(false)
+      expect(await store.listEvents({ tenantId: 't' })).toEqual([])
+
+      releaseSync()
+      await Promise.all([syncTx, reconcileTx])
+
+      const events = await store.listEvents({ tenantId: 't' })
+      expect(events.map((e) => e.type)).toEqual(['movement.recorded', 'exception.opened'])
+      expect(events[0]!.seq).toBeLessThan(events[1]!.seq)
+    })
+
     it('keeps amounts exact beyond 64 bits', async () => {
       const store = await freshStore()
       const huge = Money.fromRaw(2n ** 100n + 7n, NATIVE)

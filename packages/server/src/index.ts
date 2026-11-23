@@ -1,5 +1,5 @@
 export { createServer } from './server.js'
-export type { ServerOptions } from './server.js'
+export type { RoundRecord, RoundRunner, RoundState, RoundSummary, ServerOptions } from './server.js'
 export { MIN_KEY_LENGTH, apiKeys, firstOf, keyDigest, storedKeys } from './auth.js'
 export type { StoredKeys } from './auth.js'
 export type { Authenticate, KeyGrant, Principal } from './auth.js'

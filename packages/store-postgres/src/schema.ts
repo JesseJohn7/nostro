@@ -131,6 +131,9 @@ const EVENT_TYPES = list([
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
+  'expectation.created',
+  'movement.recorded',
+  'journal.posted',
 ])
 const EXCEPTION_CODES = list([
   'UNMATCHED_NO_CANDIDATE',
@@ -807,5 +810,25 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       updated_at        timestamptz NOT NULL
     );
     CREATE INDEX IF NOT EXISTS schedules_tenant ON ${s}.schedules (tenant_id, ended_at, start_at);
+  `,
+  (s) => `
+    CREATE INDEX IF NOT EXISTS movements_tx_hash ON ${s}.movements (tenant_id, tx_hash) WHERE tx_hash IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS movements_ledger ON ${s}.movements (tenant_id, ledger, seq);
+    CREATE INDEX IF NOT EXISTS movements_occurred ON ${s}.movements (tenant_id, occurred_at, seq);
+    CREATE INDEX IF NOT EXISTS movements_counterparty ON ${s}.movements (tenant_id, counterparty, seq) WHERE counterparty IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS movements_kind ON ${s}.movements (tenant_id, kind, seq);
+  `,
+  (s) => `
+    DO $do$
+    DECLARE c text;
+    BEGIN
+      FOR c IN
+        SELECT conname FROM pg_constraint
+        WHERE conrelid = '${s}.events'::regclass AND contype = 'c' AND pg_get_constraintdef(oid) LIKE '%type%'
+      LOOP
+        EXECUTE format('ALTER TABLE ${s}.events DROP CONSTRAINT %I', c);
+      END LOOP;
+    END $do$;
+    ALTER TABLE ${s}.events ADD CONSTRAINT events_type_check CHECK (type IN (${EVENT_TYPES}));
   `,
 ]

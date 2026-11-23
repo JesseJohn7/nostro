@@ -202,6 +202,58 @@ export function describeStoreConformance(
         const page = await store.listMovements({ tenantId: T, afterSeq: a.seq, limit: 1 })
         expect(page.map((m) => m.id)).toEqual([b.id])
       })
+
+      it('filters movements by txHash, ledger range, occurredAt range, counterparty and kind with paging', async () => {
+        const m1 = await record({ txHash: 'a'.repeat(64), ledger: 100, occurredAt: new Date('2026-10-01T10:00:00Z'), counterparty: PAYER, kind: 'transfer' })
+        const m2 = await record({ txHash: 'b'.repeat(64), ledger: 200, occurredAt: new Date('2026-10-01T11:00:00Z'), counterparty: PAYER, kind: 'transfer' })
+        const m3 = await record({ txHash: 'c'.repeat(64), ledger: 300, occurredAt: new Date('2026-10-01T12:00:00Z'), counterparty: OTHER_ACCOUNT, kind: 'fee' })
+        const m4 = await record({ txHash: 'd'.repeat(64), ledger: 400, occurredAt: new Date('2026-10-01T13:00:00Z'), counterparty: PAYER, kind: 'transfer' })
+
+        // txHash filter & tenant isolation
+        expect((await store.listMovements({ tenantId: T, txHash: 'b'.repeat(64) })).map((m) => m.id)).toEqual([m2.id])
+        expect(await store.listMovements({ tenantId: T2, txHash: 'b'.repeat(64) })).toEqual([])
+
+        // ledger range: half-open [200, 400)
+        const ledgers = await store.listMovements({ tenantId: T, fromLedger: 200, toLedger: 400 })
+        expect(ledgers.map((m) => m.id)).toEqual([m2.id, m3.id])
+        const ledgerPage1 = await store.listMovements({ tenantId: T, fromLedger: 200, toLedger: 400, limit: 1 })
+        expect(ledgerPage1.map((m) => m.id)).toEqual([m2.id])
+        const ledgerPage2 = await store.listMovements({ tenantId: T, fromLedger: 200, toLedger: 400, afterSeq: m2.seq, limit: 1 })
+        expect(ledgerPage2.map((m) => m.id)).toEqual([m3.id])
+
+        // occurredAt range: half-open [11:00, 13:00)
+        const times = await store.listMovements({
+          tenantId: T,
+          occurredFrom: new Date('2026-10-01T11:00:00Z'),
+          occurredBefore: new Date('2026-10-01T13:00:00Z'),
+        })
+        expect(times.map((m) => m.id)).toEqual([m2.id, m3.id])
+
+        // counterparty and kind
+        expect((await store.listMovements({ tenantId: T, counterparty: OTHER_ACCOUNT })).map((m) => m.id)).toEqual([m3.id])
+        expect((await store.listMovements({ tenantId: T, kind: 'fee' })).map((m) => m.id)).toEqual([m3.id])
+
+        // Combined filters with paging: payers and transfers in [100, 500)
+        const combined1 = await store.listMovements({
+          tenantId: T,
+          counterparty: PAYER,
+          kind: 'transfer',
+          fromLedger: 100,
+          toLedger: 500,
+          limit: 2,
+        })
+        expect(combined1.map((m) => m.id)).toEqual([m1.id, m2.id])
+        const combined2 = await store.listMovements({
+          tenantId: T,
+          counterparty: PAYER,
+          kind: 'transfer',
+          fromLedger: 100,
+          toLedger: 500,
+          afterSeq: combined1[1]!.seq,
+          limit: 2,
+        })
+        expect(combined2.map((m) => m.id)).toEqual([m4.id])
+      })
     })
 
     describe('entities (conformance)', () => {
@@ -764,6 +816,39 @@ export function describeStoreConformance(
         })
         expect(gap.account).toBe(ACCOUNT)
       })
+
+      it('filters exceptions by movementId and expectationId with paging', async () => {
+        const m1 = await record()
+        const m2 = await record()
+        const exp = await expect10()
+        const ex1 = await store.transaction((tx) =>
+          tx.openException({ tenantId: T, code: 'AMBIGUOUS_MATCH', movementId: m1.id, detail: 'm1-ex' }),
+        )
+        const ex2 = await store.transaction((tx) =>
+          tx.openException({ tenantId: T, code: 'WRONG_ASSET', movementId: m2.id, expectationId: exp.id, detail: 'm2-exp-ex' }),
+        )
+        const ex3 = await store.transaction((tx) =>
+          tx.openException({ tenantId: T, code: 'OVERPAYMENT', movementId: m1.id, detail: 'm1-ex2' }),
+        )
+
+        // Filter by movementId
+        const byM1 = await store.listExceptions({ tenantId: T, movementId: m1.id })
+        expect(byM1.map((e) => e.id)).toEqual([ex1.id, ex3.id])
+
+        // Paging with movementId
+        const page1 = await store.listExceptions({ tenantId: T, movementId: m1.id, limit: 1 })
+        expect(page1.map((e) => e.id)).toEqual([ex1.id])
+        const page2 = await store.listExceptions({ tenantId: T, movementId: m1.id, afterSeq: ex1.seq, limit: 1 })
+        expect(page2.map((e) => e.id)).toEqual([ex3.id])
+
+        // Filter by expectationId
+        const byExp = await store.listExceptions({ tenantId: T, expectationId: exp.id })
+        expect(byExp.map((e) => e.id)).toEqual([ex2.id])
+
+        // Tenant isolation
+        expect(await store.listExceptions({ tenantId: T2, movementId: m1.id })).toEqual([])
+        expect(await store.listExceptions({ tenantId: T2, expectationId: exp.id })).toEqual([])
+      })
     })
 
     describe('the event log', () => {
@@ -784,19 +869,26 @@ export function describeStoreConformance(
         })
         const listed = await events()
         expect(listed.map((x) => [x.type, x.subjectId])).toEqual([
+          ['expectation.created', e.id],
+          ['movement.recorded', m1.id],
+          ['movement.recorded', m2.id],
           ['expectation.partially_paid', e.id],
           ['movement.decided', m1.id],
           ['expectation.settled', e.id],
           ['movement.decided', m2.id],
         ])
         expect(listed.map((x) => x.seq)).toEqual([...listed.map((x) => x.seq)].sort((a, b) => a - b))
-        expect(new Set(listed.map((x) => x.id)).size).toBe(4)
+        expect(new Set(listed.map((x) => x.id)).size).toBe(7)
         expect(listed.every((x) => x.tenantId === T && x.createdAt instanceof Date)).toBe(true)
 
-        const paid = listed[0]!.payload as Data
+        const expCreated = listed[0]!.payload as Data
+        expect(expCreated.expectation).toMatchObject({ id: e.id, status: 'open', amount: '10.0000000', asset: USDC })
+        const movRecorded1 = listed[1]!.payload as Data
+        expect(movRecorded1.movement).toMatchObject({ id: m1.id, disposition: 'pending', amount: '4.0000000' })
+        const paid = listed[3]!.payload as Data
         expect(paid.expectation).toMatchObject({ id: e.id, status: 'partially_paid', amount: '10.0000000', asset: USDC })
         expect(paid.allocation).toMatchObject({ movementId: m1.id, amount: '4.0000000', strategy: 'memo_text', score: 0.85 })
-        const decided = listed[1]!.payload as Data
+        const decided = listed[4]!.payload as Data
         expect(decided.previous).toBe('pending')
         expect(decided.movement).toMatchObject({ id: m1.id, disposition: 'allocated', amount: '4.0000000' })
         expect(decided.allocations).toEqual([expect.objectContaining({ expectationId: e.id, amount: '4.0000000' })])
@@ -811,11 +903,11 @@ export function describeStoreConformance(
             throw new Error('changed my mind')
           }),
         ).rejects.toThrow('changed my mind')
-        expect(await events()).toEqual([])
+        expect(await events()).toEqual([expect.objectContaining({ type: 'movement.recorded', subjectId: m.id })])
 
         await store.transaction((tx) => tx.setDisposition(T, m.id, 'ignored', 'test payment'))
         await store.transaction((tx) => tx.setDisposition(T, m.id, 'ignored', 'still a test payment'))
-        expect((await events()).map((x) => x.type)).toEqual(['movement.decided'])
+        expect((await events()).map((x) => x.type)).toEqual(['movement.recorded', 'movement.decided'])
       })
 
       it('records exceptions opening and closing, and cancellations', async () => {
@@ -828,14 +920,16 @@ export function describeStoreConformance(
         await store.transaction((tx) => tx.cancelExpectation(T, e.id, 'customer withdrew'))
         const listed = await events()
         expect(listed.map((x) => [x.type, x.subjectId])).toEqual([
+          ['movement.recorded', m.id],
           ['exception.opened', a.id],
           ['exception.opened', b.id],
           ['exception.resolved', a.id],
           ['exception.dismissed', b.id],
+          ['expectation.created', e.id],
           ['expectation.cancelled', e.id],
         ])
-        expect((listed[2]!.payload as Data).exception).toMatchObject({ status: 'resolved', resolutionNote: 'INV-2' })
-        expect((listed[4]!.payload as Data).allocation).toBeNull()
+        expect((listed[3]!.payload as Data).exception).toMatchObject({ status: 'resolved', resolutionNote: 'INV-2' })
+        expect((listed[6]!.payload as Data).allocation).toBeNull()
       })
 
       it('pages within a tenant', async () => {
@@ -845,10 +939,68 @@ export function describeStoreConformance(
         }
         await store.transaction((tx) => tx.openException({ tenantId: T2, code: 'MEMO_MISSING', account: ACCOUNT, detail: 'other' }))
         const all = await events()
-        expect(all).toHaveLength(3)
+        expect(all).toHaveLength(4)
         expect(await events(T2)).toHaveLength(1)
         expect((await store.listEvents({ tenantId: T, afterSeq: all[0]!.seq, limit: 1 })).map((x) => x.id)).toEqual([all[1]!.id])
-        expect(await store.listEvents({ tenantId: T, afterSeq: all[2]!.seq })).toEqual([])
+        expect(await store.listEvents({ tenantId: T, afterSeq: all[3]!.seq })).toEqual([])
+      })
+
+      it('writes events for new expectations, movements, and journal entries, and leaves none on rollback', async () => {
+        // Rollback leaves no events
+        await expect(
+          store.transaction(async (tx) => {
+            const exp = await tx.insertExpectation({ tenantId: T, reference: 'INV-RB', account: ACCOUNT, amount: usdc('10') })
+            const { inserted } = await tx.insertMovements([movement({ externalId: 'ext-rb', amount: usdc('10') })])
+            await tx.postJournalEntry({
+              tenantId: T,
+              movementId: inserted[0]!.id,
+              postingNo: 1,
+              kind: 'initial',
+              description: 'Rollback test',
+              lines: [
+                { account: 'cash', role: 'cash', side: 'debit', amount: usdc('10') },
+                { account: 'unapplied', role: 'unapplied', side: 'credit', amount: usdc('10') },
+              ],
+            })
+            throw new Error('abort write')
+          }),
+        ).rejects.toThrow('abort write')
+        expect(await events()).toEqual([])
+
+        // Successful commit writes events with payloads
+        const exp = await store.transaction((tx) =>
+          tx.insertExpectation({ tenantId: T, reference: 'INV-OK', account: ACCOUNT, amount: usdc('10') }),
+        )
+        const { inserted } = await store.transaction((tx) =>
+          tx.insertMovements([movement({ externalId: 'ext-ok', amount: usdc('10') })]),
+        )
+        const mov = inserted[0]!
+        const jEntry = await store.transaction((tx) =>
+          tx.postJournalEntry({
+            tenantId: T,
+            movementId: mov.id,
+            postingNo: 1,
+            kind: 'initial',
+            description: 'Post journal test',
+            lines: [
+              { account: 'cash', role: 'cash', side: 'debit', amount: usdc('10') },
+              { account: 'unapplied', role: 'unapplied', side: 'credit', amount: usdc('10') },
+            ],
+          }),
+        )
+
+        const all = await events()
+        expect(all.map((x) => [x.type, x.subjectId])).toEqual([
+          ['expectation.created', exp.id],
+          ['movement.recorded', mov.id],
+          ['journal.posted', jEntry.id],
+        ])
+        const p0 = all[0]!.payload as Data
+        expect(p0.expectation).toMatchObject({ id: exp.id, reference: 'INV-OK' })
+        const p1 = all[1]!.payload as Data
+        expect(p1.movement).toMatchObject({ id: mov.id, externalId: 'ext-ok' })
+        const p2 = all[2]!.payload as Data
+        expect(p2.entry).toMatchObject({ id: jEntry.id, description: 'Post journal test' })
       })
     })
 

@@ -9,7 +9,7 @@
 import { Readable } from 'node:stream'
 import Fastify from 'fastify'
 import type { FastifyError, FastifyInstance, FastifyServerOptions } from 'fastify'
-import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, NewExpectation, NewSchedule, Store } from '@nostro-labs/nostro'
+import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, MovementKind, NewExpectation, NewSchedule, Store } from '@nostro-labs/nostro'
 import {
   ConsumerPositionConflict,
   ConstraintError,
@@ -53,7 +53,7 @@ import type { Authenticate, Principal } from './auth.js'
 import { ROUTE_SCOPES } from './scopes.js'
 import { buildOpenApi } from './openapi.js'
 import { HttpProblem } from './problem.js'
-import { UINT64, accountBody, accountParams, amendExpectationBody, batchResolveBody, cancelExpectationBody, consumerParams, expectationBody, idParams, postJournalBody, query, removeAccountQuery, replayBody, resolveBody, scheduleBody } from './schemas.js'
+import { UINT64, accountBody, accountParams, amendExpectationBody, batchResolveBody, cancelExpectationBody, consumerParams, createRoundBody, expectationBody, idParams, postJournalBody, query, removeAccountQuery, replayBody, resolveBody, scheduleBody } from './schemas.js'
 
 declare module 'fastify' {
   interface FastifyRequest {
@@ -64,11 +64,37 @@ declare module 'fastify' {
   }
 }
 
+export interface RoundSummary {
+  readonly movementsInserted: number
+  readonly movementsDecided: number
+  readonly errors: readonly { readonly account?: string | null; readonly message: string }[]
+}
+
+export type RoundState = 'queued' | 'running' | 'done' | 'failed'
+
+export interface RoundRecord {
+  readonly id: string
+  readonly tenantId: string
+  readonly account?: string | null
+  readonly state: RoundState
+  readonly queuedAt: string
+  readonly startedAt?: string | null
+  readonly finishedAt?: string | null
+  readonly summary?: RoundSummary | null
+  readonly error?: string | null
+}
+
+export interface RoundRunner {
+  triggerRound(tenantId: string, account?: string): Promise<{ id: string; round: RoundRecord }>
+  getRound(tenantId: string, id: string): Promise<RoundRecord | null>
+}
+
 export interface ServerOptions {
   readonly store: Store
   readonly authenticate: Authenticate
   /** Passed to Fastify; `false` (the default) for no request log. */
   readonly logger?: FastifyServerOptions['logger']
+  readonly roundRunner?: RoundRunner
 }
 
 const UINT64_MAX = (1n << 64n) - 1n
@@ -310,6 +336,27 @@ export function createServer(options: ServerOptions): FastifyInstance {
         return reply.code(201).header('location', `/v1/accounts/${body.account}`).send(json)
       })
 
+      v1.post<{ Body: { account?: string } }>('/rounds', { schema: { body: createRoundBody } }, async (request, reply) => {
+        const { tenantId, body } = request
+        if (options.roundRunner === undefined) {
+          throw new HttpProblem(501, 'not_supported', 'Manual rounds are not supported in this server configuration (serve hook not configured).')
+        }
+        const { id, round } = await options.roundRunner.triggerRound(tenantId, body?.account)
+        return reply.code(202).header('location', `/v1/rounds/${id}`).send(round)
+      })
+
+      v1.get<{ Params: { id: string } }>('/rounds/:id', { schema: { params: idParams } }, async (request, reply) => {
+        const { tenantId, params } = request
+        if (options.roundRunner === undefined) {
+          throw new HttpProblem(501, 'not_supported', 'Manual rounds are not supported in this server configuration.')
+        }
+        const round = await options.roundRunner.getRound(tenantId, params.id)
+        if (round === null || round.tenantId !== tenantId) {
+          throw new HttpProblem(404, 'not_found', `Round ${params.id} not found.`)
+        }
+        return reply.code(200).send(round)
+      })
+
       v1.delete<{ Params: { account: string }; Querystring: { force?: boolean } }>(
         '/accounts/:account',
         { schema: { params: accountParams, querystring: removeAccountQuery } },
@@ -335,7 +382,20 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: Paging & { disposition?: Disposition; account?: string; entityId?: string } }>(
+      v1.get<{
+        Querystring: Paging & {
+          disposition?: Disposition
+          account?: string
+          entityId?: string
+          txHash?: string
+          from?: string
+          to?: string
+          fromLedger?: number
+          toLedger?: number
+          counterparty?: string
+          kind?: MovementKind
+        }
+      }>(
         '/movements',
         { schema: { querystring: query.movements } },
         async ({ tenantId, query: q }) =>
@@ -347,6 +407,13 @@ export function createServer(options: ServerOptions): FastifyInstance {
               ...(q.disposition === undefined ? {} : { disposition: q.disposition }),
               ...(q.account === undefined ? {} : { account: q.account }),
               ...(q.entityId === undefined ? {} : { entityId: q.entityId }),
+              ...(q.txHash === undefined ? {} : { txHash: q.txHash }),
+              ...(q.from === undefined ? {} : { occurredFrom: new Date(q.from) }),
+              ...(q.to === undefined ? {} : { occurredBefore: new Date(q.to) }),
+              ...(q.fromLedger === undefined ? {} : { fromLedger: q.fromLedger }),
+              ...(q.toLedger === undefined ? {} : { toLedger: q.toLedger }),
+              ...(q.counterparty === undefined ? {} : { counterparty: q.counterparty }),
+              ...(q.kind === undefined ? {} : { kind: q.kind }),
             }),
             q.limit,
             movementJson,
@@ -445,6 +512,17 @@ export function createServer(options: ServerOptions): FastifyInstance {
           ),
       )
 
+      v1.get<{ Querystring: { reference: string } }>(
+        '/expectations/by-reference',
+        { schema: { querystring: query.expectationByReference } },
+        async ({ tenantId, query: q }) => {
+          const expectation = await store.getExpectationByReference(tenantId, q.reference)
+          if (expectation === null) throw new HttpProblem(404, 'not_found', `No expectation with reference ${q.reference}.`)
+          const allocations = await store.listAllocations({ tenantId, expectationId: expectation.id })
+          return { expectation: expectationJson(expectation), allocations: allocations.map(allocationJson) }
+        },
+      )
+
       v1.get<{ Params: { id: string } }>('/expectations/:id', { schema: { params: idParams } }, async ({ tenantId, params }) => {
         const expectation = await store.getExpectation(tenantId, params.id)
         if (expectation === null) throw new HttpProblem(404, 'not_found', `No expectation ${params.id}.`)
@@ -519,7 +597,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: Paging & { status?: ExceptionStatus; code?: ExceptionCode } }>(
+      v1.get<{ Querystring: Paging & { status?: ExceptionStatus; code?: ExceptionCode; movementId?: string; expectationId?: string } }>(
         '/exceptions',
         { schema: { querystring: query.exceptions } },
         async ({ tenantId, query: q }) =>
@@ -530,11 +608,25 @@ export function createServer(options: ServerOptions): FastifyInstance {
               ...after(q),
               ...(q.status === undefined ? {} : { status: q.status }),
               ...(q.code === undefined ? {} : { code: q.code }),
+              ...(q.movementId === undefined ? {} : { movementId: q.movementId }),
+              ...(q.expectationId === undefined ? {} : { expectationId: q.expectationId }),
             }),
             q.limit,
             exceptionJson,
           ),
       )
+
+      v1.get<{ Params: { id: string } }>('/exceptions/:id', { schema: { params: idParams } }, async ({ tenantId, params }) => {
+        const exception = await store.getException(tenantId, params.id)
+        if (exception === null) throw new HttpProblem(404, 'not_found', `No exception ${params.id}.`)
+        const movement = exception.movementId ? await store.getMovement(tenantId, exception.movementId) : null
+        const expectation = exception.expectationId ? await store.getExpectation(tenantId, exception.expectationId) : null
+        return {
+          exception: exceptionJson(exception),
+          movement: movement ? movementJson(movement) : null,
+          expectation: expectation ? expectationJson(expectation) : null,
+        }
+      })
 
       v1.get<{ Querystring: Paging }>('/events', { schema: { querystring: query.events } }, async ({ tenantId, query: q }) => {
         try {

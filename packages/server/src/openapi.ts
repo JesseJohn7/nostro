@@ -3,7 +3,7 @@
  * server validates requests with. Served at `GET /v1/openapi.json`.
  */
 import { readFileSync } from 'node:fs'
-import { accountParams, batchResolveBody, components, expectationBody, postJournalBody, query, ref, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
+import { accountParams, batchResolveBody, components, createRoundBody, expectationBody, postJournalBody, query, ref, removeAccountQuery, replayBody, resolveBody } from './schemas.js'
 import { ROUTE_SCOPES } from './scopes.js'
 
 /** This package's version, which is the API's. */
@@ -24,6 +24,50 @@ const errors = {
   '401': problem('No valid API key (`unauthorized`).'),
   '403': problem('The API key lacks the scope this operation needs (`forbidden`).'),
   '500': problem('Something failed inside the server (`internal`); the detail says nothing more.'),
+}
+
+function webhookOp(eventType: string, schemaName: string, summary: string) {
+  return {
+    post: {
+      summary,
+      parameters: [
+        {
+          name: 'Nostro-Signature',
+          in: 'header',
+          required: true,
+          schema: { type: 'string' },
+          description: 'HMAC-SHA256 signature: t=<unix_timestamp>,v1=<hex_signature>',
+        },
+        {
+          name: 'Nostro-Event-Id',
+          in: 'header',
+          required: true,
+          schema: { type: 'string' },
+          description: 'Unique event identifier',
+        },
+        {
+          name: 'Nostro-Event-Type',
+          in: 'header',
+          required: true,
+          schema: { type: 'string', const: eventType },
+          description: 'The event type',
+        },
+      ],
+      requestBody: {
+        required: true,
+        content: {
+          'application/json': {
+            schema: ref(schemaName),
+          },
+        },
+      },
+      responses: {
+        '200': {
+          description: 'The event was received and stored; any 2xx status acknowledges receipt.',
+        },
+      },
+    },
+  }
 }
 
 /** Each property of a querystring schema, as an OpenAPI query parameter. */
@@ -206,6 +250,14 @@ export function buildOpenApi() {
           },
         },
       },
+      '/v1/expectations/by-reference': {
+        get: {
+          operationId: 'getExpectationByReference',
+          summary: 'Look up an expectation by its unique reference',
+          parameters: parameters(query.expectationByReference as any),
+          responses: { '200': ok('ExpectationDetail'), '404': problem('No such expectation in this tenant (`not_found`).'), ...errors },
+        },
+      },
       '/v1/expectations/{id}': {
         get: {
           operationId: 'getExpectation',
@@ -252,6 +304,14 @@ export function buildOpenApi() {
           responses: { '200': ok('ExceptionPage'), ...errors },
         },
       },
+      '/v1/exceptions/{id}': {
+        get: {
+          operationId: 'getException',
+          summary: 'One exception, with its movement and its expectation',
+          parameters: [idParam('exception')],
+          responses: { '200': ok('ExceptionDetail'), '404': problem('No such exception in this tenant (`not_found`).'), ...errors },
+        },
+      },
       '/v1/exceptions/{id}/resolve': {
         post: {
           operationId: 'resolveException',
@@ -290,6 +350,36 @@ export function buildOpenApi() {
           responses: {
             '200': ok('EventPage'),
             '410': problem('The requested `after` position was pruned; resume after the reported sequence (`event_history_pruned`).'),
+            ...errors,
+          },
+        },
+      },
+      '/v1/rounds': {
+        post: {
+          operationId: 'triggerRound',
+          summary: 'Ask serve to run a sync and reconcile round now',
+          requestBody: { content: { 'application/json': { schema: createRoundBody } } },
+          responses: {
+            '202': {
+              description: 'Round queued or running',
+              headers: { Location: { schema: { type: 'string' } } },
+              content: { 'application/json': { schema: ref('Round') } },
+            },
+            '429': problem('Rate limit exceeded: at most 5 requests per minute per tenant (`too_many_requests`).'),
+            '501': problem('Manual rounds are not supported in this server configuration (`not_supported`).'),
+            ...errors,
+          },
+        },
+      },
+      '/v1/rounds/{id}': {
+        get: {
+          operationId: 'getRound',
+          summary: "Read a round's status and summary report",
+          parameters: [idParam('round')],
+          responses: {
+            '200': ok('Round', 'The round record'),
+            '404': problem('The round was not found or belongs to another tenant (`not_found`).'),
+            '501': problem('Manual rounds are not supported in this server configuration (`not_supported`).'),
             ...errors,
           },
         },
@@ -455,6 +545,19 @@ export function buildOpenApi() {
           },
         },
       },
+    },
+    webhooks: {
+      'movement.decided': webhookOp('movement.decided', 'MovementDecidedEvent', "A movement's disposition changed"),
+      'expectation.partially_paid': webhookOp('expectation.partially_paid', 'ExpectationPartiallyPaidEvent', 'An allocation part-paid an expectation'),
+      'expectation.settled': webhookOp('expectation.settled', 'ExpectationSettledEvent', 'An allocation paid an expectation in full'),
+      'expectation.cancelled': webhookOp('expectation.cancelled', 'ExpectationCancelledEvent', 'An expectation was cancelled'),
+      'expectation.amended': webhookOp('expectation.amended', 'ExpectationAmendedEvent', 'An expectation was amended'),
+      'exception.opened': webhookOp('exception.opened', 'ExceptionOpenedEvent', 'An exception was opened'),
+      'exception.resolved': webhookOp('exception.resolved', 'ExceptionResolvedEvent', 'An exception was resolved'),
+      'exception.dismissed': webhookOp('exception.dismissed', 'ExceptionDismissedEvent', 'An exception was dismissed'),
+      'expectation.created': webhookOp('expectation.created', 'ExpectationCreatedEvent', 'A new expectation was recorded'),
+      'movement.recorded': webhookOp('movement.recorded', 'MovementRecordedEvent', 'A new movement was ingested'),
+      'journal.posted': webhookOp('journal.posted', 'JournalPostedEvent', 'A journal entry was posted'),
     },
     components: {
       securitySchemes: {

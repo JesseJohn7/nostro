@@ -29,6 +29,11 @@ from a saved position and picks up where it stopped.
 | `expectation.amended` | its details were changed by a person | `expectation`, `previous`, `reason` |
 | `exception.opened` | something needs a person | `exception` |
 | `exception.resolved`, `exception.dismissed` | someone closed it | `exception` |
+| `expectation.created` | a new expectation was recorded | `expectation` |
+| `movement.recorded` | a new movement was ingested | `movement` |
+| `journal.posted` | a journal entry was posted | `entry` |
+
+Existing records get no events after the fact.
 
 `expectation.amended` carries both the new and the old record, so a consumer can see what changed;
 `reason` is the non-empty explanation required for the amendment. An amendment writes only this
@@ -54,6 +59,14 @@ and ids and dates are strings.
   "data": { "expectation": { "reference": "INV-1042", "amount": "25.0000000", "asset": "native", "status": "settled", "…": "…" }, "allocation": { "…": "…" } }
 }
 ```
+
+## Payload evolution and change policy
+
+Every event type is described by its OpenAPI schema in `packages/server/src/schemas.ts` and registered in the OpenAPI 3.1 `webhooks` section. To prevent drift, tests validate emitted events directly against these schemas.
+
+- **Open vs closed schemas:** Nostro's internal contract tests enforce closed schemas (`additionalProperties: false`) to guarantee that every field emitted by the server is explicitly documented. Receivers, however, should treat event schemas as open: accept unknown properties without failing so that future non-breaking additions do not disrupt working integrations.
+- **Non-breaking changes:** Adding optional fields to event payloads, introducing new event types, or adding new enum values (such as exception codes or transaction kinds) are considered non-breaking additions. Receivers should ignore event types or fields they do not recognize.
+- **Breaking changes:** Removing or renaming fields, altering types or formats, or modifying signature headers are breaking changes and will be accompanied by an API version bump.
 
 ## Verifying a request
 

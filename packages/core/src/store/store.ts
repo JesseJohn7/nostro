@@ -32,6 +32,7 @@ import type {
   InternalTransferQuery,
   JournalEntry,
   Movement,
+  MovementKind,
   NewAllocation,
   NewDecisionSnapshot,
   NewException,
@@ -72,6 +73,16 @@ export interface MovementQuery {
   readonly disposition?: Disposition
   readonly account?: string
   readonly entityId?: string
+  readonly counterparty?: string
+  readonly kind?: MovementKind
+  /** Inclusive lower bound for ledger. */
+  readonly fromLedger?: number
+  /** Exclusive upper bound for ledger. */
+  readonly toLedger?: number
+  /** Occurred on or after this instant. */
+  readonly occurredFrom?: Date
+  /** Occurred strictly before this instant. */
+  readonly occurredBefore?: Date
   /** Return movements with `seq` greater than this; for paging in ingest order. */
   readonly afterSeq?: number
   readonly limit?: number

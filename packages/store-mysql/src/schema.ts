@@ -62,6 +62,9 @@ const EVENT_TYPES = list([
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
+  'expectation.created',
+  'movement.recorded',
+  'journal.posted',
 ])
 const EXCEPTION_CODES = list([
   'UNMATCHED_NO_CANDIDATE',
@@ -590,4 +593,17 @@ export const MIGRATIONS: readonly ((s: string) => readonly string[])[] = [
       )${ENGINE}`,
      `CREATE INDEX schedules_tenant ON ${s}.schedules (tenant_id, ended_at, start_at)`,
    ],
+
+  (s) => [
+    `CREATE INDEX movements_tx_hash ON ${s}.movements (tenant_id, tx_hash)`,
+    `CREATE INDEX movements_ledger ON ${s}.movements (tenant_id, ledger, seq)`,
+    `CREATE INDEX movements_occurred ON ${s}.movements (tenant_id, occurred_at, seq)`,
+    `CREATE INDEX movements_counterparty ON ${s}.movements (tenant_id, counterparty, seq)`,
+    `CREATE INDEX movements_kind ON ${s}.movements (tenant_id, kind, seq)`,
+  ],
+
+  (s) => [
+    `ALTER TABLE ${s}.events DROP CHECK events_type_check`,
+    `ALTER TABLE ${s}.events ADD CONSTRAINT events_type_check CHECK (type IN (${EVENT_TYPES}))`,
+  ],
 ]

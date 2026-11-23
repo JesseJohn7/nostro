@@ -6,6 +6,7 @@ import type { Store } from '@nostro-labs/nostro'
 import { HorizonEffectsSource, HorizonFeesSource, JOURNAL_CSV_COLUMNS, MemoryStore, Money, NATIVE, eventCursorKey, reconcile, rewindConsumer, sync } from '@nostro-labs/nostro'
 import { FakeHorizon } from 'nostro-testkit'
 import { apiKeys, createServer } from '../src/index.js'
+import type { RoundRecord, RoundRunner } from '../src/index.js'
 
 const A = `G${'A'.repeat(55)}`
 const B = `G${'B'.repeat(55)}`
@@ -89,6 +90,16 @@ describe('movements', () => {
     expect(rest.next).toBeNull()
     expect((await get('disposition=ignored')).data.map((m: { kind: string }) => m.kind)).toEqual(['fee'])
     expect((await get(`account=${B}`)).data).toEqual([])
+
+    // New filters: txHash, from/to (occurredAt), fromLedger/toLedger, counterparty, kind
+    const [firstMovement] = all.data
+    expect((await get(`txHash=${firstMovement.txHash}`)).data).toHaveLength(1)
+    expect((await get(`txHash=${'f'.repeat(64)}`)).data).toHaveLength(0)
+    expect((await get(`kind=transfer`)).data).toHaveLength(2)
+    expect((await get(`kind=fee`)).data).toHaveLength(1)
+    expect((await get(`fromLedger=1&toLedger=999999999`)).data.length).toBeGreaterThan(0)
+    expect((await get(`from=2020-01-01T00:00:00Z&to=2030-01-01T00:00:00Z`)).data.length).toBeGreaterThan(0)
+    expect((await get(`from=2030-01-01T00:00:00Z`)).data).toHaveLength(0)
   })
 
   it('shows one movement with its allocations, exceptions and journal entries', async () => {
@@ -233,6 +244,23 @@ describe('expectations', () => {
     const detail = (await app.inject({ url: `/v1/expectations/${settled.id}`, headers: auth() })).json()
     expect(detail.allocations).toEqual([expect.objectContaining({ amount: '25.0000000' })])
     expect((await app.inject({ url: '/v1/expectations?status=paid', headers: auth() })).statusCode).toBe(400)
+
+    // Lookup expectation by reference
+    const byRef = await app.inject({ url: '/v1/expectations/by-reference?reference=INV-1042', headers: auth() })
+    expect(byRef.statusCode).toBe(200)
+    expect(byRef.json().expectation).toMatchObject({ reference: 'INV-1042', status: 'settled' })
+    expect(byRef.json().allocations).toHaveLength(1)
+
+    // Reference with special characters
+    await post(app, { reference: 'INV/2026/001#A', account: A, amount: '1' })
+    const specialRef = await app.inject({ url: `/v1/expectations/by-reference?reference=${encodeURIComponent('INV/2026/001#A')}`, headers: auth() })
+    expect(specialRef.statusCode).toBe(200)
+    expect(specialRef.json().expectation.reference).toBe('INV/2026/001#A')
+
+    // Absent reference and tenant isolation
+    expect((await app.inject({ url: '/v1/expectations/by-reference?reference=INV-9999', headers: auth() })).statusCode).toBe(404)
+    expect((await app.inject({ url: '/v1/expectations/by-reference?reference=INV-1042', headers: auth(OTHER_KEY) })).statusCode).toBe(404)
+    expect((await app.inject({ url: '/v1/expectations/by-reference', headers: auth() })).statusCode).toBe(400)
   })
 
   it('answers 400 for a malformed body and 422 for one it cannot record exactly', async () => {
@@ -413,6 +441,23 @@ describe('exceptions and the journal', () => {
     expect((await get('code=WRONG_ASSET')).data).toEqual([])
     expect((await get('status=resolved')).data).toEqual([])
     expect((await app.inject({ url: '/v1/exceptions?code=nope', headers: auth() })).statusCode).toBe(400)
+
+    const [openEx] = (await get('status=open')).data
+    // Detail route GET /v1/exceptions/{id}
+    const detailRes = await app.inject({ url: `/v1/exceptions/${openEx.id}`, headers: auth() })
+    expect(detailRes.statusCode).toBe(200)
+    expect(detailRes.json()).toMatchObject({
+      exception: expect.objectContaining({ id: openEx.id }),
+      movement: expect.objectContaining({ id: openEx.movementId }),
+      expectation: null,
+    })
+    expect((await app.inject({ url: `/v1/exceptions/${openEx.id}`, headers: auth(OTHER_KEY) })).statusCode).toBe(404)
+    expect((await app.inject({ url: '/v1/exceptions/nope', headers: auth() })).statusCode).toBe(404)
+
+    // Filters: movementId and expectationId
+    expect((await get(`movementId=${openEx.movementId}`)).data).toHaveLength(1)
+    expect((await get(`movementId=missing`)).data).toHaveLength(0)
+    expect((await get(`expectationId=missing`)).data).toHaveLength(0)
   })
 
   it('pages the journal, by effective date, and downloads it as CSV', async () => {
@@ -924,5 +969,56 @@ describe('batch exception resolution', () => {
     expect(res.statusCode).toBe(207)
     expect(res.json().applied).toBe(1)
     expect(res.json().errors).toBe(1)
+  })
+})
+
+describe('client-triggered rounds (issue #97)', () => {
+  it('returns 501 not_supported when server has no roundRunner hook', async () => {
+    const store = new MemoryStore()
+    const app = createServer({ store, authenticate: apiKeys({ [ACME_KEY]: 'acme' }) })
+    await app.ready()
+
+    const postRes = await app.inject({ method: 'POST', url: '/v1/rounds', headers: auth(), payload: {} })
+    expect(postRes.statusCode).toBe(501)
+    expect(postRes.json()).toMatchObject({ status: 501, code: 'not_supported' })
+
+    const getRes = await app.inject({ method: 'GET', url: '/v1/rounds/any-id', headers: auth() })
+    expect(getRes.statusCode).toBe(501)
+    expect(getRes.json()).toMatchObject({ status: 501, code: 'not_supported' })
+  })
+
+  it('triggers round, sets Location header, and returns round status and summary', async () => {
+    const store = new MemoryStore()
+    const roundData: RoundRecord = {
+      id: 'round-123',
+      tenantId: 'acme',
+      account: null,
+      state: 'queued',
+      queuedAt: new Date().toISOString(),
+      startedAt: null,
+      finishedAt: null,
+      summary: null,
+      error: null,
+    }
+    const mockRunner: RoundRunner = {
+      triggerRound: async (tenantId, account) => ({ id: 'round-123', round: { ...roundData, tenantId, account: account ?? null } }),
+      getRound: async (tenantId, id) => (id === 'round-123' && tenantId === 'acme' ? roundData : null),
+    }
+    const app = createServer({ store, authenticate: apiKeys({ [ACME_KEY]: 'acme', [OTHER_KEY]: 'other' }), roundRunner: mockRunner })
+    await app.ready()
+
+    const postRes = await app.inject({ method: 'POST', url: '/v1/rounds', headers: auth(), payload: {} })
+    expect(postRes.statusCode).toBe(202)
+    expect(postRes.headers.location).toBe('/v1/rounds/round-123')
+    expect(postRes.json()).toMatchObject({ id: 'round-123', state: 'queued' })
+
+    const getRes = await app.inject({ method: 'GET', url: '/v1/rounds/round-123', headers: auth() })
+    expect(getRes.statusCode).toBe(200)
+    expect(getRes.json()).toMatchObject({ id: 'round-123', state: 'queued' })
+
+    // Tenant isolation: other tenant cannot read round-123
+    const otherRes = await app.inject({ method: 'GET', url: '/v1/rounds/round-123', headers: auth(OTHER_KEY) })
+    expect(otherRes.statusCode).toBe(404)
+    expect(otherRes.json()).toMatchObject({ status: 404, code: 'not_found' })
   })
 })

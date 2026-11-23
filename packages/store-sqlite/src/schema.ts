@@ -63,6 +63,9 @@ const EVENT_TYPES = [
   'exception.opened',
   'exception.resolved',
   'exception.dismissed',
+  'expectation.created',
+  'movement.recorded',
+  'journal.posted',
 ]
 const appendOnly = (table: string) => `
     CREATE TRIGGER ${table}_no_update BEFORE UPDATE ON ${table}
@@ -818,5 +821,32 @@ PRIMARY KEY (tenant_id, destination)
       updated_at        INTEGER NOT NULL
     );
     CREATE INDEX schedules_tenant ON schedules (tenant_id, ended_at, start_at);
+  `,
+  `
+    CREATE INDEX IF NOT EXISTS movements_tx_hash ON movements (tenant_id, tx_hash) WHERE tx_hash IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS movements_ledger ON movements (tenant_id, ledger, seq);
+    CREATE INDEX IF NOT EXISTS movements_occurred ON movements (tenant_id, occurred_at, seq);
+    CREATE INDEX IF NOT EXISTS movements_counterparty ON movements (tenant_id, counterparty, seq) WHERE counterparty IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS movements_kind ON movements (tenant_id, kind, seq);
+  `,
+  `
+    CREATE TABLE events_new (
+      seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+      id         TEXT NOT NULL UNIQUE,
+      tenant_id  TEXT NOT NULL,
+      type       TEXT NOT NULL CHECK (type IN (${list(EVENT_TYPES)})),
+      subject_id TEXT NOT NULL,
+      payload    TEXT NOT NULL CHECK (json_valid(payload)),
+      created_at INTEGER NOT NULL
+    );
+    INSERT INTO events_new (seq, id, tenant_id, type, subject_id, payload, created_at)
+      SELECT seq, id, tenant_id, type, subject_id, payload, created_at FROM events;
+    DROP TABLE events;
+    ALTER TABLE events_new RENAME TO events;
+    CREATE INDEX events_tenant ON events (tenant_id, seq);
+    CREATE TRIGGER events_no_update BEFORE UPDATE ON events
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+    CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
   `,
 ]

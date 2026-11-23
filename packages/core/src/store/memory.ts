@@ -111,7 +111,7 @@ import type {
   RewindQuery,
 } from './delivery.js'
 import { DELIVERY_ATTEMPT_LIMIT, DELIVERY_ATTEMPT_TTL_MS } from './delivery.js'
-import { exceptionChanged, expectationAmended, expectationChanged, movementDecided } from './events.js'
+import { exceptionChanged, expectationAmended, expectationChanged, expectationCreated, journalPosted, movementDecided, movementRecorded } from './events.js'
 import { expectationReferenceKeys } from '../matching/reference.js'
 
 export interface MemoryStoreOptions {
@@ -309,6 +309,12 @@ abstract class MemoryReader implements StoreReader {
       if (q.account !== undefined && m.account !== q.account) continue
       if (q.entityId !== undefined && m.entityId !== q.entityId) continue
       if (q.txHash !== undefined && m.txHash !== q.txHash) continue
+      if (q.counterparty !== undefined && m.counterparty !== q.counterparty) continue
+      if (q.kind !== undefined && m.kind !== q.kind) continue
+      if (q.fromLedger !== undefined && m.ledger < q.fromLedger) continue
+      if (q.toLedger !== undefined && m.ledger >= q.toLedger) continue
+      if (q.occurredFrom !== undefined && m.occurredAt.getTime() < q.occurredFrom.getTime()) continue
+      if (q.occurredBefore !== undefined && m.occurredAt.getTime() >= q.occurredBefore.getTime()) continue
       if (q.afterSeq !== undefined && m.seq <= q.afterSeq) continue
       out.push(m)
     }
@@ -872,6 +878,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
       this.draft.movements.set(movement.id, movement)
       this.draft.movementKeys.set(k, movement.id)
       inserted.push(movement)
+      this.emit(movementRecorded(movement))
     }
     return { inserted, duplicates, conflicts }
   }
@@ -1152,6 +1159,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
     this.draft.expectations.set(expectation.id, expectation)
     this.draft.expectationRefs.set(refKey, expectation.id)
     addReferenceKeys(this.draft, expectation)
+    this.emit(expectationCreated(expectation))
     return expectation
   }
 
@@ -1282,6 +1290,7 @@ class MemoryTx extends MemoryReader implements StoreTx {
     if (movement !== null) {
       this.draft.journalByMovement.set(movement.id, [...(this.draft.journalByMovement.get(movement.id) ?? []), entry.id])
     }
+    this.emit(journalPosted(entry))
     return entry
   }
 

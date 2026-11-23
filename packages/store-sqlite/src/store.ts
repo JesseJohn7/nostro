@@ -120,8 +120,11 @@ import {
   issueMuxedId,
   expectationAmended,
   expectationChanged,
+  expectationCreated,
   expectationReferenceKeys,
+  journalPosted,
   movementDecided,
+  movementRecorded,
   parseAsset,
   sameFacts,
 } from '@nostro-labs/nostro'
@@ -539,6 +542,12 @@ class SqliteReader implements StoreReader {
       .add('account = ?', q.account)
       .add('entity_id = ?', q.entityId)
       .add('tx_hash = ?', q.txHash)
+      .add('counterparty = ?', q.counterparty)
+      .add('kind = ?', q.kind)
+      .add('ledger >= ?', q.fromLedger)
+      .add('ledger < ?', q.toLedger)
+      .add('occurred_at >= ?', ms(q.occurredFrom))
+      .add('occurred_at < ?', ms(q.occurredBefore))
       .add('seq > ?', q.afterSeq)
     return this.all(`SELECT * FROM movements${w} ORDER BY seq${w.limit(q.limit)}`, w.params).map(toMovement)
   }
@@ -1255,7 +1264,9 @@ class SqliteTx extends SqliteReader implements StoreTx {
         ],
       )
       if (row !== undefined) {
-        inserted.push(toMovement(row))
+        const m = toMovement(row)
+        inserted.push(m)
+        this.emit(movementRecorded(m))
         continue
       }
       const existing = toMovement(
@@ -1395,7 +1406,9 @@ class SqliteTx extends SqliteReader implements StoreTx {
       'INSERT OR IGNORE INTO expectation_reference_index (tenant_id, normalized, expectation_id) VALUES (?, ?, ?)',
     )
     for (const values of referenceIndexRows(id, n.tenantId, n.reference, n.memo ?? null)) index.run(...values)
-    return toExpectation(row)
+    const exp = toExpectation(row)
+    this.emit(expectationCreated(exp))
+    return exp
   }
 
   async cancelExpectation(tenantId: string, id: string, reason: string): Promise<Expectation> {
@@ -1546,7 +1559,9 @@ class SqliteTx extends SqliteReader implements StoreTx {
        VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`,
       [entryId, n.tenantId, movement?.id ?? null, n.postingNo ?? null, n.kind, entryToPost.effectiveAt.getTime(), nowMs, n.description],
     )!
-    return toJournalEntry(entry, lines)
+    const created = toJournalEntry(entry, lines)
+    this.emit(journalPosted(created))
+    return created
   }
 
   async openException(n: NewException): Promise<ExceptionRecord> {

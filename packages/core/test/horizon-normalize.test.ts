@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import { describe, expect, it } from 'vitest'
 import { FixtureSource } from 'nostro-testkit'
 import type { HorizonEffect, HorizonOperation, HorizonTransaction, NewMovement } from '../src/index.js'
-import { NATIVE, asset, normalizeEffects, normalizeFee, signedAmount } from '../src/index.js'
+import { MemoryStore, NATIVE, asset, normalizeEffects, normalizeFee, signedAmount } from '../src/index.js'
 
 interface OperationFixture {
   readonly operation: HorizonOperation
@@ -70,6 +70,22 @@ describe('normalizeEffects: payments', () => {
     expect(pull.movements).toHaveLength(1)
     expect(pull.caughtUp).toBe(true)
     expect((await source.pull({ tenantId: 't', account: to, cursor: pull.cursor, limit: 100 })).movements).toEqual([])
+  })
+
+  it('finds a movement by the transaction hash of a real fixture in fixtures/horizon/', async () => {
+    const store = new MemoryStore()
+    const source = new FixtureSource({ fixture: new URL('payment-text-memo.json', dir) })
+    const to = 'GDKOLQZXXQGYI6IXLGMD5CKFUWGE5HLSCXHTIOONIYKD2NXEQB7HV3SW'
+    const { movements } = await source.pull({ tenantId: 't', account: to, cursor: null, limit: 100 })
+    await store.transaction((tx) => tx.insertMovements(movements))
+
+    const realTxHash = 'e85780e225268aa3740c0f0ad4332407c0af17e03516100919843b552f4c246a'
+    const found = await store.listMovements({ tenantId: 't', txHash: realTxHash })
+    expect(found).toHaveLength(1)
+    expect(found[0]!.txHash).toBe(realTxHash)
+    expect(found[0]!.account).toBe(to)
+
+    expect(await store.listMovements({ tenantId: 'other', txHash: realTxHash })).toEqual([])
   })
 
   it('carries the muxed id of an M... destination', () => {
