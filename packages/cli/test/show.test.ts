@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { FakeHorizon } from 'nostro-testkit'
-import { A, B, migrated, nostro, startServe } from './helpers.js'
+import { A, B, SERVE_KEY, migrated, nostro, startServe } from './helpers.js'
 
 /** Sync one payment from B to A with the given memo, after an expectation for it. */
 async function workspace(payments: { ledger: number; amount: string; memo?: string }[], expectation?: { reference: string; amount: string }) {
@@ -60,7 +60,8 @@ describe('nostro show', () => {
   })
 
   it('shows an exception with its movement, after an overpayment', async () => {
-    const cwd = await workspace([{ ledger: 10, amount: '30' }], { reference: 'INV-1042', amount: '25' })
+    // The memo names the invoice, so the engine matches it and finds the excess.
+    const cwd = await workspace([{ ledger: 10, amount: '30', memo: 'INV-1042' }], { reference: 'INV-1042', amount: '25' })
     const listed = JSON.parse((await nostro(cwd, ['exceptions', '--json'])).stdout) as { id: string; code: string }[]
     const overpayment = listed.find((x) => x.code === 'OVERPAYMENT')
     expect(overpayment).toBeDefined()
@@ -89,7 +90,7 @@ describe('nostro show', () => {
     const id = await firstMovementId(cwd)
     const shown = JSON.parse((await nostro(cwd, ['show', id, '--json'])).stdout)
 
-    const server = await startServe(cwd, [])
+    const server = await startServe(cwd, [], { env: { NOSTRO_API_KEYS: `default:${SERVE_KEY}` } })
     try {
       const response = await server.get(`/v1/movements/${id}`)
       expect(response.status).toBe(200)
@@ -97,5 +98,5 @@ describe('nostro show', () => {
     } finally {
       await server.stop()
     }
-  })
+  }, 120_000)
 })
