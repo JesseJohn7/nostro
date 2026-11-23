@@ -22,12 +22,14 @@ await app.listen({ port: 8080 })
 |---|---|
 | `GET /v1/health` | `{ "ok": true }`; needs no key |
 | `GET /v1/openapi.json` | the OpenAPI 3.1 document for all of this; needs no key |
-| `GET /v1/movements` | `?disposition=`, `?account=` |
+| `GET /v1/movements` | `?disposition=`, `?account=`, `?txHash=`, `?from=`, `?to=`, `?fromLedger=`, `?toLedger=`, `?counterparty=`, `?kind=` |
 | `GET /v1/movements/{id}` | the movement, its allocations, exceptions and journal entries |
 | `GET /v1/expectations` | `?status=open,partially_paid`, `?account=` |
+| `GET /v1/expectations/by-reference` | `?reference=`, lookup by unique reference |
 | `GET /v1/expectations/{id}` | the expectation and its allocations |
 | `POST /v1/expectations` | record one; `201` with `Location`, `409` if the reference is taken |
-| `GET /v1/exceptions` | `?status=`, `?code=` |
+| `GET /v1/exceptions` | `?status=`, `?code=`, `?movementId=`, `?expectationId=` |
+| `GET /v1/exceptions/{id}` | the exception, its movement and its expectation |
 | `POST /v1/exceptions/{id}/resolve` | decide it: `{ "action": "apply", "allocations": [{ "reference": "INV-1" }], "note": "..." }`, `{ "action": "ignore", "note": "..." }` or `{ "action": "close", "note": "..." }`; see [When a person decides](../../docs/matching.md#when-a-person-decides) |
 | `GET /v1/journal` | `?from=`, `?to=` (ISO 8601, effective dates) |
 | `GET /v1/journal.csv` | the journal as CSV, streamed |

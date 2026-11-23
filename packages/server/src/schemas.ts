@@ -57,14 +57,31 @@ export const query = {
     disposition: { enum: [...DISPOSITIONS] },
     account: { type: 'string', pattern: ACCOUNT },
     entityId: { type: 'string', minLength: 1, maxLength: 100 },
+    txHash: { type: 'string', pattern: HASH },
+    from: { type: 'string', format: 'date-time', description: 'Occurred on or after this instant.' },
+    to: { type: 'string', format: 'date-time', description: 'Occurred strictly before this instant.' },
+    fromLedger: { type: 'integer', minimum: 1, description: 'Ledger sequence on or after this value.' },
+    toLedger: { type: 'integer', minimum: 1, description: 'Ledger sequence strictly before this value.' },
+    counterparty: { type: 'string', pattern: ACCOUNT },
+    kind: { enum: [...MOVEMENT_KINDS] },
   }),
   expectations: listQuery({
     status: { type: 'string', pattern: `^(${statuses})(,(${statuses}))*$`, description: 'One or more, comma separated.' },
     account: { type: 'string', pattern: ACCOUNT },
   }),
+  expectationByReference: {
+    type: 'object',
+    additionalProperties: false,
+    required: ['reference'],
+    properties: {
+      reference: { type: 'string', minLength: 1, maxLength: 256, description: 'The expectation reference.' },
+    },
+  } as const,
   exceptions: listQuery({
     status: { enum: ['open', 'resolved', 'dismissed'] },
     code: { enum: [...EXCEPTION_CODES] },
+    movementId: { type: 'string', minLength: 1, maxLength: 128 },
+    expectationId: { type: 'string', minLength: 1, maxLength: 128 },
   }),
   events: listQuery({}),
   schedules: {
@@ -541,6 +558,11 @@ export const components = {
   ExpectationDetail: record({
     expectation: ref('Expectation'),
     allocations: { type: 'array', items: ref('Allocation') },
+  }),
+  ExceptionDetail: record({
+    exception: ref('Exception'),
+    movement: nullable(ref('Movement')),
+    expectation: nullable(ref('Expectation')),
   }),
   Resolution: record({
     movement: nullable(ref('Movement')),

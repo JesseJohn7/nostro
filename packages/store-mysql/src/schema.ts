@@ -590,4 +590,12 @@ export const MIGRATIONS: readonly ((s: string) => readonly string[])[] = [
       )${ENGINE}`,
      `CREATE INDEX schedules_tenant ON ${s}.schedules (tenant_id, ended_at, start_at)`,
    ],
+
+  (s) => [
+    `CREATE INDEX movements_tx_hash ON ${s}.movements (tenant_id, tx_hash)`,
+    `CREATE INDEX movements_ledger ON ${s}.movements (tenant_id, ledger, seq)`,
+    `CREATE INDEX movements_occurred ON ${s}.movements (tenant_id, occurred_at, seq)`,
+    `CREATE INDEX movements_counterparty ON ${s}.movements (tenant_id, counterparty, seq)`,
+    `CREATE INDEX movements_kind ON ${s}.movements (tenant_id, kind, seq)`,
+  ],
 ]

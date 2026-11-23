@@ -819,4 +819,11 @@ PRIMARY KEY (tenant_id, destination)
     );
     CREATE INDEX schedules_tenant ON schedules (tenant_id, ended_at, start_at);
   `,
+  `
+    CREATE INDEX IF NOT EXISTS movements_tx_hash ON movements (tenant_id, tx_hash) WHERE tx_hash IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS movements_ledger ON movements (tenant_id, ledger, seq);
+    CREATE INDEX IF NOT EXISTS movements_occurred ON movements (tenant_id, occurred_at, seq);
+    CREATE INDEX IF NOT EXISTS movements_counterparty ON movements (tenant_id, counterparty, seq) WHERE counterparty IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS movements_kind ON movements (tenant_id, kind, seq);
+  `,
 ]

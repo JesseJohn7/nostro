@@ -306,6 +306,12 @@ class PgReader implements StoreReader {
       .add((p) => `account = ${p}`, q.account)
       .add((p) => `entity_id = ${p}`, q.entityId)
       .add((p) => `tx_hash = ${p}`, q.txHash)
+      .add((p) => `counterparty = ${p}`, q.counterparty)
+      .add((p) => `kind = ${p}`, q.kind)
+      .add((p) => `ledger >= ${p}`, q.fromLedger)
+      .add((p) => `ledger < ${p}`, q.toLedger)
+      .add((p) => `occurred_at >= ${p}`, q.occurredFrom)
+      .add((p) => `occurred_at < ${p}`, q.occurredBefore)
       .add((p) => `seq > ${p}`, q.afterSeq)
     const sql = `SELECT * FROM ${this.s}.movements${w} ORDER BY seq${w.limit(q.limit)}`
     return (await this.run<MovementRow>(sql, w.params)).map(toMovement)

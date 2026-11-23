@@ -202,6 +202,58 @@ export function describeStoreConformance(
         const page = await store.listMovements({ tenantId: T, afterSeq: a.seq, limit: 1 })
         expect(page.map((m) => m.id)).toEqual([b.id])
       })
+
+      it('filters movements by txHash, ledger range, occurredAt range, counterparty and kind with paging', async () => {
+        const m1 = await record({ txHash: 'a'.repeat(64), ledger: 100, occurredAt: new Date('2026-10-01T10:00:00Z'), counterparty: PAYER, kind: 'transfer' })
+        const m2 = await record({ txHash: 'b'.repeat(64), ledger: 200, occurredAt: new Date('2026-10-01T11:00:00Z'), counterparty: PAYER, kind: 'transfer' })
+        const m3 = await record({ txHash: 'c'.repeat(64), ledger: 300, occurredAt: new Date('2026-10-01T12:00:00Z'), counterparty: OTHER_ACCOUNT, kind: 'fee' })
+        const m4 = await record({ txHash: 'd'.repeat(64), ledger: 400, occurredAt: new Date('2026-10-01T13:00:00Z'), counterparty: PAYER, kind: 'transfer' })
+
+        // txHash filter & tenant isolation
+        expect((await store.listMovements({ tenantId: T, txHash: 'b'.repeat(64) })).map((m) => m.id)).toEqual([m2.id])
+        expect(await store.listMovements({ tenantId: T2, txHash: 'b'.repeat(64) })).toEqual([])
+
+        // ledger range: half-open [200, 400)
+        const ledgers = await store.listMovements({ tenantId: T, fromLedger: 200, toLedger: 400 })
+        expect(ledgers.map((m) => m.id)).toEqual([m2.id, m3.id])
+        const ledgerPage1 = await store.listMovements({ tenantId: T, fromLedger: 200, toLedger: 400, limit: 1 })
+        expect(ledgerPage1.map((m) => m.id)).toEqual([m2.id])
+        const ledgerPage2 = await store.listMovements({ tenantId: T, fromLedger: 200, toLedger: 400, afterSeq: m2.seq, limit: 1 })
+        expect(ledgerPage2.map((m) => m.id)).toEqual([m3.id])
+
+        // occurredAt range: half-open [11:00, 13:00)
+        const times = await store.listMovements({
+          tenantId: T,
+          occurredFrom: new Date('2026-10-01T11:00:00Z'),
+          occurredBefore: new Date('2026-10-01T13:00:00Z'),
+        })
+        expect(times.map((m) => m.id)).toEqual([m2.id, m3.id])
+
+        // counterparty and kind
+        expect((await store.listMovements({ tenantId: T, counterparty: OTHER_ACCOUNT })).map((m) => m.id)).toEqual([m3.id])
+        expect((await store.listMovements({ tenantId: T, kind: 'fee' })).map((m) => m.id)).toEqual([m3.id])
+
+        // Combined filters with paging: payers and transfers in [100, 500)
+        const combined1 = await store.listMovements({
+          tenantId: T,
+          counterparty: PAYER,
+          kind: 'transfer',
+          fromLedger: 100,
+          toLedger: 500,
+          limit: 2,
+        })
+        expect(combined1.map((m) => m.id)).toEqual([m1.id, m2.id])
+        const combined2 = await store.listMovements({
+          tenantId: T,
+          counterparty: PAYER,
+          kind: 'transfer',
+          fromLedger: 100,
+          toLedger: 500,
+          afterSeq: combined1[1]!.seq,
+          limit: 2,
+        })
+        expect(combined2.map((m) => m.id)).toEqual([m4.id])
+      })
     })
 
     describe('entities (conformance)', () => {
@@ -763,6 +815,39 @@ export function describeStoreConformance(
           detail: 'ledgers 58762517..59501299 re-read with differences',
         })
         expect(gap.account).toBe(ACCOUNT)
+      })
+
+      it('filters exceptions by movementId and expectationId with paging', async () => {
+        const m1 = await record()
+        const m2 = await record()
+        const exp = await expect10()
+        const ex1 = await store.transaction((tx) =>
+          tx.openException({ tenantId: T, code: 'AMBIGUOUS_MATCH', movementId: m1.id, detail: 'm1-ex' }),
+        )
+        const ex2 = await store.transaction((tx) =>
+          tx.openException({ tenantId: T, code: 'WRONG_ASSET', movementId: m2.id, expectationId: exp.id, detail: 'm2-exp-ex' }),
+        )
+        const ex3 = await store.transaction((tx) =>
+          tx.openException({ tenantId: T, code: 'OVERPAYMENT', movementId: m1.id, detail: 'm1-ex2' }),
+        )
+
+        // Filter by movementId
+        const byM1 = await store.listExceptions({ tenantId: T, movementId: m1.id })
+        expect(byM1.map((e) => e.id)).toEqual([ex1.id, ex3.id])
+
+        // Paging with movementId
+        const page1 = await store.listExceptions({ tenantId: T, movementId: m1.id, limit: 1 })
+        expect(page1.map((e) => e.id)).toEqual([ex1.id])
+        const page2 = await store.listExceptions({ tenantId: T, movementId: m1.id, afterSeq: ex1.seq, limit: 1 })
+        expect(page2.map((e) => e.id)).toEqual([ex3.id])
+
+        // Filter by expectationId
+        const byExp = await store.listExceptions({ tenantId: T, expectationId: exp.id })
+        expect(byExp.map((e) => e.id)).toEqual([ex2.id])
+
+        // Tenant isolation
+        expect(await store.listExceptions({ tenantId: T2, movementId: m1.id })).toEqual([])
+        expect(await store.listExceptions({ tenantId: T2, expectationId: exp.id })).toEqual([])
       })
     })
 

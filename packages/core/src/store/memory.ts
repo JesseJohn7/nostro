@@ -309,6 +309,12 @@ abstract class MemoryReader implements StoreReader {
       if (q.account !== undefined && m.account !== q.account) continue
       if (q.entityId !== undefined && m.entityId !== q.entityId) continue
       if (q.txHash !== undefined && m.txHash !== q.txHash) continue
+      if (q.counterparty !== undefined && m.counterparty !== q.counterparty) continue
+      if (q.kind !== undefined && m.kind !== q.kind) continue
+      if (q.fromLedger !== undefined && m.ledger < q.fromLedger) continue
+      if (q.toLedger !== undefined && m.ledger >= q.toLedger) continue
+      if (q.occurredFrom !== undefined && m.occurredAt.getTime() < q.occurredFrom.getTime()) continue
+      if (q.occurredBefore !== undefined && m.occurredAt.getTime() >= q.occurredBefore.getTime()) continue
       if (q.afterSeq !== undefined && m.seq <= q.afterSeq) continue
       out.push(m)
     }

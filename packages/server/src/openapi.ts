@@ -206,6 +206,14 @@ export function buildOpenApi() {
           },
         },
       },
+      '/v1/expectations/by-reference': {
+        get: {
+          operationId: 'getExpectationByReference',
+          summary: 'Look up an expectation by its unique reference',
+          parameters: parameters(query.expectationByReference as any),
+          responses: { '200': ok('ExpectationDetail'), '404': problem('No such expectation in this tenant (`not_found`).'), ...errors },
+        },
+      },
       '/v1/expectations/{id}': {
         get: {
           operationId: 'getExpectation',
@@ -250,6 +258,14 @@ export function buildOpenApi() {
           summary: 'Exceptions, in the order they were opened',
           parameters: parameters(query.exceptions),
           responses: { '200': ok('ExceptionPage'), ...errors },
+        },
+      },
+      '/v1/exceptions/{id}': {
+        get: {
+          operationId: 'getException',
+          summary: 'One exception, with its movement and its expectation',
+          parameters: [idParam('exception')],
+          responses: { '200': ok('ExceptionDetail'), '404': problem('No such exception in this tenant (`not_found`).'), ...errors },
         },
       },
       '/v1/exceptions/{id}/resolve': {

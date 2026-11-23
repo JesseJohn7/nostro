@@ -124,7 +124,11 @@ describe('the OpenAPI document', () => {
     for (const m of movements.data) await call('GET', `/v1/movements/${m.id}`, '/v1/movements/{id}')
     const expectations = (await call('GET', '/v1/expectations', '/v1/expectations')).json()
     await call('GET', `/v1/expectations/${expectations.data[0].id}`, '/v1/expectations/{id}')
-    await call('GET', '/v1/exceptions?status=open', '/v1/exceptions')
+    await call('GET', '/v1/expectations/by-reference?reference=INV-1042', '/v1/expectations/by-reference')
+    const openExceptionsList = (await call('GET', '/v1/exceptions?status=open', '/v1/exceptions')).json()
+    if (openExceptionsList.data.length > 0) {
+      await call('GET', `/v1/exceptions/${openExceptionsList.data[0].id}`, '/v1/exceptions/{id}')
+    }
     expect((await call('GET', '/v1/events', '/v1/events')).json().data.length).toBeGreaterThan(0)
     await call('GET', '/v1/webhooks', '/v1/webhooks')
     await call('GET', '/v1/webhooks/webhook/status', '/v1/webhooks/{consumer}/status')

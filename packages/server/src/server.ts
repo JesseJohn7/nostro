@@ -9,7 +9,7 @@
 import { Readable } from 'node:stream'
 import Fastify from 'fastify'
 import type { FastifyError, FastifyInstance, FastifyServerOptions } from 'fastify'
-import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, NewExpectation, NewSchedule, Store } from '@nostro-labs/nostro'
+import type { AssetId, Disposition, ExceptionCode, ExceptionDecision, ExceptionStatus, ExpectationChanges, ExpectationStatus, LineRole, Memo, MovementKind, NewExpectation, NewSchedule, Store } from '@nostro-labs/nostro'
 import {
   ConsumerPositionConflict,
   ConstraintError,
@@ -335,7 +335,20 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: Paging & { disposition?: Disposition; account?: string; entityId?: string } }>(
+      v1.get<{
+        Querystring: Paging & {
+          disposition?: Disposition
+          account?: string
+          entityId?: string
+          txHash?: string
+          from?: string
+          to?: string
+          fromLedger?: number
+          toLedger?: number
+          counterparty?: string
+          kind?: MovementKind
+        }
+      }>(
         '/movements',
         { schema: { querystring: query.movements } },
         async ({ tenantId, query: q }) =>
@@ -347,6 +360,13 @@ export function createServer(options: ServerOptions): FastifyInstance {
               ...(q.disposition === undefined ? {} : { disposition: q.disposition }),
               ...(q.account === undefined ? {} : { account: q.account }),
               ...(q.entityId === undefined ? {} : { entityId: q.entityId }),
+              ...(q.txHash === undefined ? {} : { txHash: q.txHash }),
+              ...(q.from === undefined ? {} : { occurredFrom: new Date(q.from) }),
+              ...(q.to === undefined ? {} : { occurredBefore: new Date(q.to) }),
+              ...(q.fromLedger === undefined ? {} : { fromLedger: q.fromLedger }),
+              ...(q.toLedger === undefined ? {} : { toLedger: q.toLedger }),
+              ...(q.counterparty === undefined ? {} : { counterparty: q.counterparty }),
+              ...(q.kind === undefined ? {} : { kind: q.kind }),
             }),
             q.limit,
             movementJson,
@@ -445,6 +465,17 @@ export function createServer(options: ServerOptions): FastifyInstance {
           ),
       )
 
+      v1.get<{ Querystring: { reference: string } }>(
+        '/expectations/by-reference',
+        { schema: { querystring: query.expectationByReference } },
+        async ({ tenantId, query: q }) => {
+          const expectation = await store.getExpectationByReference(tenantId, q.reference)
+          if (expectation === null) throw new HttpProblem(404, 'not_found', `No expectation with reference ${q.reference}.`)
+          const allocations = await store.listAllocations({ tenantId, expectationId: expectation.id })
+          return { expectation: expectationJson(expectation), allocations: allocations.map(allocationJson) }
+        },
+      )
+
       v1.get<{ Params: { id: string } }>('/expectations/:id', { schema: { params: idParams } }, async ({ tenantId, params }) => {
         const expectation = await store.getExpectation(tenantId, params.id)
         if (expectation === null) throw new HttpProblem(404, 'not_found', `No expectation ${params.id}.`)
@@ -519,7 +550,7 @@ export function createServer(options: ServerOptions): FastifyInstance {
         },
       )
 
-      v1.get<{ Querystring: Paging & { status?: ExceptionStatus; code?: ExceptionCode } }>(
+      v1.get<{ Querystring: Paging & { status?: ExceptionStatus; code?: ExceptionCode; movementId?: string; expectationId?: string } }>(
         '/exceptions',
         { schema: { querystring: query.exceptions } },
         async ({ tenantId, query: q }) =>
@@ -530,11 +561,25 @@ export function createServer(options: ServerOptions): FastifyInstance {
               ...after(q),
               ...(q.status === undefined ? {} : { status: q.status }),
               ...(q.code === undefined ? {} : { code: q.code }),
+              ...(q.movementId === undefined ? {} : { movementId: q.movementId }),
+              ...(q.expectationId === undefined ? {} : { expectationId: q.expectationId }),
             }),
             q.limit,
             exceptionJson,
           ),
       )
+
+      v1.get<{ Params: { id: string } }>('/exceptions/:id', { schema: { params: idParams } }, async ({ tenantId, params }) => {
+        const exception = await store.getException(tenantId, params.id)
+        if (exception === null) throw new HttpProblem(404, 'not_found', `No exception ${params.id}.`)
+        const movement = exception.movementId ? await store.getMovement(tenantId, exception.movementId) : null
+        const expectation = exception.expectationId ? await store.getExpectation(tenantId, exception.expectationId) : null
+        return {
+          exception: exceptionJson(exception),
+          movement: movement ? movementJson(movement) : null,
+          expectation: expectation ? expectationJson(expectation) : null,
+        }
+      })
 
       v1.get<{ Querystring: Paging }>('/events', { schema: { querystring: query.events } }, async ({ tenantId, query: q }) => {
         try {
