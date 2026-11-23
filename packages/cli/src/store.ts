@@ -1,6 +1,6 @@
 /**
- * Open the database a command names: a `postgres://` URL, or else a SQLite
- * file (optionally written `sqlite:<path>`).
+ * Open the database a command names: a `postgres://` or `mysql://` URL, or
+ * else a SQLite file (optionally written `sqlite:<path>`).
  *
  * Only `nostro migrate` creates a database or changes its schema. Every other
  * command opens an existing one and refuses to run unless its schema is
@@ -19,6 +19,7 @@ export interface OpenedStore {
 }
 
 const POSTGRES = /^postgres(ql)?:\/\//i
+const MYSQL = /^mysql:\/\//i
 
 /** The URL with any password replaced, so it can be printed. */
 export function redact(url: string): string {
@@ -40,8 +41,22 @@ export async function openStore(db: string, io: Io, options: { create: boolean }
       label: `${redact(db)} (schema ${schema})`,
     }
   }
+  if (MYSQL.test(db)) {
+    let database = ''
+    try {
+      database = decodeURIComponent(new URL(db).pathname.replace(/^\//, ''))
+    } catch {
+      database = ''
+    }
+    if (database === '') throw new CliError('--db mysql:// URL must name a database, e.g. mysql://localhost/nostro.')
+    const storeModule: string = '@nostro-labs/store-mysql'
+    const { MysqlStore } = await import(storeModule)
+    return { store: new MysqlStore({ connectionString: db }), label: redact(db) }
+  }
   const path = db.startsWith('sqlite:') ? db.slice('sqlite:'.length) : db
-  if (path === '' || path === ':memory:') throw new CliError('--db must name a database file or a postgres:// URL.')
+  if (path === '' || path === ':memory:') {
+    throw new CliError('--db must name a database file, a postgres:// URL or a mysql:// URL.')
+  }
   const filename = resolve(io.cwd, path)
   if (!options.create && !existsSync(filename)) {
     throw new CliError(`No database at ${filename}. Create it with "nostro migrate".`)

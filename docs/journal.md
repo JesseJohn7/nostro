@@ -122,10 +122,18 @@ requires a reason.
 
 | Guarantee | Every store (shared rule, before writing) | PostgreSQL itself | SQLite itself |
 |---|---|---|---|
-| Each entry balances per asset (I3) | yes | yes, at COMMIT (deferred trigger) | no: amounts beyond 64 bits are text it cannot sum |
+| Each entry balances per asset (I3) | yes | yes, at COMMIT (deferred trigger) | yes, at entry completion (triggers) |
 | Entries are never edited or deleted | yes | yes (triggers) | yes (triggers) |
 | One entry per posting number per movement | yes (compare-and-set) | yes (unique index) | yes (unique index) |
-| A movement's cash nets to 0 or its exact amount | yes | no | no |
+| A movement's cash nets to 0 or its exact amount | yes | yes, at COMMIT | yes, at entry completion |
+
+SQLite stores amounts as decimal text beyond 64 bits, so its triggers call the registered bigint
+aggregates `nostro_signed_sum` and `nostro_cash_sum`. An entry is complete only when its
+`journal_entries` row is inserted: lines go in first against a deferrable foreign key, and the AFTER
+INSERT trigger then checks the whole entry. A raw writer must use the same order and call
+`registerJournalFunctions()` on its own connection; without them the triggers fail closed.
+PostgreSQL runs the equivalent cash check with `numeric(40, 0)` at COMMIT, so a deferred trigger sees
+the movement's final cash across all its entries.
 
 ## Export
 
@@ -295,8 +303,8 @@ for (const line of report.lines) {
 Returns per-account, per-asset totals and net balances. `balanced` is `true` when the sum of all net
 balances is zero for every asset (I3).
 
-Amounts are computed with exact bigint arithmetic across all stores — including SQLite, where SQL `SUM`
-cannot add amounts beyond 64 bits exactly.
+Amounts are computed with exact bigint arithmetic across all stores — including SQLite, where `SUM`
+cannot add amounts beyond 64 bits exactly, so the store and its triggers use registered aggregates.
 
 ### Account ledger
 

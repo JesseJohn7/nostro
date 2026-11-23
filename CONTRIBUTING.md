@@ -39,6 +39,15 @@ a test in `packages/server` fails if it is broken.
 The engine is a pure function — `(movement, candidates, config, clock) → Decision` — so strategies
 are testable with no network and no database.
 
+## Adding a store
+
+A backend implements the contract in [`docs/stores.md`](./docs/stores.md): tenant scoping,
+transaction-only writes, locking reads, events written with the decision, stable constraint names and
+idempotent migrations. Run the shared suites from `@nostro-labs/store-conformance` in the store's own
+test suite with the current `STORE_CONTRACT_VERSION`, and add the package to `PACKAGES` in
+`scripts/check-packages.mjs` when it is published. The suites are the definition of conformance; do
+not weaken them to accommodate a backend.
+
 ## Recording fixtures
 
 Fixtures are real Horizon responses; see [`fixtures/horizon/README.md`](./fixtures/horizon/README.md)
@@ -74,13 +83,15 @@ for behaviour changes, and update docs. Sign off with DCO (`git commit -s`).
 
 ## Releasing
 
-All five published packages share one version. To release:
+All seven published packages (`core`, `store-conformance`, `store-sqlite`, `store-postgres`,
+`store-mysql`, `server` and `cli`) share one version. To release:
 
-1. Set the version in each `packages/*/package.json` (not `testkit`, which is never published) and
-   run `pnpm install` so the lockfile agrees.
+1. Set the version in each published `packages/*/package.json` (`nostro-testkit` is never published)
+   and run `pnpm install` so the lockfile agrees.
 2. Give the release a date in `CHANGELOG.md`: `## 0.1.0 (2026-10-25)`.
-3. Run `pnpm build && node scripts/check-packages.mjs` locally. It installs the packed tarballs into
-   an empty project and uses them, as a user would.
+3. Run `pnpm build && node scripts/check-packages.mjs` locally. The build emits
+   `packages/store-conformance/dist`; the check packs all seven tarballs, installs them into an empty
+   project and uses them, including running the published conformance suites, as a user would.
 4. Merge to `main`, then run **Actions → Release** with the version. It refuses unless the version
    matches every package and the changelog entry is dated. It runs the whole test suite and the
    package check, publishes to npm with provenance, then tags `v<version>` and creates the GitHub

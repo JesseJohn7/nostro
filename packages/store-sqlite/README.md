@@ -21,6 +21,10 @@ await store.migrate()
   committed data. That needs a real file: for an in-memory store use `MemoryStore` from `nostro`.
 - Amounts are stored as decimal text and constrained to positive integers, so values beyond 64 bits
   stay exact. Text memos are stored as BLOBs so NUL survives.
+- Journal triggers use the bigint aggregates `nostro_signed_sum` and `nostro_cash_sum`. Raw SQL
+  writers must call `registerJournalFunctions(db)` on their own connection and insert a complete
+  entry's lines before its `journal_entries` row (the line foreign key is deferrable). A connection
+  without the aggregates fails closed: it cannot post a journal entry.
 - `synchronous = FULL`: a committed transaction survives power loss.
 
 **Use one `SqliteStore` per database file per process.** better-sqlite3 is synchronous, so two

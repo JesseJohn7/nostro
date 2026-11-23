@@ -147,7 +147,7 @@ describe('nostro migrate', () => {
     for (const db of [':memory:', 'sqlite:']) {
       expect(await nostro(workspace(), ['migrate', '--db', db])).toMatchObject({
         code: 1,
-        stderr: 'nostro: --db must name a database file or a postgres:// URL.\n',
+        stderr: 'nostro: --db must name a database file, a postgres:// URL or a mysql:// URL.\n',
       })
     }
   })
@@ -234,6 +234,19 @@ describe('opening a database', () => {
 
   it('reports an unreachable PostgreSQL without printing its password', async () => {
     const { code, stderr } = await nostro(workspace(), ['reconcile', '--db', 'postgres://nostro:s3cret@127.0.0.1:1/nostro'])
+    expect(code).toBe(1)
+    expect(stderr).toMatch(/^nostro: .*ECONNREFUSED/)
+    expect(stderr).not.toContain('s3cret')
+  })
+
+  it('requires a database name in a mysql:// URL', async () => {
+    const { code, stderr } = await nostro(workspace(), ['reconcile', '--db', 'mysql://nostro@127.0.0.1:3306'])
+    expect(code).toBe(1)
+    expect(stderr).toBe('nostro: --db mysql:// URL must name a database, e.g. mysql://localhost/nostro.\n')
+  })
+
+  it('reports an unreachable MySQL without printing its password', async () => {
+    const { code, stderr } = await nostro(workspace(), ['reconcile', '--db', 'mysql://nostro:s3cret@127.0.0.1:1/nostro'])
     expect(code).toBe(1)
     expect(stderr).toMatch(/^nostro: .*ECONNREFUSED/)
     expect(stderr).not.toContain('s3cret')

@@ -251,6 +251,7 @@ export function resolutionJson(report: ResolutionReport) {
     closed: report.closed.map(exceptionJson),
     opened: report.opened === null ? null : exceptionJson(report.opened),
     journalEntry: report.journalEntry === null ? null : journalEntryJson(report.journalEntry),
+    alreadyApplied: report.alreadyApplied ?? false,
   }
 }
 

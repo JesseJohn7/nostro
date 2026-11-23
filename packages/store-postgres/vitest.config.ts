@@ -3,8 +3,9 @@ import { defineConfig } from 'vitest/config'
 
 export default defineConfig({
   resolve: {
-    // Run against core's source so the store, testkit and tests share one copy of every class.
+    // Run against core's source so the store, suites and tests share one copy of every class.
     alias: {
+      '@nostro-labs/store-conformance': fileURLToPath(new URL('../store-conformance/src/index.ts', import.meta.url)),
       'nostro-testkit': fileURLToPath(new URL('../testkit/src/index.ts', import.meta.url)),
       '@nostro-labs/nostro': fileURLToPath(new URL('../core/src/index.ts', import.meta.url)),
     },

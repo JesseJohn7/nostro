@@ -47,6 +47,7 @@
   "dependencies": {
     "@nostro-labs/nostro": "workspace:^",
     "@nostro-labs/server": "workspace:^",
+    "@nostro-labs/store-mysql": "workspace:^",
     "@nostro-labs/store-postgres": "workspace:^",
     "@nostro-labs/store-sqlite": "workspace:^"
   },

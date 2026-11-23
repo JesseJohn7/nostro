@@ -3,9 +3,10 @@
   "compilerOptions": {
     "rootDir": "..",
     "noEmit": true,
-    // Tests and the shared testkit see one copy of core: its source.
+    // Tests and the shared suites see one copy of core: its source.
     "paths": {
       "@nostro-labs/nostro": ["./src/index.ts"],
+      "@nostro-labs/store-conformance": ["../store-conformance/src/index.ts"],
       "nostro-testkit": ["../testkit/src/index.ts"]
     }
   },

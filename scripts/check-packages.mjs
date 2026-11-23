@@ -7,9 +7,10 @@
  *
  * Packs each publishable package, checks what is in each tarball (built
  * code, README, LICENSE; no sources or tests; no workspace: ranges left),
- * installs the tarballs with npm into an empty directory, and uses them
- * there: the library, the SQLite store's native module, the server, the
- * `nostro` binary, the before-and-after example, and the TypeScript types.
+ * installs the seven tarballs with npm into an empty directory, and uses them
+ * there: the library, the SQLite and MySQL stores, the shared conformance
+ * suite, the server, the `nostro` binary, the before-and-after example, and
+ * the TypeScript types.
  * Exits non-zero on any failure.
  */
 import { execFileSync } from 'node:child_process'
@@ -19,7 +20,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = fileURLToPath(new URL('..', import.meta.url))
-const PACKAGES = ['core', 'store-sqlite', 'store-postgres', 'server', 'cli']
+const PACKAGES = ['core', 'store-conformance', 'store-sqlite', 'store-postgres', 'store-mysql', 'server', 'cli']
 const work = mkdtempSync(join(tmpdir(), 'nostro-packages-'))
 const run = (cmd, args, cwd, input) =>
   execFileSync(cmd, args, { cwd, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], ...(input === undefined ? {} : { input }) })
@@ -54,7 +55,9 @@ try {
   run('mkdir', ['-p', app], work)
   writeFileSync(join(app, 'package.json'), JSON.stringify({ name: 'app', private: true, type: 'module' }))
   run('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error', ...tarballs], app)
-  check(true, 'npm installed all five tarballs into an empty directory')
+  check(true, 'npm installed all seven tarballs into an empty directory')
+  run('npm', ['install', '--no-audit', '--no-fund', '--loglevel=error', 'vitest@^2.1.8'], app)
+  check(true, 'npm installed vitest for the published conformance suite')
 
   writeFileSync(
     join(app, 'use.mjs'),
@@ -104,6 +107,21 @@ console.log('used')
   )
   check(run('node', ['use.mjs'], app).trim() === 'used', 'the library, both stores and the server work from the installed packages')
 
+  writeFileSync(
+    join(app, 'conformance.test.ts'),
+    `
+import { MemoryStore } from '@nostro-labs/nostro'
+import { STORE_CONTRACT_VERSION, describeStoreConformance, describeStoreProperties } from '@nostro-labs/store-conformance'
+
+const options = { contractVersion: STORE_CONTRACT_VERSION }
+describeStoreConformance('MemoryStore', () => new MemoryStore(), options)
+describeStoreProperties('MemoryStore', (now) => new MemoryStore({ now }), { ...options, runs: 2 })
+`,
+  )
+  const vitest = join(app, 'node_modules', '.bin', 'vitest')
+  run(vitest, ['run', 'conformance.test.ts'], app)
+  check(true, 'the published conformance suites run against the published MemoryStore')
+
   const nostro = join(app, 'node_modules', '.bin', 'nostro')
   check(run(nostro, ['--version'], app).trim() === version, `the nostro binary runs, and says ${version}`)
   check(run(nostro, ['migrate', '--db', 'cli.db'], app).includes('from schema version 0 to'), 'nostro migrate creates a database')
@@ -119,9 +137,19 @@ console.log('used')
     join(app, 'types.ts'),
     `
 import { Money, NATIVE, type Store, type MovementJson } from '@nostro-labs/nostro'
+import {
+  STORE_CONTRACT_VERSION,
+  describeStoreConformance,
+  type ConformanceOptions,
+  type PropertyOptions,
+} from '@nostro-labs/store-conformance'
 import { SqliteStore } from '@nostro-labs/store-sqlite'
 import { PostgresStore } from '@nostro-labs/store-postgres'
 import { createServer, apiKeys } from '@nostro-labs/server'
+const options: ConformanceOptions = { contractVersion: STORE_CONTRACT_VERSION }
+const properties: PropertyOptions = { ...options, runs: 2 }
+void properties
+void describeStoreConformance
 const store: Store = new SqliteStore({ filename: 'x.db' })
 const pg: Store = new PostgresStore({ connectionString: 'postgres://u@h/d' })
 void pg
