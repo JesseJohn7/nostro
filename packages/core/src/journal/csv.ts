@@ -7,9 +7,13 @@
  * because references and account codes come from users and these files are
  * opened in spreadsheets. Payer-controlled memo text is never written.
  */
+import { csvCell, csvRow } from '../csv.js'
 import type { JournalEntry } from '../model/index.js'
 import type { Store } from '../store/index.js'
 import { JournalRounder } from './round.js'
+
+export const journalCsvCell = csvCell
+export const journalCsvRow = csvRow
 
 export const JOURNAL_CSV_COLUMNS = [
   'entry_id',
@@ -53,18 +57,6 @@ export interface JournalCsvOptions {
   /** Metadata keys to read as dimensions. Each key becomes a column named after it. */
   readonly dimensions?: readonly string[]
 }
-
-const FORMULA = /^[=+\-@\t\r]/
-
-/** One CSV cell. `text` cells get the formula guard; numbers and ids do not need it. */
-export function journalCsvCell(value: string | number | null, text = false): string {
-  if (value === null) return ''
-  let s = String(value)
-  if (text && FORMULA.test(s)) s = `'${s}`
-  return /[",\r\n]/.test(s) ? `"${s.replaceAll('"', '""')}"` : s
-}
-
-export const journalCsvRow = (cells: readonly string[]) => `${cells.join(',')}\r\n`
 
 async function* journalEntryPages(options: JournalCsvOptions, includeBeforeFrom = false): AsyncGenerator<JournalEntry[]> {
   const { store, tenantId } = options

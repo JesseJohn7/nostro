@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { FakeHorizon } from 'nostro-testkit'
 import { A, B, migrated, nostro, startServe as start } from './helpers.js'
 
-const C = `G${'C'.repeat(55)}`
+const C = 'GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEBNS5'
 const KEY = 'k'.repeat(64)
 const env = { NOSTRO_API_KEYS: `acme:${KEY}` }
 

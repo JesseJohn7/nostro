@@ -1,0 +1,4 @@
+id,seq,external_id,revision,network,source,account,entity_id,direction,kind,amount,asset,counterparty,muxed_id,memo_type,ledger,tx_hash,operation_id,occurred_at,disposition,ignored_reason,created_at
+id,seq,reference,account,direction,amount,asset,amount_paid,amount_outstanding,muxed_id,payers,due_at,expires_at,status,cancel_reason,fingerprint_suffix,metadata,created_at,updated_at
+id,seq,code,status,movement_id,expectation_id,account,amount,asset,detail,resolution_note,opened_at,resolved_at
+id,movement_id,expectation_id,amount,asset,strategy,score,created_at

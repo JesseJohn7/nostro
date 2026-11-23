@@ -5,7 +5,7 @@
  */
 import { parseArgs } from "node:util";
 import type { ParseArgsConfig } from "node:util";
-import { isAccountId } from "@nostro-labs/nostro";
+import { isAccountId, isValidAccountId } from "@nostro-labs/nostro";
 import type { HorizonRateLimit } from "@nostro-labs/nostro";
 import type { Io } from "./io.js";
 
@@ -40,6 +40,8 @@ type Value = string | boolean | (string | boolean)[] | undefined;
 export interface Args {
   readonly values: Readonly<Record<string, Value>>;
   readonly positionals: readonly string[];
+  /** Original argv, for commands that need to inspect `--` boundaries. */
+  readonly argv: readonly string[];
 }
 
 /** Every command takes these. */
@@ -84,7 +86,7 @@ export function parse(argv: readonly string[], options: OptionSpec): Args {
       allowPositionals: true,
       strict: true,
     });
-    return { values: values as Record<string, Value>, positionals };
+    return { values: values as Record<string, Value>, positionals, argv: [...argv] };
   } catch (err) {
     throw new UsageError(err instanceof Error ? err.message : String(err));
   }
@@ -210,10 +212,17 @@ export function accounts(args: Args, io: Io): string[] {
     );
   }
   const CONTRACT_RE = /^C[A-Z2-7]{55}$/;
+  const MUXED_RE = /^M[A-Z2-7]{68}$/;
   for (const a of list) {
-    if (!isAccountId(a) && !CONTRACT_RE.test(a)) {
+    const structurallyValid = isAccountId(a) || CONTRACT_RE.test(a) || MUXED_RE.test(a);
+    if (!structurallyValid) {
       throw new UsageError(
         `${JSON.stringify(a)} is not a G... account id or a C... contract address.`,
+      );
+    }
+    if (!isValidAccountId(a)) {
+      throw new UsageError(
+        `${JSON.stringify(a)} has an invalid checksum; check the account id.`,
       );
     }
   }

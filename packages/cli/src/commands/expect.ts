@@ -1,5 +1,5 @@
 import type { AssetId, Expectation, Memo, NewExpectation, StoreTx } from '@nostro-labs/nostro'
-import { ConstraintError, Money, NATIVE, ValidationError, isAccountId, parseAsset } from '@nostro-labs/nostro'
+import { ConstraintError, Money, NATIVE, ValidationError, isAccountId, isValidAccountId, muxedAddress, parseAsset } from '@nostro-labs/nostro'
 import type { Args } from '../args.js'
 import { COMMON, CliError, UsageError, date, flag, positionals, string, strings, tenant } from '../args.js'
 import type { Command } from '../command.js'
@@ -68,6 +68,7 @@ export function expectationOf(args: Args, tenantId: string): NewExpectation {
   if (reference === undefined || reference.trim() === '') throw new UsageError('Give the reference, e.g. nostro expect INV-1042 ...')
   const account = string(args, 'account')
   if (account === undefined || !isAccountId(account)) throw new UsageError('--account must be the G... account it is paid to.')
+  if (!isValidAccountId(account)) throw new UsageError('--account has an invalid checksum; check the account id.')
   const raw = string(args, 'amount')
   if (raw === undefined) throw new UsageError('--amount is required.')
   const asset = assetOf(string(args, 'asset') ?? 'native')
@@ -80,6 +81,7 @@ export function expectationOf(args: Args, tenantId: string): NewExpectation {
   if (flag(args, 'issue-muxed-id') && string(args, 'muxed-id') !== undefined) throw new UsageError('Give --muxed-id or --issue-muxed-id, not both.')
   for (const payer of strings(args, 'payer')) {
     if (!isAccountId(payer)) throw new UsageError(`--payer ${JSON.stringify(payer)} is not a G... account id.`)
+    if (!isValidAccountId(payer)) throw new UsageError(`--payer ${JSON.stringify(payer)} has an invalid checksum; check the account id.`)
   }
 
   return {
@@ -172,7 +174,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
       await write(io.stdout, json(expectationWithPaid(recorded, Money.zero(recorded.amount.asset, recorded.amount.decimals))))
     } else {
       const way = recorded.direction === 'credit' ? 'owed to' : 'to pay from'
-      const muxed = recorded.muxedId === null ? '' : ` (muxed id ${recorded.muxedId.toString()})`
+      const muxed = recorded.muxedId === null ? '' : ` (${muxedAddress(recorded.account, recorded.muxedId)})`
       await write(io.stdout, `Recorded ${clean(recorded.reference)}: ${money(recorded.amount)} ${way} ${recorded.account}${muxed}.\n`)
     }
     return 0

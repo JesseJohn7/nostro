@@ -27,7 +27,7 @@ describe('nostro expect', () => {
 
     const listed = await nostro(cwd, ['expectations'])
     expect(listed.stdout.split('\n')).toEqual([
-      'REFERENCE  STATUS   AMOUNT      PAID        ASSET  DUE         ACCOUNT',
+      'REFERENCE  STATUS   AMOUNT      PAID        ASSET  DUE         ACCOUNT                                                M ADDRESS',
       `INV-1042   settled  25.0000000  25.0000000  XLM                ${A}`,
       `INV-1043   open     10.0000000  0.0000000   XLM    2026-11-30  ${A}`,
       '',
@@ -81,7 +81,7 @@ describe('nostro expect', () => {
   it('issues sequential muxed ids for an account, scoped by tenant', async () => {
     const cwd = await migrated()
     const first = await nostro(cwd, ['expect', 'INV-1', '--account', A, '--amount', '10', '--issue-muxed-id'])
-    expect(first).toMatchObject({ code: 0, stdout: `Recorded INV-1: 10.0000000 XLM owed to ${A} (muxed id 1).\n` })
+    expect(first).toMatchObject({ code: 0, stdout: `Recorded INV-1: 10.0000000 XLM owed to ${A} (MAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAFNZG).\n` })
     await nostro(cwd, ['expect', 'INV-2', '--account', A, '--amount', '10', '--muxed-id', '10'])
     const second = await nostro(cwd, ['expect', 'INV-3', '--account', A, '--amount', '20', '--issue-muxed-id', '--json'])
     expect(JSON.parse(second.stdout)).toMatchObject({ reference: 'INV-3', account: A, muxedId: '11', status: 'open' })
@@ -219,7 +219,7 @@ describe('nostro cancel', () => {
 })
 
 describe('nostro amend', () => {
-  const C = `G${'C'.repeat(55)}`
+  const C = 'GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEBNS5'
 
   it('changes the mutable fields and prints the resulting status', async () => {
     const cwd = await migrated()

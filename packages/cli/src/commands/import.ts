@@ -51,7 +51,7 @@ function rowArgs(row: ReadonlyMap<string, string>): Args {
   }
   if (payers.length > 0) values.payer = payers
   if (meta.length > 0) values.meta = meta
-  return { values, positionals: [row.get('reference') ?? ''] }
+  return { values, positionals: [row.get('reference') ?? ''], argv: [] }
 }
 
 /** The fields two expectations are compared on. Equal fields mean the same expectation. */

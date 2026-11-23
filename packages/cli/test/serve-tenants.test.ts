@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest'
 import { FakeHorizon } from 'nostro-testkit'
 import { A, B, migrated, nostro, startServe as start } from './helpers.js'
 
-const C = `G${'C'.repeat(55)}`
+const C = 'GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEBNS5'
 const SECRET_ACME = 's'.repeat(64)
 const SECRET_BETA = 't'.repeat(64)
 
