@@ -33,9 +33,22 @@ jobs:
           --health-interval 2s
           --health-timeout 5s
           --health-retries 20
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: nostro
+          MYSQL_DATABASE: nostro
+        ports: ['3306:3306']
+        options: >-
+          --tmpfs /var/lib/mysql
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pnostro"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     env:
       VERSION: ${{ inputs.version }}
       NOSTRO_TEST_DATABASE_URL: postgres://nostro:nostro@localhost:5432/nostro
+      NOSTRO_TEST_MYSQL_DATABASE_URL: mysql://root:nostro@127.0.0.1:3306/nostro
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4

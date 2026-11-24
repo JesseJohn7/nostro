@@ -38,7 +38,9 @@ jobs:
           MYSQL_ROOT_PASSWORD: nostro
           MYSQL_DATABASE: nostro
         ports: ['3306:3306']
+        # In memory: every test store runs the whole schema, and fsyncing that much DDL takes minutes.
         options: >-
+          --tmpfs /var/lib/mysql
           --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -pnostro"
           --health-interval 2s
           --health-timeout 5s
