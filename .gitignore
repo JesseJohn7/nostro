@@ -6,3 +6,7 @@ coverage/
 .env.*
 !.env.example
 .DS_Store
+
+# Python bytecode
+__pycache__/
+*.py[cod]

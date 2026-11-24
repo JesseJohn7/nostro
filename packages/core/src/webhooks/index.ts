@@ -18,11 +18,13 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 import type { DeliveryOutcome, Store } from '../store/index.js'
 import { eventCursorKey, outboxEventJson } from '../store/index.js'
+import { parseSignature, SIGNATURE_HEADER, type VerifyOptions } from './parse.js'
+
+export { parseSignature, SIGNATURE_HEADER } from './parse.js'
+export type { ParsedSignature, VerifyOptions } from './parse.js'
 
 /** Shorter secrets can be guessed; generate them with `openssl rand -hex 32`. */
 export const MIN_WEBHOOK_SECRET_LENGTH = 32
-
-export const SIGNATURE_HEADER = 'nostro-signature'
 
 const hmac = (secret: string, t: number, body: string) =>
   createHmac('sha256', secret).update(`${t}.${body}`, 'utf8').digest('hex')
@@ -32,28 +34,17 @@ export function signWebhook(secret: string, body: string, t: number): string {
   return `t=${t},v1=${hmac(secret, t, body)}`
 }
 
-export interface VerifyOptions {
-  readonly secret: string
-  /** The `Nostro-Signature` header as received. */
-  readonly header: string | null | undefined
-  /** The raw request body, exactly as received: verify before parsing. */
-  readonly body: string
-  /** How far `t` may be from now, in seconds. Default 300. */
-  readonly toleranceSeconds?: number
-  readonly now?: () => Date
-}
-
 /** True only for a body signed with `secret` within the tolerance. */
 export function verifyWebhook(options: VerifyOptions): boolean {
   const { secret, header, body } = options
   if (typeof header !== 'string') return false
-  const parts = new Map(header.split(',').map((p) => [p.slice(0, p.indexOf('=')).trim(), p.slice(p.indexOf('=') + 1).trim()]))
-  const t = parts.get('t')
-  const v1 = parts.get('v1')
-  if (t === undefined || v1 === undefined || !/^\d{1,12}$/.test(t) || !/^[0-9a-f]{64}$/.test(v1)) return false
   const now = Math.floor((options.now ?? (() => new Date()))().getTime() / 1000)
-  if (Math.abs(now - Number(t)) > (options.toleranceSeconds ?? 300)) return false
-  return timingSafeEqual(Buffer.from(hmac(secret, Number(t), body), 'hex'), Buffer.from(v1, 'hex'))
+  const signature = parseSignature(header, now, options.toleranceSeconds ?? 300)
+  if (signature === null) return false
+  return timingSafeEqual(
+    Buffer.from(hmac(secret, signature.t, body), 'hex'),
+    Buffer.from(signature.v1, 'hex'),
+  )
 }
 
 export interface DeliverOptions {

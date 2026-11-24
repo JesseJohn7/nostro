@@ -22,6 +22,7 @@ nostro export --output journal.csv                   # the journal, a row per li
 
 | Command | What it does |
 |---|---|
+| `config` | Prints every resolved setting and its source (flag, environment, profile or default), in text or `--json`. |
 | `migrate` | Creates the database, or applies the migrations it is missing. The only command that changes the schema; every other one refuses a database that is not exactly at the version it expects. |
 | `sync` | Ingests effects and fees for each `--account`, until caught up (or one round with `--once`). |
 | `expect` | Records an expectation: a reference, an account, an amount, and optionally a muxed id, a memo, payers, due and expiry dates. Never rounds an amount. |
@@ -94,6 +95,81 @@ rest. Options can also come from the environment:
 | `NOSTRO_WEBHOOK_URL` | `serve`: `--webhook-url` |
 | `NOSTRO_WEBHOOK_SECRET` | `serve`: the webhook signing secret; never a flag |
 | `NOSTRO_PORT`, `NOSTRO_HOST` | `serve`: `--port`, `--host` |
+
+## Named profiles
+
+For people who switch between a local testnet database and a pubnet database (or two tenants),
+put the settings in a JSON file instead of retyping flags or exporting `NOSTRO_*` on every command:
+
+```json
+{
+  "version": 1,
+  "defaultProfile": "testnet",
+  "profiles": {
+    "testnet": {
+      "db": "testnet.db",
+      "tenant": "acme",
+      "network": "testnet",
+      "accounts": ["G..."],
+      "port": 8080,
+      "host": "127.0.0.1",
+      "interval": 30
+    },
+    "pubnet": {
+      "db": "postgres://db.example/pubnet",
+      "tenant": "acme",
+      "network": "public",
+      "accounts": ["G..."],
+      "schema": "nostro"
+    }
+  }
+}
+```
+
+Select a profile with `--profile pubnet` or `NOSTRO_PROFILE=pubnet`; point at a file with `--config
+<file>` or `NOSTRO_CONFIG=<file>`. Without either, `./nostro.json` is used, then
+`$XDG_CONFIG_HOME/nostro/nostro.json` (or `~/.config/nostro/nostro.json`); the first file found wins
+and files are never merged. A profile sets `db`, `tenant`, `network`, `horizon`, `accounts`, the
+PostgreSQL `schema`, and `serve`'s `port`, `host` and `interval`. Precedence is **flag > selected
+profile > environment > default**, so a leftover environment variable cannot redirect a profile you
+chose on purpose. With no config file, behaviour is exactly as before.
+
+`nostro config` prints every resolved value and where it came from (`flag`, `environment`, `profile`
+or `default`), in text or `--json`:
+
+```sh
+nostro config --profile pubnet
+nostro config --profile pubnet --json
+```
+
+URLs are redacted and API keys are never printed. The file is parsed strictly: an unknown key, a
+wrong type or a missing profile is an error. Secrets are refused in the file — put a database
+password in `NOSTRO_DB` (or the driver's password file), never in the JSON; API keys and webhook
+secrets stay in the environment. A `settings` object inside a profile is reserved for future
+settings and cannot hold secrets.
+
+## Remote mode
+
+If `nostro serve` is running, a person triaging exceptions does not need database credentials:
+they have an API key scoped to one tenant. Select remote mode with `--api <url>` or
+`NOSTRO_API_URL`, and supply the key **only** through `NOSTRO_API_KEY` (never a flag):
+
+```sh
+export NOSTRO_API_KEY=nstk_...
+nostro exceptions --api http://localhost:8080
+nostro expectations --api http://localhost:8080 --json
+nostro export --api http://localhost:8080 --output journal.csv
+```
+
+`expectations`, `expect`, `exceptions`, `resolve` and `export` work against the API; their text and
+`--json` output is identical to local mode. Lists follow the API's `next` cursor. `http://` is
+allowed only for localhost (or `*.localhost`); use `https://` elsewhere, and do not put credentials
+in the URL. `migrate`, `sync`, `reconcile`, `post`, `doctor`, `serve` and the other local commands
+refuse in remote mode with a message that says they need the database. RFC 9457 problem codes appear
+in error messages (`nostro: resolution_refused: ...`); malformed requests exit 2, other API failures
+exit 1. The key and any URL credentials never appear in output, including with `NOSTRO_DEBUG`.
+Remote `export` supports `--format csv` only; date range and `--entity` are sent to the API, while
+`--decimals`, `--destination` and the other formats need a local database.
 
 Exit status is 0 on success, 1 when the command failed or found a problem, and 2 when the command
 line was wrong. A password in a `postgres://` or `mysql://` URL is never printed. Text that came from a payment,

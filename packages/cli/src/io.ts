@@ -3,6 +3,8 @@
  * tests pass strings and a fake Horizon, so every command runs in-process.
  */
 
+import type { LoadedConfig } from './config.js'
+
 export interface Output {
   /** Returns false when the caller should wait for `drain`, as a Node stream does. */
   write(chunk: string): boolean
@@ -26,6 +28,8 @@ export interface Io {
   readonly interactive?: boolean
   /** Asks a question and returns the answer, or null when input has ended. */
   readonly prompt?: (question: string) => Promise<string | null>
+  /** The config file loaded once by `main()`. Commands read resolved settings from it. */
+  readonly config?: LoadedConfig
 }
 
 /** Write a chunk, waiting for the stream to drain if it asks. */

@@ -1702,6 +1702,9 @@ export class SqliteStore extends SqliteReader implements MigratableStore {
     writer.function('nostro_event_prune_allowed', () => Number(this.eventPruneAuthorized))
     const reader = new Database(filename, { readonly: true, timeout: busy })
     super(() => reader)
+    // Pruning deletes through the reader connection, so the append-only
+    // trigger needs the same authorisation function registered there.
+    reader.function('nostro_event_prune_allowed', () => Number(this.eventPruneAuthorized))
     this.writer = writer
     this.reader = reader
     this.ids = options.ids ?? randomUUID

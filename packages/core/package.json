@@ -10,6 +10,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
+    },
+    "./money": {
+      "types": "./dist/money/index.d.ts",
+      "default": "./dist/money/index.js"
+    },
+    "./json": {
+      "types": "./dist/model/json.d.ts",
+      "default": "./dist/model/json.js"
+    },
+    "./webhooks/verify": {
+      "types": "./dist/webhooks/browser.d.ts",
+      "default": "./dist/webhooks/browser.js"
     }
   },
   "files": [

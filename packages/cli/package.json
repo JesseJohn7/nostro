@@ -46,6 +46,7 @@
     "test": "vitest run --coverage"
   },
   "dependencies": {
+    "@nostro-labs/client": "workspace:^",
     "@nostro-labs/nostro": "workspace:^",
     "@nostro-labs/server": "workspace:^",
     "@nostro-labs/store-mysql": "workspace:^",

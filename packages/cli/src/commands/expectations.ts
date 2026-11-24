@@ -1,8 +1,9 @@
 import type { ExpectationStatus } from '@nostro-labs/nostro'
 import { isAccountId, isValidAccountId, muxedAddress, sumAmounts } from '@nostro-labs/nostro'
 import { COMMON, UsageError, afterSeq, integer, machineFormat, positionals, string, tenant } from '../args.js'
+import { withBackend } from '../backend.js'
 import type { Command } from '../command.js'
-import { COMMON_HELP, withStore } from '../command.js'
+import { COMMON_HELP } from '../command.js'
 import { assetLabel, expectationWithPaid, when } from '../format.js'
 import { json, table, write } from '../io.js'
 
@@ -43,8 +44,8 @@ ${COMMON_HELP}`,
     if (account !== undefined && !isAccountId(account)) throw new UsageError('--account must be a G... account id.')
     if (account !== undefined && !isValidAccountId(account)) throw new UsageError('--account has an invalid checksum; check the account id.')
 
-    const rows = await withStore(args, io, async (store) => {
-      const list = await store.listExpectations({
+    const rows = await withBackend(args, io, async (backend) => {
+      const list = await backend.listExpectations({
         tenantId,
         limit,
         ...(after === undefined ? {} : { afterSeq: after }),
@@ -53,7 +54,7 @@ ${COMMON_HELP}`,
       })
       const out = []
       for (const e of list) {
-        const allocations = await store.listAllocations({ tenantId, expectationId: e.id })
+        const allocations = await backend.listAllocations(tenantId, e.id)
         out.push({ e, paid: sumAmounts(allocations.map((a) => a.amount), e.amount) })
       }
       return out

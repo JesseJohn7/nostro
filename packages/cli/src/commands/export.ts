@@ -1,5 +1,5 @@
 import { createWriteStream } from 'node:fs'
-import { readFile, rm } from 'node:fs/promises'
+import { readFile, rm, writeFile } from 'node:fs/promises'
 import { once } from 'node:events'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -18,6 +18,7 @@ import {
   walletStatement,
 } from '@nostro-labs/nostro'
 import { COMMON, CliError, UsageError, date, flag, integer, positionals, string, tenant } from '../args.js'
+import { remote, withBackend } from '../backend.js'
 import type { Command } from '../command.js'
 import { withStore } from '../command.js'
 import { write } from '../io.js'
@@ -178,6 +179,30 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
     let ofxContent: string | undefined
     let throughSeq = 0
     let afterSeq: number | undefined
+
+    // Remote mode has only journal.csv on the API. Other formats need the
+    // store, and the export high-water mark lives in the store too.
+    if (remote(args, io) !== undefined) {
+      if (format !== 'csv') throw new UsageError(`--format ${format} needs a local database; --api can export csv only.`)
+      if (decimals !== undefined) throw new UsageError('--decimals needs a local database; --api exports exact amounts.')
+      if (destination !== undefined || showBatches) throw new UsageError('--destination and --batches need a local database.')
+      const text = await withBackend(args, io, (backend) =>
+        backend.journalCsv({
+          tenantId,
+          ...(from === undefined ? {} : { from }),
+          ...(to === undefined ? {} : { to }),
+          ...(entityId === undefined ? {} : { entityId }),
+        }),
+      )
+      if (output === undefined) {
+        await write(io.stdout, text)
+      } else {
+        const path = resolve(io.cwd, output)
+        await writeFile(path, text, { encoding: 'utf8', flag: flag(args, 'force') ? 'w' : 'wx' })
+        await write(io.stdout, `Wrote journal line(s) to ${path}.\n`)
+      }
+      return 0
+    }
 
     return withStore(args, io, async (store) => {
       let rows: AsyncGenerator<string>

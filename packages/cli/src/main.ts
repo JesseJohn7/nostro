@@ -5,10 +5,13 @@
  */
 import { readFileSync } from 'node:fs'
 import { HorizonError } from '@nostro-labs/nostro'
-import { CliError, UsageError, parse } from './args.js'
+import { CliError, UsageError, parse, string } from './args.js'
 import type { ErrorCode } from './args.js'
+import { loadConfig } from './config.js'
+import { REMOTE_COMMANDS, problemError, remote } from './backend.js'
 import type { Command } from './command.js'
 import { chart } from './commands/chart.js'
+import { configCommand } from './commands/config.js'
 import { doctor } from './commands/doctor.js'
 import { entity } from './commands/entity.js'
 import { keys } from './commands/keys.js'
@@ -68,6 +71,7 @@ export const COMMANDS: readonly Command[] = [
   journalCommand,
   pruneEventsCommand,
   serve,
+  configCommand,
 ]
 
 export function version(): string {
@@ -132,9 +136,22 @@ export async function main(argv: readonly string[], io: Io): Promise<number> {
       await write(io.stdout, helpFor(command))
       return 0
     }
-    return await command.run(args, io)
+    // Load the config once, after parsing: a bad file or a missing profile is
+    // a usage error, and every command sees the same resolved values.
+    const path = string(args, 'config') ?? io.env.NOSTRO_CONFIG
+    const profile = string(args, 'profile') ?? io.env.NOSTRO_PROFILE
+    const loaded = loadConfig(io, path, profile)
+    const resolvedIo = loaded === undefined ? io : { ...io, config: loaded }
+    if (command.name !== 'config') {
+      const mode = remote(args, resolvedIo)
+      if (mode !== undefined && !REMOTE_COMMANDS.has(command.name)) {
+        throw new CliError(`${command.name} needs a local database; --api is a remote connection without one.`)
+      }
+    }
+    return await command.run(args, resolvedIo)
   } catch (err) {
-    const error = err instanceof Error ? err : new Error(String(err))
+    const mapped = problemError(err)
+    const error = mapped instanceof Error ? mapped : new Error(String(mapped))
     if (wantsJson) {
       await write(io.stderr, `${JSON.stringify({ error: { code: errorCode(error), message: error.message } })}
 `)

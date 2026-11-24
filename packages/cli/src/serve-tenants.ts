@@ -9,7 +9,8 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { MIN_WEBHOOK_SECRET_LENGTH, isAccountId, isValidAccountId } from '@nostro-labs/nostro'
 import type { Args } from './args.js'
-import { UsageError, accounts, network, networkNamed, string, strings, tenant } from './args.js'
+import { UsageError, accounts, network, networkNamed, string, tenant } from './args.js'
+import { rawSetting } from './config.js'
 import type { Network } from './args.js'
 import type { Io } from './io.js'
 
@@ -54,7 +55,7 @@ export function webhookDestination(url: string, secret: string | undefined, secr
 /** The plans from the single-tenant flags: one tenant, or none when it has nothing to do. */
 function plansFromFlags(args: Args, io: Io): TenantPlan[] {
   const id = tenant(args, io)
-  const watched = strings(args, 'account').length > 0 || (io.env.NOSTRO_ACCOUNTS ?? '').trim() !== '' ? accounts(args, io) : []
+  const watched = rawSetting('accounts', args, io) === undefined ? [] : accounts(args, io)
   const net = watched.length > 0 ? network(args, io) : null
   const url = string(args, 'webhook-url') ?? io.env.NOSTRO_WEBHOOK_URL
   const webhook = url === undefined ? null : webhookDestination(url, io.env.NOSTRO_WEBHOOK_SECRET, 'NOSTRO_WEBHOOK_SECRET')
@@ -129,14 +130,17 @@ function plansFromConfig(file: string, io: Io): TenantPlan[] {
  * are refused rather than guessed at.
  */
 export function tenantPlans(args: Args, io: Io): TenantPlan[] {
-  const file = string(args, 'config')
-  if (file === undefined) return plansFromFlags(args, io)
+  const file = string(args, 'config') ?? io.env.NOSTRO_CONFIG
+  const path = io.config?.path ?? (file === undefined ? undefined : resolve(io.cwd, file))
+  // A profiles file has no `tenants` list: the usual flags, environment and
+  // selected profile describe one tenant, exactly as without a file.
+  if (path === undefined || io.config?.file.tenants === undefined) return plansFromFlags(args, io)
   for (const name of SINGLE_TENANT_FLAGS) {
     if (args.values[name] !== undefined) throw new UsageError(`--config replaces --${name}; put it in the file instead.`)
   }
   for (const name of SINGLE_TENANT_ENV) {
     if ((io.env[name] ?? '') !== '') throw new UsageError(`--config replaces ${name}; put it in the file instead.`)
   }
-  return plansFromConfig(file, io)
+  return plansFromConfig(path, io)
 }
 

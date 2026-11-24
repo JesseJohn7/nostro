@@ -32,7 +32,7 @@ export const RATE_LIMIT_HELP = `  --rate-limit <n>    Pace Horizon at n requests
 
 /** Open the database, check its schema, run `fn`, and close it whatever happens. */
 export async function withStore<T>(args: Args, io: Io, fn: (store: MigratableStore) => Promise<T>): Promise<T> {
-  const opened = await openStore(database(args, io), io, { create: false })
+  const opened = await openStore(database(args, io), io, { create: false }, args)
   try {
     await assertCurrent(opened)
     return await fn(opened.store)
