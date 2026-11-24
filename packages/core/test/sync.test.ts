@@ -36,7 +36,7 @@ class FakeSource implements MovementSource {
   readonly pulls: PullRequest[] = []
   constructor(
     public feeds: Record<string, FeedRecord[]>,
-    private readonly beforeReturn?: (req: PullRequest) => Promise<void>,
+    public beforeReturn?: (req: PullRequest) => Promise<void>,
   ) {}
 
   async pull(req: PullRequest) {
@@ -59,6 +59,37 @@ const feed = (...amounts: (string | null)[]): FeedRecord[] =>
   amounts.map((amount, i) => ({ token: String(i + 1), amount }))
 
 describe('sync', () => {
+  it('resumes exactly after an abort at every batch boundary', async () => {
+    const rows = feed('1', '2', '3', '4', '5', '6', '7')
+    const baselineStore = new MemoryStore()
+    await sync({ store: baselineStore, source: new FakeSource({ [A]: rows }), tenantId: T, accounts: [A], batchSize: 2 })
+    const baseline = (await baselineStore.listMovements({ tenantId: T })).map((m) => m.externalId)
+    for (const stopAfter of [0, 1, 2, 3]) {
+      const store = new MemoryStore()
+      const source = new FakeSource({ [A]: rows })
+      let pulls = 0
+      const controller = new AbortController()
+      source.beforeReturn = async () => { pulls += 1; if (pulls > stopAfter) controller.abort() }
+      await sync({ store, source, tenantId: T, accounts: [A], batchSize: 2, signal: controller.signal })
+      await sync({ store, source, tenantId: T, accounts: [A], batchSize: 2 })
+      expect((await store.listMovements({ tenantId: T })).map((m) => m.externalId)).toEqual(baseline)
+    }
+  })
+
+  it('produces the same records across page sizes and bounded restarts', async () => {
+    const rows = feed('1', '2', '3', '4', '5', '6', '7', '8')
+    const expected = rows.map((r) => r.token)
+    for (const batchSize of [1, 2, 3, 4]) {
+      const store = new MemoryStore()
+      const source = new FakeSource({ [A]: rows })
+      for (;;) {
+        const report = await sync({ store, source, tenantId: T, accounts: [A], batchSize, maxBatches: 1 })
+        if (report.accounts[0]!.caughtUp) break
+      }
+      expect((await store.listMovements({ tenantId: T })).map((m) => m.externalId)).toEqual(expected)
+    }
+  })
+
   it('reads a backlog in bounded batches and resumes from the stored cursor', async () => {
     const store = new MemoryStore()
     const source = new FakeSource({ [A]: feed('1', '2', '3', '4', '5') })
