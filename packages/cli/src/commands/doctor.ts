@@ -25,7 +25,7 @@ function reportJson(r: DoctorReport) {
     balances:
       r.balances === null
         ? null
-        : r.balances.map((c) => ({ ...c, chain: c.chain.toString(), recorded: c.recorded.toString() })),
+        : r.balances.map((c) => ({ ...c, chain: c.chain.toString(), recorded: c.recorded.toString(), outstanding: c.outstanding === null ? null : c.outstanding.toString() })),
   }
 }
 
@@ -57,23 +57,28 @@ export const doctor: Command = {
   help: `Checks every movement's disposition (I1) and every journal entry (I3). With --attest it also
 compares each account's recorded movements with the balance Horizon reports, per asset, as of the
 ledger that balance last changed in (I2); that catches the sources up first, recording any new
-movements as sync would. Exits 1 if any invariant does not hold. Warnings, such as a decision not
-posted to the journal yet, are listed but do not fail the check.
+movements as sync would. For an account that issues an asset, the chain shows no balance for that
+asset, so the issuer's signed movements are attested against the asset's outstanding supply instead.
+With --events it also checks the event log (I4): every decided movement has a movement.decided event,
+and the chain ends at the movement's current disposition. Exits 1 if any invariant does not hold.
+Warnings, such as a decision not posted to the journal yet, are listed but do not fail the check.
 
 It reads every record in the tenant, so run it as a batch job, not per request. It is safe to run
 while sync and reconcile are running.
 
 Options:
   --attest            Also check balances against the chain, for each --account
+  --events            Also check the event log (I4); the log can be large
 ${NETWORK_HELP}
   --attempts <n>      Comparisons made before a balance mismatch is reported (default 3, about
                       a ledger apart)
 ${COMMON_HELP}`,
-  options: { ...COMMON, ...NETWORK, attest: { type: 'boolean' }, attempts: { type: 'string' } },
+  options: { ...COMMON, ...NETWORK, attest: { type: 'boolean' }, events: { type: 'boolean' }, attempts: { type: 'string' } },
   async run(args, io) {
     positionals(args, 0)
     const tenantId = tenant(args, io)
     const attest = flag(args, 'attest')
+    const checkEvents = flag(args, 'events')
     if (!attest && strings(args, 'account').length > 0) {
       throw new UsageError('--account is for --attest; without it no balance would be checked.')
     }
@@ -91,8 +96,15 @@ ${COMMON_HELP}`,
       }
     }
     const report = await withStore(args, io, (store) =>
-      runDoctor({ store, tenantId, ...(checks === undefined ? {} : { attest: checks }) }),
+      runDoctor({
+        store,
+        tenantId,
+        ...(checks === undefined ? {} : { attest: checks }),
+        ...(checkEvents ? { events: true } : {}),
+        ...(io.signal === undefined ? {} : { signal: io.signal }),
+      }),
     )
+    if (io.signal?.aborted === true) return 130
 
     if (flag(args, 'json')) {
       await write(io.stdout, json(reportJson(report)))
@@ -102,14 +114,21 @@ ${COMMON_HELP}`,
     let out = summary(report, attest)
     if (report.balances !== null && report.balances.length > 0) {
       out += `\n${table([
-        ['ACCOUNT', 'ASSET', 'CHAIN', 'RECORDED', 'AT LEDGER', 'RESULT'],
+        ['ACCOUNT', 'ASSET', 'CHAIN', 'RECORDED', 'OUTSTANDING', 'AT LEDGER', 'RESULT'],
         ...report.balances.map((c) => [
           c.account,
           assetLabel(c.asset),
           c.chain.toString(),
           c.recorded.toString(),
+          c.outstanding === null ? '' : c.outstanding.toString(),
           c.ledger === null ? '' : String(c.ledger),
-          c.status === 'issuer' ? 'issuer: not attested' : c.status,
+          c.status === 'issuer'
+            ? 'issuer: not attested'
+            : c.status === 'supply_match'
+              ? 'supply match'
+              : c.status === 'supply_mismatch'
+                ? 'supply mismatch'
+                : c.status,
         ]),
       ])}`
     }

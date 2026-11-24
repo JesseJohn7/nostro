@@ -24,6 +24,8 @@ export interface SyncOptions {
   readonly batchSize?: number
   /** Pulls per account per call. Default 10. */
   readonly maxBatches?: number
+  /** Abort the sync between pulls; the current batch finishes first. */
+  readonly signal?: AbortSignal
 }
 
 export interface AccountSyncReport {
@@ -78,7 +80,7 @@ export async function sync(options: SyncOptions): Promise<SyncReport> {
 }
 
 async function syncAccount(
-  { store, source, tenantId }: SyncOptions,
+  { store, source, tenantId, signal }: SyncOptions,
   account: string,
   batchSize: number,
   maxBatches: number,
@@ -96,6 +98,7 @@ async function syncAccount(
 
   try {
     while (batches < maxBatches && !caughtUp) {
+      if (signal?.aborted === true) break
       const from = cursor
       const pulled = await source.pull({ tenantId, account, cursor: from, limit: batchSize })
       for (const m of pulled.movements) assertBelongs(m, key)

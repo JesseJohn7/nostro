@@ -44,6 +44,21 @@ export interface BalanceSource {
   /** The network label the movement sources use, e.g. `testnet`. */
   readonly network: string
   snapshot(account: string): Promise<BalanceSnapshot>
+  /**
+   * The outstanding supply of an asset issued by `account`, or `null` when
+   * the source cannot report it. Used to attest an issuer's own asset (I2),
+   * which a balance line cannot cover.
+   */
+  supply?(account: string, asset: AssetId): Promise<AssetSupply | null>
+}
+
+/** The total outstanding supply of an issued asset. */
+export interface AssetSupply {
+  readonly asset: AssetId
+  /** Total outstanding: balances + claimable balances + liquidity pools + contracts. */
+  readonly outstanding: Money
+  /** The ledger the supply is as of, when the source says. */
+  readonly ledger: number | null
 }
 
 export interface BalanceCheck {
@@ -60,10 +75,19 @@ export interface BalanceCheck {
    */
   readonly ledger: number | null
   /**
-   * `issuer`: the account issues the asset, so the chain shows no balance
-   * to compare with, and nothing is attested.
+   * The outstanding supply of the asset, when the account is the issuer and
+   * a supply was read. `null` otherwise.
    */
-  readonly status: 'match' | 'mismatch' | 'issuer'
+  readonly outstanding: Money | null
+  /**
+   * `match`: the recorded movements equal the chain balance.
+   * `mismatch`: they disagree.
+   * `issuer`: the account issues the asset, so no balance line exists, and
+   *   no supply was read to attest against.
+   * `supply_match`: the issuer's signed movements net to minus the outstanding supply.
+   * `supply_mismatch`: they do not.
+   */
+  readonly status: 'match' | 'mismatch' | 'issuer' | 'supply_match' | 'supply_mismatch'
 }
 
 /**
@@ -96,11 +120,11 @@ export function compareBalances(
     const sum = recorded.get(asset) ?? Money.zero(asset, line.amount.decimals)
     recorded.delete(asset)
     const status = sum.equals(line.amount) ? 'match' : 'mismatch'
-    checks.push({ account, asset, chain: line.amount, recorded: sum, ledger: line.lastModifiedLedger, status })
+    checks.push({ account, asset, chain: line.amount, recorded: sum, ledger: line.lastModifiedLedger, outstanding: null, status })
   }
   for (const [asset, sum] of recorded) {
     const status = issuerOf(asset) === account ? 'issuer' : sum.isZero() ? 'match' : 'mismatch'
-    checks.push({ account, asset, chain: Money.zero(asset, sum.decimals), recorded: sum, ledger: snapshot.ledger, status })
+    checks.push({ account, asset, chain: Money.zero(asset, sum.decimals), recorded: sum, ledger: snapshot.ledger, outstanding: null, status })
   }
   return checks
 }
@@ -145,8 +169,28 @@ export async function attestBalances(options: AttestOptions): Promise<BalanceChe
     for (let attempt = 1; ; attempt++) {
       for (const source of sources) await catchUp(store, source, tenantId, account)
       const opening = await store.getAccountOpening(tenantId, balances.network, account)
-      const found = compareBalances(snapshot, await recorded(store, tenantId, balances.network, account), opening)
-      if (attempt >= attempts || found.every((c) => c.status !== 'mismatch')) {
+      let found = compareBalances(snapshot, await recorded(store, tenantId, balances.network, account), opening)
+
+      // For assets the account issues (no balance line), attest against supply.
+      if (balances.supply !== undefined) {
+        found = await Promise.all(
+          found.map(async (c) => {
+            if (c.status !== 'issuer') return c
+            try {
+              const supply = await balances.supply!(account, c.asset)
+              if (supply === null) return c
+              const expected = supply.outstanding.negate()
+              const status = c.recorded.equals(expected) ? 'supply_match' as const : 'supply_mismatch' as const
+              return { ...c, outstanding: supply.outstanding, ledger: supply.ledger ?? c.ledger, status }
+            } catch {
+              return c
+            }
+          }),
+        )
+      }
+
+      const hasMismatch = found.some((c) => c.status === 'mismatch' || c.status === 'supply_mismatch')
+      if (attempt >= attempts || !hasMismatch) {
         checks.push(...found)
         break
       }

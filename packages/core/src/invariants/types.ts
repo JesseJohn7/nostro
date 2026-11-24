@@ -11,7 +11,7 @@
  */
 import type { AssetId } from '../money/index.js'
 
-export type Invariant = 'I1' | 'I2' | 'I3'
+export type Invariant = 'I1' | 'I2' | 'I3' | 'I4'
 
 export type FindingCode =
   // I1
@@ -19,6 +19,11 @@ export type FindingCode =
   | 'allocation_asset'
   | 'allocation_over_movement'
   | 'muxed_id_duplicate'
+  | 'expectation_status_mismatch'
+  | 'allocation_over_expectation'
+  | 'allocation_account_mismatch'
+  | 'allocation_direction_mismatch'
+  | 'expectation_cancelled_with_allocations'
   // I2
   | 'balance_mismatch'
   // I3
@@ -28,6 +33,9 @@ export type FindingCode =
   | 'journal_cash_mismatch'
   | 'journal_stale'
   | 'manual_entry_touches_cash'
+  // I4 — event log integrity
+  | 'event_missing'
+  | 'event_chain_broken'
 
 /**
  * `error`: the invariant does not hold. `warning`: it holds, but something

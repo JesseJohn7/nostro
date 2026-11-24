@@ -1,5 +1,5 @@
 import type { JournalEntryKind } from '@nostro-labs/nostro'
-import { postJournal } from '@nostro-labs/nostro'
+import { postUntilDone } from '@nostro-labs/nostro'
 import { COMMON, flag, positionals, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
@@ -21,23 +21,13 @@ ${COMMON_HELP}`,
   async run(args, io) {
     positionals(args, 0)
     const tenantId = tenant(args, io)
-    const posted: Record<JournalEntryKind, number> = { initial: 0, reclass: 0, correction: 0, conversion: 0, manual: 0, opening: 0 }
-    const errors = new Map<string, string>()
-    let examined = 0
-    await withStore(args, io, async (store) => {
-      for (let afterSeq: number | undefined; ; ) {
-        const report = await postJournal({ store, tenantId, ...(afterSeq === undefined ? {} : { afterSeq }) })
-        examined += report.examined
-        for (const kind of Object.keys(posted) as JournalEntryKind[]) posted[kind] += report.posted[kind]
-        for (const { movementId, error } of report.errors) errors.set(movementId, error.message)
-        if (report.lastSeq === null) return
-        afterSeq = report.lastSeq
-      }
-    })
-
-    const failed = errors.size > 0
+    const { examined, posted, errors, aborted } = await withStore(args, io, (store) =>
+      postUntilDone({ store, tenantId, ...(io.signal === undefined ? {} : { signal: io.signal }) }),
+    )
+    if (aborted) return 130
+    const failed = errors.length > 0
     if (flag(args, 'json')) {
-      await write(io.stdout, json({ examined, posted, errors: [...errors].map(([movementId, error]) => ({ movementId, error })) }))
+      await write(io.stdout, json({ examined, posted, errors }))
       return failed ? 1 : 0
     }
     const total = posted.initial + posted.reclass + posted.correction
@@ -48,7 +38,7 @@ ${COMMON_HELP}`,
         : `Posted ${total} entr${total === 1 ? 'y' : 'ies'} (${posted.initial} initial, ${posted.reclass} reclass, ` +
             `${posted.correction} correction) over ${examined} movement(s).\n`,
     )
-    for (const [movementId, error] of errors) {
+    for (const { movementId, error } of errors) {
       await write(io.stderr, `Failed on movement ${movementId}: ${clean(error)}\n`)
     }
     return failed ? 1 : 0
