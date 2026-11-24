@@ -10,7 +10,14 @@ process.stdout.on('error', (err: NodeJS.ErrnoException) => {
 
 // Ctrl-C or a container stop: let a running command finish what it is doing and close.
 const stop = new AbortController()
-for (const signal of ['SIGINT', 'SIGTERM'] as const) process.once(signal, () => stop.abort())
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => {
+    if (!stop.signal.aborted) {
+      process.stderr.write('Stopping after the current batch... (Ctrl-C again to kill)\n')
+    }
+    stop.abort()
+  })
+}
 
 // One readline interface, made on first use and shared by every prompt in the command.
 let lines: ReturnType<typeof createInterface> | undefined;

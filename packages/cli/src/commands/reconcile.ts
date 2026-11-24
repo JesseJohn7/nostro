@@ -22,8 +22,9 @@ ${COMMON_HELP}`,
     const tenantId = tenant(args, io)
     const limit = integer(args, 'batch', 100, 1, 10_000)
 
-    const { exceptions, errors, ...totals } = await withStore(args, io, (store) => reconcileAll(store, tenantId, limit))
+    const { exceptions, errors, ...totals } = await withStore(args, io, (store) => reconcileAll(store, tenantId, limit, io.signal))
 
+    if (io.signal?.aborted === true) return 130
     const failed = errors.size > 0
     if (flag(args, 'json')) {
       const list = [...errors].map(([movementId, error]) => ({ movementId, error }))

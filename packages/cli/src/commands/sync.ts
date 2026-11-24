@@ -37,6 +37,7 @@ ${COMMON_HELP}`,
         accounts: list,
         sources: movementSources(client, net),
         once,
+        ...(io.signal === undefined ? {} : { signal: io.signal }),
         onRound: async (source, streams) => {
           if (!progress) return
           for (const r of streams) await write(io.stderr, `${source.name} ${r.account}: ${r.inserted} new so far\n`)
@@ -44,6 +45,7 @@ ${COMMON_HELP}`,
       }),
     )
 
+    if (io.signal?.aborted === true) return 130
     const failed = results.some((r) => r.error !== null)
     if (asJson) {
       await write(

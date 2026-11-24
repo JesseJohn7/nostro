@@ -50,7 +50,8 @@ That code is wrong in at least six ways, and every one of them is a real inciden
 - A restart that re-reads from an older cursor re-applies payments it had already applied.
 
 [examples/before-after](./examples/before-after) runs a careful version of this code and nostro over
-the same payments, and shows what each concludes.
+the same payments, and shows what each concludes. [examples/invoicing](./examples/invoicing) is a
+small web app that creates invoices, settles them from signed webhooks, and shows the full flow.
 
 nostro is the layer that gets this right once, so each product doesn't re-derive it badly.
 

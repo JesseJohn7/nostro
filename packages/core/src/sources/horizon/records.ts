@@ -117,6 +117,22 @@ export interface HorizonAccount {
   readonly balances: readonly HorizonBalance[]
 }
 
+/** One record from `GET /assets`. */
+export interface HorizonAssetRecord {
+  readonly asset_type: string
+  readonly asset_code: string
+  readonly asset_issuer: string
+  readonly balances?: {
+    readonly authorized?: string
+    readonly authorized_to_maintain_liabilities?: string
+    readonly unauthorized?: string
+  }
+  readonly claimable_balances_amount?: string
+  readonly liquidity_pools_amount?: string
+  readonly contracts_amount?: string
+  readonly paging_token: string
+}
+
 /** The operation id (a TOID) an effect belongs to. */
 export function operationIdOf(effect: Pick<HorizonEffect, 'paging_token'>): string {
   const dash = effect.paging_token.indexOf('-')

@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import type { AddressInfo } from 'node:net'
 import { resolve } from 'node:path'
 import type { HorizonRateLimit, MovementSource, Store } from '@nostro-labs/nostro'
-import { StreamWatcher, deliverWebhooks, generateExpectations, sweepExpectations } from '@nostro-labs/nostro'
+import { StreamWatcher, deliverUntilDone, generateExpectations, sweepExpectations } from '@nostro-labs/nostro'
 import type { KeyGrant, RoundSummary, Scope } from '@nostro-labs/server'
 import { SCOPES, apiKeys, createServer, firstOf, storedKeys } from '@nostro-labs/server'
 import type { StoredKeys } from '@nostro-labs/server'
@@ -439,22 +439,18 @@ async function recordSync(store: Store, tenantId: string, net: Network, streams:
 
 /** Deliver until caught up or a delivery fails; a failed event is retried next round. */
 async function deliver(store: Store, tenantId: string, hook: Webhook, io: Io): Promise<void> {
-  let total = 0
-  for (;;) {
-    const report = await deliverWebhooks({
-      store,
-      tenantId,
-      url: hook.url,
-      secret: hook.secret,
-      ...(io.fetch === undefined ? {} : { fetch: io.fetch }),
-    })
-    total += report.delivered
-    if (report.failure !== null) {
-      await line(io.stderr, tenantId, `Webhook failed on event ${report.failure.eventId}: ${clean(report.failure.reason)}; retrying next round.`)
-    }
-    if (report.delivered === 0 || report.failure !== null || report.contended) break
+  const { delivered, failure } = await deliverUntilDone({
+    store,
+    tenantId,
+    url: hook.url,
+    secret: hook.secret,
+    ...(io.fetch === undefined ? {} : { fetch: io.fetch }),
+    ...(io.signal === undefined ? {} : { signal: io.signal }),
+  })
+  if (failure !== null) {
+    await line(io.stderr, tenantId, `Webhook failed on event ${failure.eventId}: ${clean(failure.reason)}; retrying next round.`)
   }
-  if (total > 0) await line(io.stdout, tenantId, `delivered ${total} event(s).`)
+  if (delivered > 0) await line(io.stdout, tenantId, `delivered ${delivered} event(s).`)
 }
 
 /** Resolves when the signal fires; never, without one. */

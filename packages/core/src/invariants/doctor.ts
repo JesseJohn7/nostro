@@ -14,6 +14,7 @@ import type { Disposition, JournalEntry, Movement } from '../model/index.js'
 import { Money } from '../money/index.js'
 import type { AssetId } from '../money/index.js'
 import type { Store, StoreReader } from '../store/index.js'
+import { sumAmounts } from '../store/index.js'
 import type { AttestOptions, BalanceCheck } from './balances.js'
 import { attestBalances } from './balances.js'
 import type { MovementRecords } from './movement.js'
@@ -27,6 +28,10 @@ export interface DoctorOptions {
   readonly pageSize?: number
   /** Also attest these accounts' balances against the chain (I2). */
   readonly attest?: Omit<AttestOptions, 'store' | 'tenantId'>
+  /** Abort between pages; the current page finishes first. */
+  readonly signal?: AbortSignal
+  /** Check the event log (I4) as well. Off by default; the log can be large. */
+  readonly events?: boolean
 }
 
 export interface JournalTotal {
@@ -77,7 +82,22 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   // First, so the movements it catches up are checked below too.
   const balances = options.attest === undefined ? null : await attestBalances({ store, tenantId, ...options.attest })
   for (const c of balances ?? []) {
-    if (c.status !== 'mismatch') continue
+    if (c.status === 'match' || c.status === 'issuer' || c.status === 'supply_match') continue
+    if (c.status === 'supply_mismatch') {
+      findings.push({
+        invariant: 'I2',
+        severity: 'error',
+        code: 'balance_mismatch',
+        detail:
+          `the chain says ${c.account} issues ${c.outstanding!.toString()} ${c.asset}` +
+          `${c.ledger === null ? '' : ` outstanding as of ledger ${c.ledger}`}, but its recorded movements net to ${c.recorded.toString()} (expected ${c.outstanding!.negate().toString()})`,
+        movementId: null,
+        entryId: null,
+        account: c.account,
+        asset: c.asset,
+      })
+      continue
+    }
     findings.push({
       invariant: 'I2',
       severity: 'error',
@@ -93,6 +113,7 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   }
 
   for (let afterSeq: number | undefined; ; ) {
+    if (options.signal?.aborted === true) break
     const page = await store.listMovements({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
     const movementIds = page.map((movement) => movement.id)
     const [pageAllocations, pageExceptions, pageEntries, pageRefunds, pageTransfers] = await Promise.all([
@@ -157,6 +178,7 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   const sums = new Map<string, { like: Money; debits: bigint; credits: bigint }>()
   let entries = 0
   for (let afterSeq: number | undefined; ; ) {
+    if (options.signal?.aborted === true) break
     const page = await store.listJournalEntries({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
     for (const entry of page) {
       entries += 1
@@ -197,28 +219,191 @@ export async function doctor(options: DoctorOptions): Promise<DoctorReport> {
   const seenMuxed = new Map<string, string>()
   let after: number | undefined
   for (;;) {
+    if (options.signal?.aborted === true) break
     const page = await store.listExpectations({ tenantId, limit, ...(after === undefined ? {} : { afterSeq: after }) })
     if (page.length === 0) break
     after = page[page.length - 1]!.seq
+
+    // Fetch all allocations for this page of expectations, to check them.
+    const expectationIds = page.map((e) => e.id)
+    const pageAllocations = await store.listAllocations({ tenantId, expectationIds })
+    const allocationsByExpectation = new Map<string, typeof pageAllocations>()
+    for (const a of pageAllocations) {
+      allocationsByExpectation.set(a.expectationId, [
+        ...(allocationsByExpectation.get(a.expectationId) ?? []),
+        a,
+      ])
+    }
+
+    // Fetch the movements for these allocations, to check account/direction.
+    const movementIds = [...new Set(pageAllocations.map((a) => a.movementId))]
+    const movementMap = new Map<string, Movement>()
+    if (movementIds.length > 0) {
+      for (const m of await store.listMovements({ tenantId, ids: movementIds })) {
+        movementMap.set(m.id, m)
+      }
+    }
+
     for (const e of page) {
-      if (e.muxedId === null) continue
-      const key = `${e.account}:${e.muxedId.toString()}`
-      const first = seenMuxed.get(key)
-      if (first === undefined) seenMuxed.set(key, e.id)
-      else {
+      // Existing: muxed id duplicate check
+      if (e.muxedId !== null) {
+        const key = `${e.account}:${e.muxedId.toString()}`
+        const first = seenMuxed.get(key)
+        if (first === undefined) seenMuxed.set(key, e.id)
+        else {
+          findings.push({
+            invariant: 'I1',
+            severity: 'error',
+            code: 'muxed_id_duplicate',
+            detail: `muxed id ${e.muxedId.toString()} is used by expectations ${first} and ${e.id} on ${e.account}`,
+            movementId: null,
+            entryId: null,
+            account: e.account,
+            asset: null,
+          })
+        }
+      }
+
+      const allocs = allocationsByExpectation.get(e.id) ?? []
+      const allocated = sumAmounts(allocs.map((a) => a.amount), e.amount)
+
+      // Allocations must not exceed the expectation amount.
+      if (allocated.compare(e.amount) > 0) {
         findings.push({
           invariant: 'I1',
           severity: 'error',
-          code: 'muxed_id_duplicate',
-          detail: `muxed id ${e.muxedId.toString()} is used by expectations ${first} and ${e.id} on ${e.account}`,
+          code: 'allocation_over_expectation',
+          detail: `expectation ${e.id} (${e.reference}) is allocated ${allocated.toString()} of ${e.amount.toString()}`,
           movementId: null,
           entryId: null,
           account: e.account,
-          asset: null,
+          asset: e.amount.asset,
         })
+      }
+
+      // The expectation's status must agree with its allocations.
+      const expectedStatus: string =
+        e.status === 'cancelled' ? 'cancelled'
+        : allocated.isZero() ? 'open'
+        : allocated.equals(e.amount) ? 'settled'
+        : 'partially_paid'
+      if (e.status !== expectedStatus) {
+        findings.push({
+          invariant: 'I1',
+          severity: 'error',
+          code: 'expectation_status_mismatch',
+          detail: `expectation ${e.id} (${e.reference}) is ${e.status} but its allocations total ${allocated.toString()} of ${e.amount.toString()} (${expectedStatus})`,
+          movementId: null,
+          entryId: null,
+          account: e.account,
+          asset: e.amount.asset,
+        })
+      }
+
+      // A cancelled expectation must have no allocations.
+      if (e.status === 'cancelled' && !allocated.isZero()) {
+        findings.push({
+          invariant: 'I1',
+          severity: 'error',
+          code: 'expectation_cancelled_with_allocations',
+          detail: `expectation ${e.id} (${e.reference}) is cancelled but has ${allocated.toString()} allocated to it`,
+          movementId: null,
+          entryId: null,
+          account: e.account,
+          asset: e.amount.asset,
+        })
+      }
+
+      // Each allocation's movement must match the expectation's account and direction.
+      for (const a of allocs) {
+        const m = movementMap.get(a.movementId)
+        if (m === undefined) continue
+        if (m.account !== e.account) {
+          findings.push({
+            invariant: 'I1',
+            severity: 'error',
+            code: 'allocation_account_mismatch',
+            detail: `allocation ${a.id} is on movement ${m.id} (account ${m.account}) but the expectation ${e.id} is on account ${e.account}`,
+            movementId: m.id,
+            entryId: null,
+            account: e.account,
+            asset: e.amount.asset,
+          })
+        }
+        if (m.direction !== e.direction) {
+          findings.push({
+            invariant: 'I1',
+            severity: 'error',
+            code: 'allocation_direction_mismatch',
+            detail: `allocation ${a.id} is on a ${m.direction} movement but the expectation ${e.id} is a ${e.direction} expectation`,
+            movementId: m.id,
+            entryId: null,
+            account: e.account,
+            asset: e.amount.asset,
+          })
+        }
       }
     }
     if (page.length < limit) break
+  }
+
+  // I4: event log integrity (opt-in). One event per decision, no more and no fewer.
+  if (options.events === true) {
+    const movementsDecided = new Map<string, { previous: string; disposition: string }[]>()
+    for (let afterSeq: number | undefined; ; ) {
+      if (options.signal?.aborted === true) break
+      const page = await store.listEvents({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
+      if (page.length === 0) break
+      for (const ev of page) {
+        if (ev.type !== 'movement.decided') continue
+        const payload = ev.payload as { previous?: string; movement?: { disposition?: string } }
+        const chain = movementsDecided.get(ev.subjectId) ?? []
+        chain.push({ previous: payload.previous ?? 'pending', disposition: payload.movement?.disposition ?? 'pending' })
+        movementsDecided.set(ev.subjectId, chain)
+      }
+      if (page.length < limit) break
+      afterSeq = page[page.length - 1]!.seq
+    }
+
+    // Every decided movement must have at least one event, and the chain must end at the current disposition.
+    for (let afterSeq: number | undefined; ; ) {
+      if (options.signal?.aborted === true) break
+      const page = await store.listMovements({ tenantId, limit, ...(afterSeq === undefined ? {} : { afterSeq }) })
+      if (page.length === 0) break
+      for (const m of page) {
+        if (m.disposition === 'pending') continue
+        const chain = movementsDecided.get(m.id)
+        if (chain === undefined || chain.length === 0) {
+          findings.push({
+            invariant: 'I4',
+            severity: 'error',
+            code: 'event_missing',
+            detail: `movement ${m.id} is ${m.disposition} but has no movement.decided event`,
+            movementId: m.id,
+            entryId: null,
+            account: m.account,
+            asset: m.amount.asset,
+          })
+        } else {
+          // The last event's disposition must match the movement's current disposition.
+          const last = chain[chain.length - 1]!
+          if (last.disposition !== m.disposition) {
+            findings.push({
+              invariant: 'I4',
+              severity: 'error',
+              code: 'event_chain_broken',
+              detail: `movement ${m.id} is ${m.disposition} but the last event says ${last.disposition}`,
+              movementId: m.id,
+              entryId: null,
+              account: m.account,
+              asset: m.amount.asset,
+            })
+          }
+        }
+      }
+      if (page.length < limit) break
+      afterSeq = page[page.length - 1]!.seq
+    }
   }
 
   return {

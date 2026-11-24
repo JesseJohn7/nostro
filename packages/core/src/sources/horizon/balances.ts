@@ -2,11 +2,12 @@
  * Horizon as a `BalanceSource`: an account's balances, and when each last
  * changed, for attesting them against recorded movements (I2).
  */
-import type { BalanceLine, BalanceSnapshot, BalanceSource } from '../../invariants/index.js'
-import { Money, NATIVE, asset } from '../../money/index.js'
+import type { AssetSupply, BalanceLine, BalanceSnapshot, BalanceSource } from '../../invariants/index.js'
+import { Money, NATIVE, asset, issuerOf, isNative } from '../../money/index.js'
+import type { AssetId } from '../../money/index.js'
 import type { HorizonClient } from './client.js'
 import { HorizonError } from './client.js'
-import type { HorizonAccount } from './records.js'
+import type { HorizonAccount, HorizonAssetRecord } from './records.js'
 
 export interface HorizonBalanceSourceOptions {
   readonly client: HorizonClient
@@ -48,5 +49,31 @@ export class HorizonBalanceSource implements BalanceSource {
       })
     }
     return { account, ledger: latestLedger, balances, poolShares }
+  }
+
+  async supply(account: string, assetId: AssetId): Promise<AssetSupply | null> {
+    if (isNative(assetId)) return null
+    const issuer = issuerOf(assetId)
+    if (issuer === null || issuer !== account) return null
+    const code = assetId.slice(0, assetId.indexOf(':'))
+
+    const { body, latestLedger } = await this.client.resource<{ _embedded?: { records?: HorizonAssetRecord[] } }>(
+      '/assets',
+      { asset_code: code, asset_issuer: issuer, limit: '1' },
+    )
+    const records = body._embedded?.records ?? []
+    if (records.length === 0) return null
+
+    const r = records[0]!
+    const b = r.balances ?? {}
+    const sum = (amount: string | undefined) => Money.parse(amount ?? '0', assetId)
+    const outstanding = sum(b.authorized)
+      .add(sum(b.authorized_to_maintain_liabilities))
+      .add(sum(b.unauthorized))
+      .add(sum(r.claimable_balances_amount))
+      .add(sum(r.liquidity_pools_amount))
+      .add(sum(r.contracts_amount))
+
+    return { asset: assetId, outstanding, ledger: latestLedger }
   }
 }

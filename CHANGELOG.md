@@ -5,6 +5,31 @@ before 1.0, a minor version may change the API.
 
 ## Unreleased
 
+- **Library loops with `AbortSignal` support.** `syncUntilCaughtUp()`, `reconcileUntilDone()`,
+  `postUntilDone()` and `deliverUntilDone()` are the bounded loops the CLI wrote around `sync()`,
+  `reconcile()`, `postJournal()` and `deliverWebhooks()`, moved into `@nostro-labs/nostro` so a
+  library user does not have to rewrite them. Each takes an optional `AbortSignal` and stops
+  cleanly between batches. `sync()` itself takes the signal and checks it between pulls. The CLI
+  commands (`nostro sync`, `reconcile`, `post`, `doctor --attest`, `export`) pass the signal from
+  Ctrl-C: the first Ctrl-C prints that it is stopping after the current batch, finishes it, closes
+  the store and exits 130; a second Ctrl-C kills the process. `packages/cli/src/work.ts` is now a
+  thin adapter over the library functions.
+- **`doctor()` checks expectations, allocations and the event log.** New I1 findings:
+  `expectation_status_mismatch` (an expectation's status disagrees with its allocations),
+  `allocation_over_expectation` (allocations exceed the expectation amount),
+  `allocation_account_mismatch` and `allocation_direction_mismatch` (an allocation on the wrong
+  account or in the wrong direction), and `expectation_cancelled_with_allocations`. A new I4
+  invariant checks the event log: `event_missing` (a decided movement with no
+  `movement.decided` event) and `event_chain_broken` (the last event does not match the current
+  disposition). The event check is opt-in (`events: true`, `nostro doctor --events`) because the
+  log can be larger than the movement table.
+- **Issuer accounts attest against asset supply.** `BalanceSource` gains an optional `supply()`
+  method. When the account issues an asset, `attestBalances()` reads the asset's outstanding supply
+  from Horizon's `/assets` endpoint and checks that the issuer's signed movements net to minus it.
+  `BalanceCheck` gains `supply_match` / `supply_mismatch` statuses and an `outstanding` field.
+  `nostro doctor --attest` shows the supply line in its table and JSON. Issuer accounts are no
+  longer listed as "not attested".
+
 - **Bulk import of expectations.** `nostro import <file|->` records expectations from a CSV file (RFC
   4180, with a header row) or JSON Lines. Every row is validated as `nostro expect` validates it, and
   the file is written in one transaction: any refused row writes nothing. Re-running a file skips rows

@@ -208,6 +208,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
         throughSeq = afterSeq ?? 0
         let cursor = afterSeq
         for (;;) {
+          if (io.signal?.aborted === true) throw new CliError('Export aborted.')
           const page = await store.listJournalEntries({ tenantId, limit: 500,
             ...(cursor === undefined ? {} : { afterSeq: cursor }),
             ...(from === undefined ? {} : { effectiveFrom: from }),
