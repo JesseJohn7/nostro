@@ -10,6 +10,14 @@ type Page = { data: { reference: string }[] }
 const KEY = 'k'.repeat(64)
 const env = { NOSTRO_API_KEYS: `acme:${KEY}` }
 
+/** Wait for every stream of every watched account to have been read at least once. */
+async function synced(server: Awaited<ReturnType<typeof start>>): Promise<void> {
+  await server.until(async () => {
+    const { data } = (await (await server.get('/v1/accounts')).json()) as { data: { sync: { lastSuccessAt: string | null }[] }[] }
+    return data.length > 0 && data.every((a) => a.sync.length > 0 && a.sync.every((s) => s.lastSuccessAt !== null))
+  })
+}
+
 describe('nostro serve', () => {
   it('serves the API, and syncs and reconciles the watched accounts every interval', async () => {
     const cwd = await migrated()
@@ -51,15 +59,21 @@ describe('nostro serve', () => {
       received.push({ headers: init!.headers as Record<string, string>, body: init!.body as string })
       return new Response(null, { status: 204 })
     }) as typeof globalThis.fetch
-    const server = await start(cwd, ['--account', A, '--tenant', 'acme', '--interval', '1', '--webhook-url', 'https://hooks.example/n'], {
+    const server = await start(cwd, ['--account', A, '--tenant', 'acme', '--interval', '1', '--delivery-interval', '1', '--webhook-url', 'https://hooks.example/n'], {
       env: { ...env, NOSTRO_WEBHOOK_SECRET: secret },
       fetch,
     })
     expect(server.out.stdout).toContain("Delivering tenant acme's events to https://hooks.example/n.\n")
-    // One payment to A (B paid the fee): the invoice settles and the movement is decided.
-    await server.until(() => server.out.stdout.includes('delivered 2 event(s).'))
+    // One payment to A (B paid the fee), from the invoice being recorded to the journal entry.
+    await server.until(() => received.length >= 5)
     expect(server.out.stderr).toMatch(/Webhook failed on event \S+: HTTP 503; retrying next round\.\n/)
-    expect(received.map((r) => JSON.parse(r.body).type)).toEqual(['expectation.settled', 'movement.decided'])
+    expect(received.map((r) => JSON.parse(r.body).type)).toEqual([
+      'expectation.created',
+      'movement.recorded',
+      'expectation.settled',
+      'movement.decided',
+      'journal.posted',
+    ])
     expect(received.every((r) => verifyWebhook({ secret, header: r.headers['nostro-signature'], body: r.body }))).toBe(true)
     expect(await server.stop()).toBe(0)
   })
@@ -159,11 +173,13 @@ describe('nostro serve', () => {
   it('runs a round immediately when requested via POST /v1/rounds without waiting for --interval', async () => {
     const cwd = await migrated()
     const h = new FakeHorizon()
-    h.payment(10, B, A, '50', { memo: 'INV-ROUND' })
     await nostro(cwd, ['expect', 'INV-ROUND', '--account', A, '--amount', '50', '--tenant', 'acme'])
 
-    // Long interval (1 hour): serve would never sync on its own without manual trigger
+    // serve syncs once as it starts; with a 1 hour interval it would not see the payment after that on its own.
     const server = await start(cwd, ['--account', A, '--tenant', 'acme', '--interval', '3600'], { fetch: h.fetch })
+    await server.until(() => h.requests.some((u) => u.pathname === `/accounts/${A}/effects`) && h.requests.some((u) => u.pathname === `/accounts/${A}/transactions`))
+    await synced(server)
+    h.payment(10, B, A, '50', { memo: 'INV-ROUND' })
 
     const triggerRes = await server.post('/v1/rounds', { account: A })
     expect(triggerRes.status).toBe(202)
@@ -192,11 +208,48 @@ describe('nostro serve', () => {
     expect(await server.stop()).toBe(0)
   })
 
+  it('starts a round requested during a round as soon as that one ends', async () => {
+    const cwd = await migrated()
+    const h = new FakeHorizon()
+    let open!: () => void
+    let gate = new Promise<void>((resolve) => (open = resolve))
+    const fetch = (async (url: string | URL | Request, init?: RequestInit) => {
+      await gate
+      return h.fetch(url, init)
+    }) as typeof globalThis.fetch
+    const server = await start(cwd, ['--account', A, '--tenant', 'acme', '--interval', '3600'], { fetch })
+    const trigger = async () => (await (await server.post('/v1/rounds')).json()) as { id: string; state: string }
+    const state = async (id: string) => ((await (await server.get(`/v1/rounds/${id}`)).json()) as { state: string }).state
+
+    // The startup round is stuck on Horizon.
+    const first = await trigger()
+    expect(await state(first.id)).toBe('queued')
+    open()
+    await server.until(async () => (await state(first.id)) === 'done')
+
+    gate = new Promise<void>((resolve) => (open = resolve))
+    const second = await trigger()
+    await server.until(async () => (await state(second.id)) === 'running')
+    const third = await trigger()
+    expect(await state(third.id)).toBe('queued')
+    open()
+    await server.until(async () => (await state(third.id)) === 'done')
+    expect(await server.stop()).toBe(0)
+  })
+
   it('coalesces multiple round requests, enforces per-tenant rate limit, and preserves tenant isolation', async () => {
     const cwd = await migrated()
     const OTHER_KEY = 'o'.repeat(64)
+    // The startup round waits on Horizon, so every request below finds a round running.
+    const h = new FakeHorizon()
+    let open!: () => void
+    const gate = new Promise<void>((resolve) => (open = resolve))
     const server = await start(cwd, ['--account', A, '--tenant', 'acme', '--interval', '3600'], {
       env: { NOSTRO_API_KEYS: `acme:${KEY},other:${OTHER_KEY}` },
+      fetch: async (url, init) => {
+        await gate
+        return h.fetch(url, init)
+      },
     })
 
     // Coalescing: two rapid requests coalesce into the same queued round
@@ -230,6 +283,7 @@ describe('nostro serve', () => {
     const otherRead = await server.get(`/v1/rounds/${body1.id}`, OTHER_KEY)
     expect(otherRead.status).toBe(404)
 
+    open()
     expect(await server.stop()).toBe(0)
   })
 })

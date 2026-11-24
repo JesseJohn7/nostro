@@ -51,12 +51,12 @@ export function clean(text: string): string {
   )
 }
 
-/** Left-aligned columns, two spaces apart. Cells are cleaned. */
+/** Left-aligned columns, two spaces apart. Cells are cleaned; no row ends in spaces. */
 export function table(rows: readonly (readonly string[])[]): string {
   const cells = rows.map((r) => r.map(clean))
   const widths: number[] = []
   for (const r of cells) r.forEach((c, i) => (widths[i] = Math.max(widths[i] ?? 0, c.length)))
-  return cells.map((r) => `${r.map((c, i) => (i === r.length - 1 ? c : c.padEnd(widths[i]!))).join('  ')}\n`).join('')
+  return cells.map((r) => `${r.map((c, i) => (i === r.length - 1 ? c : c.padEnd(widths[i]!))).join('  ').trimEnd()}\n`).join('')
 }
 
 export const json = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`

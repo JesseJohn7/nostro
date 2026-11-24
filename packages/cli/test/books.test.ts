@@ -56,8 +56,8 @@ describe('nostro doctor', () => {
     expect(run.code).toBe(0)
     expect(run.stdout).toContain('balances   checked against the chain for 1 account(s)\n')
     expect(run.stdout).toContain(
-      'ACCOUNT                                                   ASSET  CHAIN       RECORDED    AT LEDGER  RESULT\n' +
-        `${A}  XLM    19.9999900  19.9999900  11         match\n`,
+      'ACCOUNT                                                   ASSET  CHAIN       RECORDED    OUTSTANDING  AT LEDGER  RESULT\n' +
+        `${A}  XLM    19.9999900  19.9999900               11         match\n`,
     )
     expect(run.stdout).toMatch(/\nOK: I1, I2 and I3 hold\.\n$/)
     expect(h.requests.some((u) => u.pathname === `/accounts/${A}`)).toBe(true)
@@ -68,13 +68,13 @@ describe('nostro doctor', () => {
     const cwd = await books(h)
     const run = await nostro(cwd, ['doctor', '--attest', '--attempts', '1'], { fetch: h.fetch, env: { NOSTRO_ACCOUNTS: A } })
     expect(run.code).toBe(1)
-    expect(run.stdout).toMatch(new RegExp(`${A} {2}XLM {4}20\\.0000000 {2}19\\.9999900 {2}11 {9}mismatch\\n`))
+    expect(run.stdout).toMatch(new RegExp(`${A} {2}XLM {4}20\\.0000000 {2}19\\.9999900 {15}11 {9}mismatch\\n`))
     expect(run.stdout).toMatch(new RegExp(`error {5}I2 {9}balance_mismatch {2}${A} XLM {2}`))
     expect(run.stdout).toMatch(/\nFAILED: 1 error\(s\)\. What each means and what to do: https:\/\/github\.com\/nostro-labs\/nostro\/blob\/main\/docs\/invariants\.md\n$/)
     const asJson = JSON.parse((await nostro(cwd, ['doctor', '--attest', '--attempts', '1', '--account', A, '--json'], { fetch: h.fetch })).stdout)
     expect(asJson.ok).toBe(false)
     expect(asJson.balances).toEqual([
-      { account: A, asset: 'native', chain: '20.0000000', recorded: '19.9999900', ledger: 11, status: 'mismatch' },
+      { account: A, asset: 'native', chain: '20.0000000', recorded: '19.9999900', outstanding: null, ledger: 11, status: 'mismatch' },
     ])
     expect(asJson.findings).toEqual([expect.objectContaining({ invariant: 'I2', code: 'balance_mismatch', account: A })])
   })

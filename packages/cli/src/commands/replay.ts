@@ -1,5 +1,6 @@
 import { explainMovement, replayDecisions } from '@nostro-labs/nostro'
-import { COMMON, date, flag, integer, positionals, string, strings, tenant } from '../args.js'
+import { COMMON, UsageError, date, flag, integer, positionals, string, strings, tenant } from '../args.js'
+import type { Args } from '../args.js'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
 import { json, table, write } from '../io.js'
@@ -40,7 +41,7 @@ ${COMMON_HELP}`,
     const strategyNames = strings(args, 'strategy').flatMap((s) => s.split(',')).map((s) => s.trim()).filter(Boolean)
     const strategies = strategyNames.length === 0 ? undefined : strategyNames.map((name) => {
       const strategy = DEFAULT_STRATEGIES.find((s) => s.name === name)
-      if (strategy === undefined) throw new Error(`Unknown strategy: ${name}`)
+      if (strategy === undefined) throw new UsageError(`Unknown strategy: ${name}`)
       return strategy
     })
 
@@ -92,11 +93,11 @@ ${COMMON_HELP}`,
   },
 }
 
-function numberOpt(args: any, name: string): number | undefined {
+function numberOpt(args: Args, name: string): number | undefined {
   const raw = string(args, name)
   if (raw === undefined) return undefined
   const n = Number(raw)
-  if (!Number.isFinite(n) || n < 0 || n > 1) throw new Error(`--${name} must be a number from 0 to 1.`)
+  if (!Number.isFinite(n) || n < 0 || n > 1) throw new UsageError(`--${name} must be a number from 0 to 1.`)
   return n
 }
 

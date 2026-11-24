@@ -27,7 +27,7 @@ describe('nostro expect', () => {
 
     const listed = await nostro(cwd, ['expectations'])
     expect(listed.stdout.split('\n')).toEqual([
-      'REFERENCE  STATUS   AMOUNT      PAID        ASSET  DUE         ACCOUNT                                                M ADDRESS',
+      `REFERENCE  STATUS   AMOUNT      PAID        ASSET  DUE         ${'ACCOUNT'.padEnd(A.length)}  M ADDRESS`,
       `INV-1042   settled  25.0000000  25.0000000  XLM                ${A}`,
       `INV-1043   open     10.0000000  0.0000000   XLM    2026-11-30  ${A}`,
       '',
@@ -219,7 +219,7 @@ describe('nostro cancel', () => {
 })
 
 describe('nostro amend', () => {
-  const C = 'GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEBNS5'
+  const C = 'GABAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEAQCAIBAEJXA'
 
   it('changes the mutable fields and prints the resulting status', async () => {
     const cwd = await migrated()

@@ -1,5 +1,5 @@
 import type { AssetId, NewSchedule } from '@nostro-labs/nostro'
-import { ConstraintError, Money, NATIVE, ValidationError, parseAsset } from '@nostro-labs/nostro'
+import { ConstraintError, Money, NATIVE, ValidationError, parseAsset, scheduleJson } from '@nostro-labs/nostro'
 import { COMMON, CliError, UsageError, date, flag, positionals, string, tenant } from '../args.js'
 import type { Command } from '../command.js'
 import { COMMON_HELP, withStore } from '../command.js'
@@ -60,7 +60,7 @@ ${COMMON_HELP}`,
     const n: NewSchedule = { tenantId: tenant(args, io), referencePattern, account, amount, direction, cadence: parseCadence(cadenceRaw), startAt, ...(endAt ? { endAt } : {}) }
     try {
       const created = await withStore(args, io, (store) => store.transaction((tx) => tx.insertSchedule(n)))
-      if (flag(args, 'json')) { await write(io.stdout, json(created)); return 0 }
+      if (flag(args, 'json')) { await write(io.stdout, json(scheduleJson(created))); return 0 }
       await write(io.stdout, `${created.id}\n`)
       return 0
     } catch (err) {
@@ -78,7 +78,7 @@ const list: Command = {
   options: { ...COMMON, 'active-only': { type: 'boolean' } },
   async run(args, io) {
     const rows = await withStore(args, io, (store) => store.listSchedules({ tenantId: tenant(args, io), ...(flag(args, 'active-only') ? { activeOnly: true } : {}) }))
-    if (flag(args, 'json')) { await write(io.stdout, json(rows)); return 0 }
+    if (flag(args, 'json')) { await write(io.stdout, json(rows.map(scheduleJson))); return 0 }
     await write(io.stdout, table([['id', 'reference', 'account', 'amount', 'cadence', 'ended'], ...rows.map((s) => [s.id, s.referencePattern, s.account, money(s.amount), s.cadence.type, s.endedAt ? 'yes' : 'no'])]))
     return 0
   },
@@ -94,12 +94,46 @@ const end: Command = {
     const [id] = positionals(args, 1)
     if (!id) throw new UsageError('schedule id is required')
     const ended = await withStore(args, io, (store) => store.transaction((tx) => tx.endSchedule(tenant(args, io), id, new Date())))
-    if (flag(args, 'json')) { await write(io.stdout, json(ended)); return 0 }
+    if (flag(args, 'json')) { await write(io.stdout, json(scheduleJson(ended))); return 0 }
     await write(io.stdout, `${ended.id}\n`)
     return 0
   },
 }
 
-export function scheduleCommand(): Command {
-  return { name: 'schedule', summary: 'Manage expectation schedules', usage: '<create|list|end>', help: 'Manage expectation schedules', options: {}, async run() { return 0 }, subcommands: [create, list, end] } as any
+const SUBCOMMANDS = [create, list, end]
+
+export const schedule: Command = {
+  name: 'schedule',
+  summary: 'Create, list and end expectation schedules',
+  usage: '<create|list|end> [options]',
+  help: `A schedule generates one expectation a period; "nostro serve" records them as they come due.
+
+Subcommands:
+  create <reference-pattern> --account <G...> --amount <amount> --cadence <cadence> --start-at <date>
+                      Prints the new schedule's id. The pattern must include {period}
+  list                Every schedule, earliest start first
+  end <id>            Generate no more. What is already recorded stays owed
+
+Options for create:
+  --account <G...>    Destination account
+  --amount <amount>   Amount
+  --asset <asset>     native (default) or CODE:ISSUER
+  --direction <dir>   credit (default) or debit
+  --cadence <c>       daily, weekly:<0-6>, monthly:<1-28>
+  --start-at <date>   First period's date
+  --end-at <date>     Generate nothing from this date on
+
+Options for list:
+  --active-only       Only schedules that have not been ended
+${COMMON_HELP}`,
+  options: Object.assign({}, ...SUBCOMMANDS.map((c) => c.options)) as Command['options'],
+  async run(args, io) {
+    const [name, ...rest] = args.positionals
+    const command = SUBCOMMANDS.find((c) => c.name === name)
+    if (command === undefined) throw new UsageError('Use "nostro schedule create", "nostro schedule list" or "nostro schedule end".')
+    for (const option of Object.keys(args.values)) {
+      if (!(option in command.options)) throw new UsageError(`--${option} does not apply to schedule ${command.name}.`)
+    }
+    return command.run({ ...args, positionals: rest }, io)
+  },
 }

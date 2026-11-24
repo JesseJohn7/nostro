@@ -4,6 +4,7 @@ import type { Args } from '../args.js'
 import { COMMON, UsageError, flag, positionals, string, strings, tenant } from '../args.js'
 import { withBackend } from '../backend.js'
 import { readFileSync } from 'node:fs'
+import { resolve as resolvePath } from 'node:path'
 import type { Command } from '../command.js'
 import { COMMON_HELP } from '../command.js'
 import { assetLabel } from '../format.js'
@@ -70,7 +71,7 @@ ${COMMON_HELP}`,
     if (file !== undefined) {
       const mode = (string(args, 'mode') ?? 'atomic') as 'atomic' | 'row'
       if (mode !== 'atomic' && mode !== 'row') throw new UsageError('--mode must be atomic or row.')
-      const rows = parseBatchCsv(readFileSync(file, 'utf8'))
+      const rows = parseBatchCsv(readFileSync(resolvePath(io.cwd, file), 'utf8'))
       const report = await withBackend(args, io, (backend) =>
         backend.resolveExceptions(tenantId, rows, mode),
       )
@@ -135,7 +136,7 @@ function parseBatchCsv(text: string): { exceptionId: string; decision: Exception
     } else if (action === 'ignore') {
       rows.push({ exceptionId, decision: { action: 'ignore', note: ref || note } as ExceptionDecision })
     } else if (action === 'close') {
-      rows.push({ exceptionId, decision: { action: 'close', note: ref || note } as ExceptionDecision })
+      rows.push({ exceptionId, decision: { action: 'close', status: 'resolved', note: ref || note } })
     } else {
       throw new UsageError(`Bad batch row ${i + 1}: unknown action ${action}.`)
     }

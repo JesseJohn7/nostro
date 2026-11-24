@@ -93,6 +93,11 @@ export class RoundManager implements RoundRunner {
     return round
   }
 
+  /** Whether a round is waiting to start: one requested while another was running has no pause to wake. */
+  hasQueued(tenantId: string): boolean {
+    return this.tenants.get(tenantId)?.queued != null
+  }
+
   onRoundStart(tenantId: string): RoundRecord | null {
     const state = this.getTenantState(tenantId)
     if (state.queued !== null) {
@@ -122,9 +127,6 @@ export class RoundManager implements RoundRunner {
       state.history.set(updated.id, updated)
       state.running = null
     }
-    if (state.queued !== null) {
-      state.wake?.()
-    }
   }
 
   onRoundFailed(tenantId: string, err: unknown): void {
@@ -138,9 +140,6 @@ export class RoundManager implements RoundRunner {
       }
       state.history.set(updated.id, updated)
       state.running = null
-    }
-    if (state.queued !== null) {
-      state.wake?.()
     }
   }
 }

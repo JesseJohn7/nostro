@@ -49,8 +49,11 @@ export async function startServe(cwd: string, argv: readonly string[], options: 
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   })
   const until = async (check: () => boolean | Promise<boolean>) => {
-    for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 25))
-    if (!check()) throw new Error(`timed out; stdout: ${out.stdout} stderr: ${out.stderr}`)
+    for (let i = 0; i < 200; i++) {
+      if (await check()) return
+      await new Promise((r) => setTimeout(r, 25))
+    }
+    if (!(await check())) throw new Error(`timed out; stdout: ${out.stdout} stderr: ${out.stderr}`)
   }
   await until(() => out.stdout.includes('Listening on'))
   const address = /Listening on (\S+) /.exec(out.stdout)![1]!

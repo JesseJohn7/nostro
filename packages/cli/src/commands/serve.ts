@@ -337,6 +337,7 @@ async function runTenants(o: RunOptions): Promise<void> {
           }
         }),
       onError: (err) => void warn(`Round failed: ${clean((err as Error).message)}`),
+      pending: () => o.roundManager.hasQueued(id),
     })
     loops.push(sync)
     o.roundManager.registerTenant(id, () => sync.wake())

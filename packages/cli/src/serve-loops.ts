@@ -41,6 +41,8 @@ export interface LoopOptions {
   readonly step: () => Promise<void>
   readonly onError: (err: unknown) => void
   readonly signal: AbortSignal | undefined
+  /** Asked after each step: true runs the next one at once, instead of pausing. */
+  readonly pending?: () => boolean
 }
 
 /**
@@ -79,6 +81,8 @@ export function startLoop(options: LoopOptions): Loop {
         options.onError(err)
       }
       if (aborted()) break
+      // Work asked for while the step ran: wake() had no pause to end.
+      if (options.pending?.() === true) continue
       const factor = failures === 0 ? 1 : Math.min(2 ** failures, 10)
       await pause(options.everySeconds * factor * 1000)
     }
