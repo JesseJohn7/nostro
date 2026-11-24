@@ -233,7 +233,8 @@ function tenantReadProxy<T extends object>(target: T, context: AsyncLocalStorage
   return new Proxy(target, {
     get(object, property) {
       const value = Reflect.get(object, property, object)
-      if (typeof property !== 'string' || typeof value !== 'function' || tenantlessMethods.has(property)) return value
+      // `run` takes SQL first, not a tenant.
+      if (typeof property !== 'string' || typeof value !== 'function' || property === 'run' || tenantlessMethods.has(property)) return value
       return (...args: unknown[]) => {
         const tenantId = tenantOf(property, args)
         return context.run(tenantId ?? '', () => (value as (...a: unknown[]) => unknown).apply(object, args))
@@ -761,6 +762,8 @@ class PgTx extends PgReader implements StoreTx {
   private open = true
   private savepoints = 0
   private readonly periodLocks = new Set<string>()
+  private readonly direct: Run
+  private roleLifted: Promise<void> | undefined
 
   constructor(
     s: string,
@@ -768,11 +771,17 @@ class PgTx extends PgReader implements StoreTx {
     private readonly ids: () => string,
     private readonly now: () => Date,
     private readonly pin?: TenantPin,
+    private readonly appRole?: string,
   ) {
     super(s, async (sql, params) => {
+      // Nothing else may run while keyAdmin() has lifted the app role.
+      while (this.roleLifted !== undefined) await this.roleLifted
+      return this.direct(sql, params)
+    })
+    this.direct = async (sql, params) => {
       if (!this.open) throw new TransactionClosedError()
       return (await client.query(sql, params === undefined ? undefined : [...params])).rows
-    })
+    }
   }
 
   close(): void {
@@ -893,20 +902,47 @@ class PgTx extends PgReader implements StoreTx {
     return toApiKey(row!)
   }
 
-  async revokeApiKey(id: string, at: Date): Promise<ApiKeyRow> {
-    const [row] = await this.run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE id = $1 FOR UPDATE`, [id])
-    if (row === undefined) throw new NotFoundError('api_key', id)
-    if (row.revoked_at === null) {
-      await this.run(`UPDATE ${this.s}.api_keys SET revoked_at = $2 WHERE id = $1`, [id, at])
+  /**
+   * Run API-key administration that names a key but no tenant as the login
+   * role. A transaction pinned to a tenant stays inside that tenant.
+   */
+  private async keyAdmin<T>(fn: (run: Run) => Promise<T>): Promise<T> {
+    if (this.appRole === undefined || this.pin?.tenant !== undefined) return fn(this.run)
+    const before = this.roleLifted
+    let restored!: () => void
+    const mine = new Promise<void>((resolve) => (restored = resolve))
+    this.roleLifted = mine
+    try {
+      await before
+      await this.direct('SET LOCAL ROLE NONE')
+      return await fn(this.direct)
+    } finally {
+      // Also after a refusal the caller may catch. If this statement itself
+      // fails, the transaction is aborted and runs nothing more.
+      await this.direct(`SET LOCAL ROLE ${quoteRole(this.appRole)}`).catch(() => undefined)
+      if (this.roleLifted === mine) this.roleLifted = undefined
+      restored()
     }
-    const [updated] = await this.run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE id = $1`, [id])
-    return toApiKey(updated!)
+  }
+
+  async revokeApiKey(id: string, at: Date): Promise<ApiKeyRow> {
+    return this.keyAdmin(async (run) => {
+      const [row] = await run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE id = $1 FOR UPDATE`, [id])
+      if (row === undefined) throw new NotFoundError('api_key', id)
+      if (row.revoked_at === null) {
+        await run(`UPDATE ${this.s}.api_keys SET revoked_at = $2 WHERE id = $1`, [id, at])
+      }
+      const [updated] = await run<ApiKeyDbRow>(`SELECT * FROM ${this.s}.api_keys WHERE id = $1`, [id])
+      return toApiKey(updated!)
+    })
   }
 
   async recordApiKeyUse(uses: readonly { readonly id: string; readonly at: Date }[]): Promise<void> {
-    for (const { id, at } of uses) {
-      await this.run(`UPDATE ${this.s}.api_keys SET last_used_at = GREATEST(COALESCE(last_used_at, 'epoch'), $2) WHERE id = $1`, [id, at])
-    }
+    await this.keyAdmin(async (run) => {
+      for (const { id, at } of uses) {
+        await run(`UPDATE ${this.s}.api_keys SET last_used_at = GREATEST(COALESCE(last_used_at, 'epoch'), $2) WHERE id = $1`, [id, at])
+      }
+    })
   }
 
   async addWatchedAccount(row: WatchedAccountRow): Promise<WatchedAccountRow> {
@@ -1697,12 +1733,15 @@ export class PostgresStore extends PgReader implements MigratableStore {
   }
 
   async exportSetMark(tenantId: string, destination: string, lastSeq: number): Promise<void> {
-    await this.run(
-      `INSERT INTO ${this.s}.exports (tenant_id, destination, last_seq, last_exported_at, control_totals, checksum)
-       VALUES ($1, $2, $3, now(), '{}', '')
-       ON CONFLICT (tenant_id, destination) DO UPDATE SET last_seq = $3, last_exported_at = now()`,
-      [tenantId, destination, lastSeq],
-    )
+    // A read outside a transaction runs read-only under row-level security, so this needs one.
+    await this.transaction(tenantId, async (tx) => {
+      await (tx as unknown as { readonly run: Run }).run(
+        `INSERT INTO ${this.s}.exports (tenant_id, destination, last_seq, last_exported_at, control_totals, checksum)
+         VALUES ($1, $2, $3, now(), '{}', '')
+         ON CONFLICT (tenant_id, destination) DO UPDATE SET last_seq = $3, last_exported_at = now()`,
+        [tenantId, destination, lastSeq],
+      )
+    })
   }
 
 
@@ -1711,13 +1750,13 @@ export class PostgresStore extends PgReader implements MigratableStore {
   }
 
   async exportListBatches(tenantId: string): Promise<readonly { readonly destination: string; readonly last_seq: number; readonly last_exported_at: number; readonly control_totals: string; readonly checksum: string }[]> {
-    const rows = await this.run<{ destination: string; last_seq: number; last_exported_at: string; control_totals: string; checksum: string }>(
+    const rows = await this.run<{ destination: string; last_seq: string; last_exported_at: string; control_totals: string; checksum: string }>(
       `SELECT destination, last_seq, last_exported_at, control_totals, checksum FROM ${this.s}.exports WHERE tenant_id = $1`,
       [tenantId],
     )
     return rows.map(r => ({
       destination: r.destination,
-      last_seq: r.last_seq,
+      last_seq: Number(r.last_seq),
       last_exported_at: Number(r.last_exported_at),
       control_totals: r.control_totals,
       checksum: r.checksum,
@@ -1731,6 +1770,12 @@ export class PostgresStore extends PgReader implements MigratableStore {
   private readonly rls: PostgresRlsOptions | undefined
   private readonly rlsContext: AsyncLocalStorage<string> | undefined
   private readonly rlsSetting: string
+  /**
+   * Set while looking up API keys before any tenant is known: the digest is
+   * what decides the tenant, so row-level security cannot scope that read.
+   * It runs as the login role, and only when no tenant is in scope.
+   */
+  private readonly keyLookup: AsyncLocalStorage<true>
 
   constructor(options: PostgresStoreOptions) {
     if (options.pool === undefined && options.connectionString === undefined) {
@@ -1745,6 +1790,7 @@ export class PostgresStore extends PgReader implements MigratableStore {
     }
     if (rls?.appRole !== undefined) quoteRole(rls.appRole)
     const context = rls === undefined ? undefined : new AsyncLocalStorage<string>()
+    const keyLookup = new AsyncLocalStorage<true>()
     super(quoteSchema(schema), async (sql, params) => {
       const args = params === undefined ? undefined : [...params]
       if (rls === undefined) return (await pool.query(sql, args)).rows
@@ -1752,8 +1798,10 @@ export class PostgresStore extends PgReader implements MigratableStore {
       let broken: Error | undefined
       try {
         await client.query('BEGIN READ ONLY')
-        if (rls.appRole !== undefined) await client.query(`SET LOCAL ROLE ${quoteRole(rls.appRole)}`)
-        await client.query('SELECT set_config($1, $2, true)', [rlsSetting, context!.getStore() ?? ''])
+        const tenant = context!.getStore() ?? ''
+        const asLogin = tenant === '' && keyLookup.getStore() === true
+        if (rls.appRole !== undefined && !asLogin) await client.query(`SET LOCAL ROLE ${quoteRole(rls.appRole)}`)
+        await client.query('SELECT set_config($1, $2, true)', [rlsSetting, tenant])
         const result = await client.query(sql, args)
         await client.query('COMMIT')
         return result.rows
@@ -1774,6 +1822,7 @@ export class PostgresStore extends PgReader implements MigratableStore {
     this.rls = rls
     this.rlsContext = context
     this.rlsSetting = rlsSetting
+    this.keyLookup = keyLookup
     if (rls !== undefined) return tenantReadProxy(this, context!) as PostgresStore
   }
 
@@ -1877,7 +1926,7 @@ export class PostgresStore extends PgReader implements MigratableStore {
       : new TenantPin(async (id) => {
           await client.query('SELECT set_config($1, $2, true)', [this.rlsSetting, id])
         })
-    const raw = new PgTx(this.s, client, this.ids, this.now, pin)
+    const raw = new PgTx(this.s, client, this.ids, this.now, pin, this.rls?.appRole)
     const tx = pin === undefined ? raw : tenantTxProxy(raw, pin)
     let broken: Error | undefined
     try {
@@ -1899,6 +1948,14 @@ export class PostgresStore extends PgReader implements MigratableStore {
       raw.close()
       client.release(broken)
     }
+  }
+
+  override async findApiKeyByDigest(digest: string): Promise<ApiKeyRow | null> {
+    return this.keyLookup.run(true, () => super.findApiKeyByDigest(digest))
+  }
+
+  override async listApiKeys(tenantId?: string): Promise<ApiKeyRow[]> {
+    return this.keyLookup.run(true, () => super.listApiKeys(tenantId))
   }
 
   /** A convenience handle for one tenant: writes pin the tenant, reads need no tenant argument. */

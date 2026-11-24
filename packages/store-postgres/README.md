@@ -72,7 +72,10 @@ With RLS enabled each call's tenant is written to a transaction-local GUC. A `tr
 fn)` pins its tenant: a second tenant in the same transaction throws instead of silently writing
 another tenant's rows. Reads outside a transaction get a short `BEGIN READ ONLY` / `set_config` /
 query / `COMMIT` cycle on a pooled client, so a single read has slightly more round trips than in
-the default mode. `forTenant(id)` binds the tenant for reads and for `transaction`. Keep
+the default mode. API keys are the exception: a key's digest is what decides the tenant, so with no
+tenant in scope, finding a key by its digest, listing every key, revoking a key by id and recording
+its use run as the pool's login role, which must own the tables (or bypass RLS) for them to find
+anything. Inside a tenant they see only that tenant's keys. `forTenant(id)` binds the tenant for reads and for `transaction`. Keep
 `tenantSetting` at its default unless the policies were retargeted by `migrate()` with the same
 value; only lowercase letters, digits, `_` and `.` are accepted.
 

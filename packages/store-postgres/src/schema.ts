@@ -719,29 +719,29 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
   // issuer's supply. Their cumulative signed amount must stay at zero or at
   // the movement's exact signed amount, checked with NUMERIC, never a float.
   (s) => `
-    CREATE FUNCTION ${s}.journal_check_cash(entry text) RETURNS void LANGUAGE plpgsql AS $$
+    CREATE OR REPLACE FUNCTION ${s}.journal_check_cash(entry text) RETURNS void LANGUAGE plpgsql AS $$
     DECLARE
-      movement_id text;
+      checked_movement text;
       movement_amount numeric(40, 0);
       movement_direction text;
       target numeric;
       cash numeric;
     BEGIN
       SELECT e.movement_id, m.amount, m.direction
-        INTO movement_id, movement_amount, movement_direction
+        INTO checked_movement, movement_amount, movement_direction
         FROM ${s}.journal_entries e
         JOIN ${s}.movements m ON m.id = e.movement_id
        WHERE e.id = entry;
-      IF movement_id IS NULL THEN RETURN; END IF;
+      IF checked_movement IS NULL THEN RETURN; END IF;
       target := CASE WHEN movement_direction = 'credit' THEN movement_amount ELSE -movement_amount END;
       SELECT coalesce(sum(CASE l.side WHEN 'debit' THEN l.amount ELSE -l.amount END), 0)
         INTO cash
         FROM ${s}.journal_lines l
         JOIN ${s}.journal_entries e ON e.id = l.entry_id
-       WHERE e.movement_id = movement_id
+       WHERE e.movement_id = checked_movement
          AND l.role IN (${BALANCE_ROLES});
       IF cash <> 0 AND cash <> target THEN
-        RAISE EXCEPTION 'movement % cash leg nets to %, but the movement is %', movement_id, cash, target
+        RAISE EXCEPTION 'movement % cash leg nets to %, but the movement is %', checked_movement, cash, target
           USING ERRCODE = 'check_violation';
       END IF;
     END $$;
@@ -796,8 +796,7 @@ export const MIGRATIONS: readonly ((s: string) => string)[] = [
       direction         text NOT NULL CHECK (direction IN ('credit','debit')),
       asset             text NOT NULL,
       decimals          integer NOT NULL CHECK (decimals BETWEEN 0 AND 38),
-      amount            text NOT NULL CHECK (amount ~ '^[1-9][0-9]*
-),
+      amount            text NOT NULL CHECK (amount ~ '^[1-9][0-9]*$'),
       memo_type         text CHECK (memo_type IN ('text','id','hash','return')),
       memo_value        text,
       memo_text         bytea,

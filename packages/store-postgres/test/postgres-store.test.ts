@@ -302,21 +302,27 @@ if (pool === undefined) {
            'credit', 'transfer', 'native', 7, '1.0000000', 1, now(), 'complete', 'pending', now())`
       const seed = await pool!.connect()
       try {
-        await seed.query(`SELECT set_config('nostro.migrate_bypass', 'on', false)`)
+        // Transaction-local, so the bypass does not outlive this connection's return to the pool.
+        await seed.query('BEGIN')
+        await seed.query(`SELECT set_config('nostro.migrate_bypass', 'on', true)`)
         await seed.query(seedMovement('m-t', 't'))
         await seed.query(seedMovement('m-u', 'u'))
+        await seed.query('COMMIT')
       } finally {
         seed.release()
       }
 
       const app = await pool!.connect()
       try {
+        // SET LOCAL only takes effect inside a transaction.
+        await app.query('BEGIN')
         await app.query(`SET LOCAL ROLE ${quotedRole}`)
         await app.query(`SELECT set_config('nostro.tenant', 't', true)`)
         const { rows } = await app.query<{ id: string }>(`SELECT id FROM ${s}.movements ORDER BY id`)
         expect(rows.map((row) => row.id)).toEqual(['m-t'])
         await expect(app.query(seedMovement('bad', 'u'))).rejects.toThrow(/row-level security/)
       } finally {
+        await app.query('ROLLBACK')
         app.release()
       }
 
@@ -326,6 +332,39 @@ if (pool === undefined) {
         await tx.getMovement('t', 'm-t')
         await tx.getMovement('u', 'm-u')
       })).rejects.toThrow(/pinned to tenant/)
+    })
+
+    it('looks up API keys before a tenant is known, without letting a tenant reach another tenant\'s keys', async () => {
+      const store = await freshStore({ rls: { enabled: true, appRole } })
+      const s = quoteSchema(schemas[schemas.length - 1]!)
+      const key = (id: string, tenantId: string, digest: string) => ({
+        id, tenantId, label: id, digest: digest.repeat(64), scopes: ['read'], createdAt: new Date('2026-01-01T00:00:00Z'),
+      })
+      await store.transaction((tx) => tx.insertApiKey(key('k-t', 't', 'a')))
+      await store.transaction((tx) => tx.insertApiKey(key('k-u', 'u', 'b')))
+
+      expect((await store.findApiKeyByDigest('b'.repeat(64)))?.tenantId).toBe('u')
+      expect((await store.listApiKeys()).map((k) => k.id).sort()).toEqual(['k-t', 'k-u'])
+      // Inside a tenant, only that tenant's keys.
+      expect((await store.listApiKeys('t')).map((k) => k.id)).toEqual(['k-t'])
+      expect(await store.forTenant('t').findApiKeyByDigest('b'.repeat(64))).toBeNull()
+      expect((await store.forTenant('t').listApiKeys()).map((k) => k.id)).toEqual(['k-t'])
+      await expect(store.transaction('t', (tx) => tx.revokeApiKey('k-u', new Date()))).rejects.toMatchObject({ code: 'NOT_FOUND' })
+      await store.transaction('t', (tx) => tx.recordApiKeyUse([{ id: 'k-u', at: new Date() }]))
+      expect((await store.findApiKeyByDigest('b'.repeat(64)))?.lastUsedAt).toBeNull()
+
+      // Whoever the transaction is after the lookup, it is the app role again.
+      type Raw = { run(sql: string): Promise<{ who: string }[]> }
+      const who = async (tx: StoreTx) => (await (tx as unknown as Raw).run(`SELECT current_user::text AS who, count(*) FROM ${s}.api_keys`))[0]!.who
+      await store.transaction(async (tx) => {
+        await expect(tx.revokeApiKey('missing', new Date())).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(await who(tx)).toBe(appRole)
+        // Asked while the key statements are running, it waits for them rather than borrowing their role.
+        const recording = tx.recordApiKeyUse(Array.from({ length: 300 }, () => ({ id: 'k-t', at: new Date() })))
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        expect(await who(tx)).toBe(appRole)
+        await recording
+      })
     })
 
     it('enforces the hard constraints in the database too, not only in code', async () => {
