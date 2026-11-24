@@ -849,4 +849,18 @@ PRIMARY KEY (tenant_id, destination)
     CREATE TRIGGER events_no_delete BEFORE DELETE ON events
       BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
   `,
+  // The migration above rebuilt `events` and lost two things: the guard that
+  // lets retention prune, and, for a log already pruned empty, its place in
+  // the sequence. A reused seq would be behind every consumer's cursor.
+  `
+    DROP TRIGGER events_no_delete;
+    CREATE TRIGGER events_no_delete BEFORE DELETE ON events
+      WHEN nostro_event_prune_allowed() = 0
+      BEGIN SELECT RAISE(ABORT, 'the event log is append-only'); END;
+    INSERT INTO sqlite_sequence (name, seq)
+      SELECT 'events', 0 WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'events');
+    UPDATE sqlite_sequence
+       SET seq = max(seq, (SELECT coalesce(max(pruned_through), 0) FROM event_prune_state))
+     WHERE name = 'events';
+  `,
 ]

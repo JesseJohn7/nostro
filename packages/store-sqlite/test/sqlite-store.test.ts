@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import Database from 'better-sqlite3'
 import { afterAll, describe, expect, it } from 'vitest'
+import type { StoreTx } from '@nostro-labs/nostro'
 import { Money, NATIVE, STORE_CONTRACT_VERSION, doctor } from '@nostro-labs/nostro'
 import { describeStoreConformance, describeStoreProperties } from '@nostro-labs/store-conformance'
 import { SqliteStore, registerJournalFunctions } from '../src/index.js'
@@ -284,6 +285,33 @@ describe('SqliteStore', () => {
     expect(await ids('8')).toEqual([e.id])
     expect(await ids('')).toEqual([])
     await upgraded.close()
+  })
+
+  it('keeps the event log prunable, and its sequence ahead of a log already pruned empty', async () => {
+    const filename = freshFile()
+    const db = new Database(filename)
+    registerJournalFunctions(db)
+    for (const migration of MIGRATIONS.slice(0, 24)) db.exec(migration)
+    db.prepare(`INSERT INTO event_prune_state (tenant_id, pruned_through) VALUES ('t', 7)`).run()
+    db.pragma('user_version = 24')
+    db.close()
+
+    const store = await freshStore(filename)
+    const invoice = (tx: StoreTx, reference: string) =>
+      tx.insertExpectation({ tenantId: 't', reference, account: `G${'A'.repeat(55)}`, amount: Money.parse('1', NATIVE) })
+    await store.transaction((tx) => invoice(tx, 'INV-1'))
+    // Past what was pruned, so a consumer resuming at 7 sees it.
+    expect((await store.listEvents({ tenantId: 't' })).map((e) => e.seq)).toEqual([8])
+
+    const raw = new Database(filename)
+    registerJournalFunctions(raw)
+    raw.function('nostro_event_prune_allowed', () => 0)
+    expect(() => raw.prepare('DELETE FROM events').run()).toThrow(/append-only/)
+    expect(() => raw.prepare(`UPDATE events SET type = 'journal.posted'`).run()).toThrow(/append-only/)
+    raw.close()
+    expect((await store.transaction((tx) => tx.pruneEventsBefore('t', new Date(Date.now() + 60_000))))).toEqual({ deleted: 1, prunedThrough: 8 })
+    expect(await store.listEvents({ tenantId: 't' })).toEqual([])
+    await store.close()
   })
 
   it('sees committed data across separate store instances on one file', async () => {

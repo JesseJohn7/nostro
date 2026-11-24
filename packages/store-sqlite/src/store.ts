@@ -1651,6 +1651,9 @@ class SqliteTx extends SqliteReader implements StoreTx {
   }
 }
 
+/** The migration that enforces the journal rules in the database. */
+const JOURNAL_RULES_MIGRATION = 20
+
 export class SqliteStore extends SqliteReader implements MigratableStore {
   private eventPruneAuthorized = false
   async exportGetMark(tenantId: string, destination: string): Promise<string | null> {
@@ -1799,9 +1802,9 @@ export class SqliteStore extends SqliteReader implements MigratableStore {
   migrate(): Promise<void> {
     return this.serial(async () => {
       const version = this.writer.pragma('user_version', { simple: true }) as number
-      const journalRulesMigration = MIGRATIONS.length
       for (let v = version + 1; v <= MIGRATIONS.length; v++) {
-        if (v === journalRulesMigration && version >= 2 && version < journalRulesMigration) this.verifyJournalRules()
+        // Existing entries are checked before the triggers that assume them.
+        if (v === JOURNAL_RULES_MIGRATION && version >= 2) this.verifyJournalRules()
         this.writer.exec(MIGRATIONS[v - 1]!)
         this.writer.pragma(`user_version = ${v}`)
       }
