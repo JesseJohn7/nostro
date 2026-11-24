@@ -7,32 +7,11 @@ import { parseArgs } from "node:util";
 import type { ParseArgsConfig } from "node:util";
 import { isAccountId, isValidAccountId } from "@nostro-labs/nostro";
 import type { HorizonRateLimit } from "@nostro-labs/nostro";
+import { stringSetting, stringsSetting } from "./config.js";
+export { CliError, UsageError } from "./errors.js";
+export type { ErrorCode } from "./errors.js";
+import { UsageError } from "./errors.js";
 import type { Io } from "./io.js";
-
-/** The command line was wrong. Exit status 2. */
-export class UsageError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "UsageError";
-  }
-}
-
-/**
- * Stable reasons a command can fail with, for scripts reading `--json` errors.
- * Adding a code is not breaking; renaming or removing one is.
- */
-export type ErrorCode = "usage" | "no_database" | "schema_mismatch" | "horizon" | "failed" | "internal";
-
-/** The command could not do what was asked, for a reason the message explains. Exit status 1. */
-export class CliError extends Error {
-  constructor(
-    message: string,
-    readonly code: ErrorCode = "failed",
-  ) {
-    super(message);
-    this.name = "CliError";
-  }
-}
 
 export type OptionSpec = NonNullable<ParseArgsConfig["options"]>;
 type Value = string | boolean | (string | boolean)[] | undefined;
@@ -50,6 +29,9 @@ export const COMMON: OptionSpec = {
   tenant: { type: "string" },
   json: { type: "boolean" },
   help: { type: "boolean", short: "h" },
+  config: { type: "string" },
+  profile: { type: "string" },
+  api: { type: "string" },
 };
 
 /** Commands that talk to Horizon take these. */
@@ -139,10 +121,10 @@ export function integer(
 export const DEFAULT_DB = "nostro.db";
 
 export const database = (args: Args, io: Io): string =>
-  string(args, "db") ?? io.env.NOSTRO_DB ?? DEFAULT_DB;
+  stringSetting("db", args, io, DEFAULT_DB).value!;
 
 export function tenant(args: Args, io: Io): string {
-  const id = string(args, "tenant") ?? io.env.NOSTRO_TENANT ?? "default";
+  const id = stringSetting("tenant", args, io, "default").value!;
   if (id.trim() === "") throw new UsageError("--tenant must not be empty.");
   return id;
 }
@@ -160,8 +142,8 @@ export interface Network {
 
 export function network(args: Args, io: Io): Network {
   return networkNamed(
-    string(args, "network") ?? io.env.NOSTRO_NETWORK ?? "testnet",
-    string(args, "horizon") ?? io.env.NOSTRO_HORIZON_URL,
+    stringSetting("network", args, io, "testnet").value!,
+    stringSetting("horizon", args, io).value,
     io,
   );
 }
@@ -201,11 +183,7 @@ export function networkNamed(
 
 /** The accounts to work on: every `--account`, else `NOSTRO_ACCOUNTS` (comma or space separated). */
 export function accounts(args: Args, io: Io): string[] {
-  const given = strings(args, "account");
-  const list =
-    given.length > 0
-      ? given
-      : (io.env.NOSTRO_ACCOUNTS ?? "").split(/[\s,]+/).filter((a) => a !== "");
+  const list = stringsSetting("accounts", args, io).value;
   if (list.length === 0) {
     throw new UsageError(
       "Name at least one account: --account G... or --account C... (or set NOSTRO_ACCOUNTS).",

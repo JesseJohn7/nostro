@@ -949,7 +949,7 @@ export function describeStoreConformance(
         // Rollback leaves no events
         await expect(
           store.transaction(async (tx) => {
-            const exp = await tx.insertExpectation({ tenantId: T, reference: 'INV-RB', account: ACCOUNT, amount: usdc('10') })
+            await tx.insertExpectation({ tenantId: T, reference: 'INV-RB', account: ACCOUNT, amount: usdc('10') })
             const { inserted } = await tx.insertMovements([movement({ externalId: 'ext-rb', amount: usdc('10') })])
             await tx.postJournalEntry({
               tenantId: T,

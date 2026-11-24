@@ -1,0 +1,67 @@
+name: Python client
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-client-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.16.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm -r build
+
+      - name: Prepare a test key and a temporary database
+        run: |
+          KEY="$(printf 'k%.0s' {1..32})"
+          echo "NOSTRO_TEST_API_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "NOSTRO_API_KEYS=test:$KEY" >> "$GITHUB_ENV"
+          echo "NOSTRO_TEST_API_URL=http://127.0.0.1:18080" >> "$GITHUB_ENV"
+          echo "PY_DB_DIR=$(mktemp -d)" >> "$GITHUB_ENV"
+
+      - name: Migrate the temporary database
+        run: node packages/cli/dist/bin.js migrate --db "$PY_DB_DIR/py.db"
+
+      - name: Start the server
+        run: |
+          nohup node packages/cli/dist/bin.js serve \
+            --db "$PY_DB_DIR/py.db" --port 18080 --host 127.0.0.1 \
+            > "$PY_DB_DIR/serve.log" 2>&1 &
+          echo $! > "$PY_DB_DIR/serve.pid"
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:18080/v1/health > /dev/null; then exit 0; fi
+            sleep 1
+          done
+          cat "$PY_DB_DIR/serve.log"
+          exit 1
+
+      - name: Install and test the Python client
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e "clients/python[dev]"
+          pytest clients/python/tests
+
+      - name: Stop the server
+        if: always()
+        run: |
+          if [ -f "$PY_DB_DIR/serve.pid" ]; then
+            kill "$(cat "$PY_DB_DIR/serve.pid")" 2>/dev/null || true
+          fi

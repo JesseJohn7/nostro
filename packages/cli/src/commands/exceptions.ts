@@ -1,8 +1,9 @@
 import type { ExceptionCode, ExceptionStatus } from '@nostro-labs/nostro'
 import { EXCEPTION_CODES, exceptionJson } from '@nostro-labs/nostro'
 import { COMMON, UsageError, afterSeq, integer, machineFormat, positionals, string, tenant } from '../args.js'
+import { withBackend } from '../backend.js'
 import type { Command } from '../command.js'
-import { COMMON_HELP, withStore } from '../command.js'
+import { COMMON_HELP } from '../command.js'
 import { assetLabel, when } from '../format.js'
 import { json, table, write } from '../io.js'
 
@@ -46,8 +47,8 @@ ${COMMON_HELP}`,
     const after = afterSeq(args)
     const format = machineFormat(args)
 
-    const list = await withStore(args, io, (store) =>
-      store.listExceptions({
+    const list = await withBackend(args, io, (backend) =>
+      backend.listExceptions({
         tenantId,
         limit,
         ...(after === undefined ? {} : { afterSeq: after }),

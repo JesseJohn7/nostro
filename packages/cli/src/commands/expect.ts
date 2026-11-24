@@ -1,9 +1,10 @@
 import type { AssetId, Expectation, Memo, NewExpectation, StoreTx } from '@nostro-labs/nostro'
-import { ConstraintError, Money, NATIVE, ValidationError, isAccountId, isValidAccountId, muxedAddress, parseAsset } from '@nostro-labs/nostro'
+import { Money, NATIVE, isAccountId, isValidAccountId, muxedAddress, parseAsset } from '@nostro-labs/nostro'
 import type { Args } from '../args.js'
-import { COMMON, CliError, UsageError, date, flag, positionals, string, strings, tenant } from '../args.js'
+import { COMMON, UsageError, date, flag, positionals, string, strings, tenant } from '../args.js'
+import { withBackend } from '../backend.js'
 import type { Command } from '../command.js'
-import { COMMON_HELP, withStore } from '../command.js'
+import { COMMON_HELP } from '../command.js'
 import { expectationWithPaid, money } from '../format.js'
 import { clean, json, write } from '../io.js'
 
@@ -152,23 +153,7 @@ Dates are 2026-10-31 (midnight UTC) or an instant with its offset, 2026-10-31T17
   },
   async run(args, io) {
     const expectation = expectationOf(args, tenant(args, io))
-    const reference = expectation.reference
-    const recorded = await withStore(args, io, (store) =>
-      store.transaction(async (tx) => {
-        try {
-          return await recordExpectation(tx, expectation)
-        } catch (err) {
-          if (err instanceof ValidationError) throw new UsageError(err.message)
-          if (err instanceof ConstraintError && err.constraint === 'expectation_reference_unique') {
-            throw new CliError(`${reference} is already recorded in this tenant; references are unique.`)
-          }
-          if (err instanceof ConstraintError && err.constraint === 'expectation_muxed_id_unique') {
-            throw new CliError(err.message)
-          }
-          throw err
-        }
-      }),
-    )
+    const recorded = await withBackend(args, io, (backend) => backend.createExpectation(expectation))
 
     if (flag(args, 'json')) {
       await write(io.stdout, json(expectationWithPaid(recorded, Money.zero(recorded.amount.asset, recorded.amount.decimals))))

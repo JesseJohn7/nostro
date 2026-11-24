@@ -9,7 +9,9 @@
 import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 import type { MigratableStore } from '@nostro-labs/nostro'
-import { CliError } from './args.js'
+import type { Args } from './args.js'
+import { CliError } from './errors.js'
+import { stringSetting } from './config.js'
 import type { Io } from './io.js'
 
 export interface OpenedStore {
@@ -32,10 +34,10 @@ export function redact(url: string): string {
   }
 }
 
-export async function openStore(db: string, io: Io, options: { create: boolean }): Promise<OpenedStore> {
+export async function openStore(db: string, io: Io, options: { create: boolean }, args?: Args): Promise<OpenedStore> {
   if (POSTGRES.test(db)) {
     const { PostgresStore } = await import('@nostro-labs/store-postgres')
-    const schema = io.env.NOSTRO_PG_SCHEMA ?? 'nostro'
+    const schema = args === undefined ? (io.env.NOSTRO_PG_SCHEMA ?? 'nostro') : stringSetting('schema', args, io, 'nostro').value!
     return {
       store: new PostgresStore({ connectionString: db, schema }),
       label: `${redact(db)} (schema ${schema})`,

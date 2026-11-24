@@ -59,7 +59,7 @@ export const keys: Command = {
     if (action === undefined || !(SUBCOMMANDS as readonly string[]).includes(action)) {
       throw new UsageError(`keys needs one of: ${SUBCOMMANDS.join(', ')}. See nostro keys --help.`)
     }
-    const opened = await openStore(database(args, io), io, { create: false })
+    const opened = await openStore(database(args, io), io, { create: false }, args)
     try {
       await assertCurrent(opened)
       const { store } = opened

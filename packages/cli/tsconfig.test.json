@@ -5,8 +5,12 @@
     "noEmit": true,
     // Typecheck against the sources the tests run against: one copy of core.
     "paths": {
-      "@nostro-labs/nostro": ["../core/src/index.ts"],
+      "@nostro-labs/client": ["../client/src/index.ts"],
       "@nostro-labs/server": ["../server/src/index.ts"],
+      "@nostro-labs/nostro/money": ["../core/src/money/index.ts"],
+      "@nostro-labs/nostro/json": ["../core/src/model/json.ts"],
+      "@nostro-labs/nostro/webhooks/verify": ["../core/src/webhooks/browser.ts"],
+      "@nostro-labs/nostro": ["../core/src/index.ts"],
       "@nostro-labs/store-postgres": ["../store-postgres/src/index.ts"],
       "@nostro-labs/store-sqlite": ["../store-sqlite/src/index.ts"],
       "nostro-testkit": ["../testkit/src/index.ts"]

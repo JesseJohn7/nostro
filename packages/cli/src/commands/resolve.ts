@@ -1,10 +1,11 @@
 import type { ExceptionDecision } from '@nostro-labs/nostro'
-import { ConstraintError, NotFoundError, PrecisionError, ValidationError, decideException, decideExceptions, resolutionJson } from '@nostro-labs/nostro'
+import { resolutionJson } from '@nostro-labs/nostro'
 import type { Args } from '../args.js'
-import { COMMON, CliError, UsageError, flag, positionals, string, strings, tenant } from '../args.js'
+import { COMMON, UsageError, flag, positionals, string, strings, tenant } from '../args.js'
+import { withBackend } from '../backend.js'
 import { readFileSync } from 'node:fs'
 import type { Command } from '../command.js'
-import { COMMON_HELP, withStore } from '../command.js'
+import { COMMON_HELP } from '../command.js'
 import { assetLabel } from '../format.js'
 import { clean, json, write } from '../io.js'
 
@@ -70,14 +71,9 @@ ${COMMON_HELP}`,
       const mode = (string(args, 'mode') ?? 'atomic') as 'atomic' | 'row'
       if (mode !== 'atomic' && mode !== 'row') throw new UsageError('--mode must be atomic or row.')
       const rows = parseBatchCsv(readFileSync(file, 'utf8'))
-      const report = await withStore(args, io, async (store) => {
-        try {
-          return await decideExceptions({ store, tenantId, decisions: rows, mode })
-        } catch (err) {
-          if (err instanceof ValidationError || err instanceof PrecisionError) throw new UsageError(err.message)
-          throw err
-        }
-      })
+      const report = await withBackend(args, io, (backend) =>
+        backend.resolveExceptions(tenantId, rows, mode),
+      )
       if (flag(args, 'json')) { await write(io.stdout, json(report)); return report.errors > 0 ? 1 : 0 }
       let out = ''
       for (const r of report.results) {
@@ -93,16 +89,9 @@ ${COMMON_HELP}`,
     if (exceptionId === undefined) throw new UsageError('Give the exception id, from "nostro exceptions".')
     const what = decision(args)
 
-    const report = await withStore(args, io, async (store) => {
-      try {
-        return await decideException({ store, tenantId, exceptionId, decision: what })
-      } catch (err) {
-        if (err instanceof NotFoundError) throw new CliError(`No ${err.entity} ${err.id}.`)
-        if (err instanceof ConstraintError) throw new CliError(err.message)
-        if (err instanceof ValidationError || err instanceof PrecisionError) throw new UsageError(err.message)
-        throw err
-      }
-    })
+    const report = await withBackend(args, io, (backend) =>
+      backend.resolveException(tenantId, exceptionId, what),
+    )
 
     if (flag(args, 'json')) {
       await write(io.stdout, json(resolutionJson(report)))

@@ -11,6 +11,7 @@
 import type { RefundLink } from '../store/store.js'
 import type { Schedule } from './types.js'
 import type { AssetId } from '../money/index.js'
+import { moneyFromJson } from '../money/money.js'
 import type {
   Allocation,
   DecisionSnapshot,
@@ -282,6 +283,157 @@ export function scheduleJson(s: Schedule): ScheduleJson {
     endedAt: iso(s.endedAt),
     createdAt: s.createdAt.toISOString(),
     updatedAt: s.updatedAt.toISOString(),
+  }
+}
+
+// ---- Parse-back: JSON wire format to domain records -----------------------
+
+/** A memo's id value is a decimal string on the wire, a bigint in the domain. */
+export function memoFromJson(j: MemoJson | null): Memo | null {
+  if (j === null) return null
+  switch (j.type) {
+    case 'text':
+      return { type: 'text', value: j.value }
+    case 'id':
+      return { type: 'id', value: BigInt(j.value) }
+    case 'hash':
+      return { type: 'hash', value: j.value }
+    case 'return':
+      return { type: 'return', value: j.value }
+  }
+}
+
+const dateOrNull = (value: string | null): Date | null => (value === null ? null : new Date(value))
+
+/**
+ * The inverse of the `*Json` functions above. Amounts come back as exact
+ * `Money`, dates as `Date`, uint64 strings as bigints. Tenant ids are absent
+ * from the wire by design; a caller that knows its tenant may pass it as the
+ * optional second argument.
+ */
+export function movementFromJson(j: MovementJson, tenantId = ''): Movement {
+  return {
+    id: j.id,
+    tenantId,
+    seq: j.seq,
+    network: j.network,
+    source: j.source,
+    externalId: j.externalId,
+    revision: j.revision,
+    account: j.account,
+    entityId: j.entityId ?? null,
+    direction: j.direction,
+    kind: j.kind,
+    amount: moneyFromJson(j.amount, j.asset),
+    counterparty: j.counterparty,
+    muxedId: j.muxedId === null ? null : BigInt(j.muxedId),
+    memo: memoFromJson(j.memo),
+    ledger: j.ledger,
+    txHash: j.txHash,
+    operationId: j.operationId,
+    occurredAt: new Date(j.occurredAt),
+    enrichment: j.enrichment,
+    disposition: j.disposition,
+    ignoredReason: j.ignoredReason,
+    createdAt: new Date(j.createdAt),
+  }
+}
+
+export function expectationFromJson(j: ExpectationJson, tenantId = ''): Expectation {
+  return {
+    id: j.id,
+    tenantId,
+    seq: j.seq,
+    reference: j.reference,
+    account: j.account,
+    direction: j.direction,
+    amount: moneyFromJson(j.amount, j.asset),
+    muxedId: j.muxedId === null ? null : BigInt(j.muxedId),
+    memo: memoFromJson(j.memo),
+    payers: [...j.payers],
+    dueAt: dateOrNull(j.dueAt),
+    expiresAt: dateOrNull(j.expiresAt),
+    status: j.status,
+    cancelReason: j.cancelReason,
+    metadata: { ...j.metadata },
+    fingerprintSuffix: null,
+    createdAt: new Date(j.createdAt),
+    updatedAt: new Date(j.updatedAt),
+  }
+}
+
+export function allocationFromJson(j: AllocationJson, tenantId = ''): Allocation {
+  return {
+    id: j.id,
+    tenantId,
+    movementId: j.movementId,
+    expectationId: j.expectationId,
+    amount: moneyFromJson(j.amount, j.asset),
+    strategy: j.strategy,
+    score: j.score,
+    decision: j.decision ?? null,
+    createdAt: new Date(j.createdAt),
+  }
+}
+
+export function exceptionFromJson(j: ExceptionJson, tenantId = ''): ExceptionRecord {
+  return {
+    id: j.id,
+    tenantId,
+    seq: j.seq,
+    code: j.code,
+    status: j.status,
+    movementId: j.movementId,
+    expectationId: j.expectationId,
+    account: j.account,
+    amount: j.amount === null || j.asset === null ? null : moneyFromJson(j.amount, j.asset),
+    detail: j.detail,
+    evidence: j.evidence,
+    openedAt: new Date(j.openedAt),
+    resolvedAt: dateOrNull(j.resolvedAt),
+    resolutionNote: j.resolutionNote,
+  }
+}
+
+export function journalEntryFromJson(j: JournalEntryJson, tenantId = ''): JournalEntry {
+  return {
+    id: j.id,
+    tenantId,
+    seq: j.seq,
+    movementId: j.movementId,
+    postingNo: j.postingNo,
+    kind: j.kind,
+    effectiveAt: new Date(j.effectiveAt),
+    postedAt: new Date(j.postedAt),
+    description: j.description,
+    lines: j.lines.map((l) => ({
+      account: l.account,
+      entityId: l.entityId ?? null,
+      role: l.role,
+      side: l.side,
+      amount: moneyFromJson(l.amount, l.asset),
+      expectationId: l.expectationId,
+      exceptionId: l.exceptionId,
+    })),
+  }
+}
+
+export function scheduleFromJson(j: ScheduleJson, tenantId = ''): Schedule {
+  return {
+    id: j.id,
+    tenantId,
+    referencePattern: j.referencePattern,
+    account: j.account,
+    direction: j.direction,
+    amount: moneyFromJson(j.amount, j.asset as AssetId),
+    memo: memoFromJson(j.memo === null ? null : { type: j.memo.type, value: String(j.memo.value) }),
+    payers: [...j.payers],
+    cadence: j.cadence,
+    startAt: new Date(j.startAt),
+    endAt: dateOrNull(j.endAt),
+    endedAt: dateOrNull(j.endedAt),
+    createdAt: new Date(j.createdAt),
+    updatedAt: new Date(j.updatedAt),
   }
 }
 

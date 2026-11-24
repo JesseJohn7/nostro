@@ -252,12 +252,12 @@ describe('the OpenAPI document', () => {
 
     // 3. allocate partial -> expectation.partially_paid
     await store.transaction(async (tx) => {
-      await tx.allocate({ tenantId: 'acme', movementId: mov.id, expectationId: exp.id, amount: Money.parse('4', NATIVE) })
+      await tx.allocate({ tenantId: 'acme', movementId: mov.id, expectationId: exp.id, amount: Money.parse('4', NATIVE), strategy: 'test' })
     })
 
     // 4. allocate settled -> expectation.settled
     await store.transaction(async (tx) => {
-      await tx.allocate({ tenantId: 'acme', movementId: mov.id, expectationId: exp.id, amount: Money.parse('6', NATIVE) })
+      await tx.allocate({ tenantId: 'acme', movementId: mov.id, expectationId: exp.id, amount: Money.parse('6', NATIVE), strategy: 'test' })
     })
 
     // 5. setDisposition -> movement.decided

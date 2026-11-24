@@ -8,6 +8,7 @@ import { SCOPES, apiKeys, createServer, firstOf, storedKeys } from '@nostro-labs
 import type { StoredKeys } from '@nostro-labs/server'
 import type { Args, Network } from '../args.js'
 import { CliError, NETWORK, RATE_LIMIT, UsageError, database, flag, integer, positionals, rateLimit, string } from '../args.js'
+import { numberSetting, stringSetting } from '../config.js'
 import type { Command } from '../command.js'
 import { NETWORK_HELP, RATE_LIMIT_HELP, horizonClient, movementSources } from '../command.js'
 import type { Io } from '../io.js'
@@ -162,6 +163,8 @@ SSE accelerator (--sse):
     host: { type: 'string' },
     'keys-file': { type: 'string' },
     config: { type: 'string' },
+    profile: { type: 'string' },
+    api: { type: 'string' },
     interval: { type: 'string' },
     'delivery-interval': { type: 'string' },
     concurrency: { type: 'string' },
@@ -181,13 +184,9 @@ SSE accelerator (--sse):
       if (err instanceof UsageError) throw err
       throw new CliError((err as Error).message)
     }
-    const rawPort = string(args, 'port') ?? io.env.NOSTRO_PORT
-    if (rawPort !== undefined && (!/^\d{1,5}$/.test(rawPort) || Number(rawPort) > 65_535)) {
-      throw new UsageError('--port must be a whole number from 0 to 65535.')
-    }
-    const port = rawPort === undefined ? 8080 : Number(rawPort)
-    const host = string(args, 'host') ?? io.env.NOSTRO_HOST ?? '127.0.0.1'
-    const interval = integer(args, 'interval', 30, 1, 86_400)
+    const port = numberSetting('port', args, io, 8080, 0, 65_535).value
+    const host = stringSetting('host', args, io, '127.0.0.1').value!
+    const interval = numberSetting('interval', args, io, 30, 1, 86_400).value
     const deliveryInterval = integer(args, 'delivery-interval', 5, 1, 86_400)
     const concurrency = integer(args, 'concurrency', 4, 1, 64)
     const shutdownTimeout = integer(args, 'shutdown-timeout', 30, 0, 86_400)
@@ -195,7 +194,7 @@ SSE accelerator (--sse):
     const plans = tenantPlans(args, io)
     const rate = rateLimit(args)
 
-    const opened = await openStore(database(args, io), io, { create: false })
+    const opened = await openStore(database(args, io), io, { create: false }, args)
     const { store } = opened
     let stored: StoredKeys | null = null
     try {

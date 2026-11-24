@@ -1,0 +1,54 @@
+{
+  "secret": "0123456789abcdef0123456789abcdef",
+  "tolerance": 300,
+  "vectors": [
+    {
+      "name": "valid",
+      "body": "{\"id\":\"evt-1\",\"type\":\"movement.decided\"}",
+      "t": 1700000000,
+      "header": "t=1700000000,v1=268e6007cb988e40a35bd93e8c80caa0dbd1665d4c6e62535e611178bf5862d0",
+      "now": 1700000100,
+      "valid": true
+    },
+    {
+      "name": "expired",
+      "body": "{\"id\":\"evt-1\",\"type\":\"movement.decided\"}",
+      "t": 1700000000,
+      "header": "t=1700000000,v1=268e6007cb988e40a35bd93e8c80caa0dbd1665d4c6e62535e611178bf5862d0",
+      "now": 1700000301,
+      "valid": false
+    },
+    {
+      "name": "tampered",
+      "body": "{\"id\":\"evt-1\",\"type\":\"expectation.settled\"}",
+      "t": 1700000000,
+      "header": "t=1700000000,v1=268e6007cb988e40a35bd93e8c80caa0dbd1665d4c6e62535e611178bf5862d0",
+      "now": 1700000100,
+      "valid": false
+    },
+    {
+      "name": "malformed-header",
+      "body": "{\"id\":\"evt-1\",\"type\":\"movement.decided\"}",
+      "t": 1700000000,
+      "header": "t=1700000000,v1=nope",
+      "now": 1700000100,
+      "valid": false
+    },
+    {
+      "name": "wrong-secret",
+      "body": "{\"id\":\"evt-1\",\"type\":\"movement.decided\"}",
+      "t": 1700000000,
+      "header": "t=1700000000,v1=9655fcade5f2ab0ab2ed6d43303658ce6d6ead5498be7ac66c7660f17e87850c",
+      "now": 1700000100,
+      "valid": false
+    },
+    {
+      "name": "missing-header",
+      "body": "{\"id\":\"evt-1\",\"type\":\"movement.decided\"}",
+      "t": 1700000000,
+      "header": null,
+      "now": 1700000100,
+      "valid": false
+    }
+  ]
+}

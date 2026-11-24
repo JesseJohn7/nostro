@@ -168,6 +168,23 @@ export class Money {
   }
 }
 
+/**
+ * Parse an amount from the JSON wire format, inferring decimals from the
+ * decimal string itself. `movementJson` and friends write a fixed-width string
+ * (e.g. `"25.0000000"`), so the fraction's length is the asset's precision.
+ * `Money.parse` still rejects anything it cannot hold exactly — this helper
+ * only works out how many places to give it, and never rounds.
+ */
+export function moneyFromJson(amount: string, asset: AssetId): Money {
+  if (typeof amount !== 'string') {
+    throw new PrecisionError(`moneyFromJson requires a decimal string, received ${typeof amount}.`)
+  }
+  const match = AMOUNT_RE.exec(amount.trim())
+  // A malformed string is left to Money.parse, which reports it precisely.
+  if (match === null) return Money.parse(amount, asset, 0)
+  return Money.parse(amount, asset, (match[3] ?? '').length)
+}
+
 function assertDecimals(decimals: number): void {
   if (!Number.isInteger(decimals) || decimals < 0 || decimals > 38) {
     throw new PrecisionError(`Invalid decimals ${decimals}: expected an integer in [0, 38].`)

@@ -54,7 +54,7 @@ function base32Decode(value: string): Uint8Array | null {
     const code = value.charCodeAt(i)
     if (code > 255) return null
     const v = BASE32_LOOKUP[code]
-    if (v === 255) return null
+    if (v === undefined || v === 255) return null
     acc = (acc << 5) | v
     bits += 5
     if (bits >= 8) {

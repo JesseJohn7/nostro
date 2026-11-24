@@ -16,7 +16,7 @@ ${COMMON_HELP}`,
   options: COMMON,
   async run(args, io) {
     positionals(args, 0)
-    const opened = await openStore(database(args, io), io, { create: true })
+    const opened = await openStore(database(args, io), io, { create: true }, args)
     try {
       const before = await opened.store.schemaVersion()
       if (before.current > before.latest) {
