@@ -9,7 +9,7 @@
 import type { ExceptionCode, MovementSource, Store } from '@nostro-labs/nostro'
 import { reconcileUntilDone, syncUntilCaughtUp } from '@nostro-labs/nostro'
 
-export type { StreamProgress, ReconcileTotals } from '@nostro-labs/nostro'
+export type { StreamProgress } from '@nostro-labs/nostro'
 import type { StreamProgress } from '@nostro-labs/nostro'
 
 export interface SyncAllOptions {
@@ -28,7 +28,7 @@ export interface SyncAllOptions {
 /** Sync every account from every source; one entry per (source, account). */
 export async function syncAll(options: SyncAllOptions): Promise<StreamProgress[]> {
   const { streams } = await syncUntilCaughtUp(options)
-  return streams
+  return [...streams]
 }
 
 export interface ReconcileTotals {

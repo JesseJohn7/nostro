@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true,
+    // Typecheck against core's source, so nothing has to be built first.
+    "paths": { "@nostro-labs/nostro": ["../core/src/index.ts"] }
+  }
+}

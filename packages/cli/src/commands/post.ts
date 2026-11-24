@@ -1,4 +1,3 @@
-import type { JournalEntryKind } from '@nostro-labs/nostro'
 import { postUntilDone } from '@nostro-labs/nostro'
 import { COMMON, flag, positionals, tenant } from '../args.js'
 import type { Command } from '../command.js'

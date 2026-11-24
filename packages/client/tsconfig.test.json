@@ -5,6 +5,7 @@
     "noEmit": true,
     "paths": {
       "@nostro-labs/nostro": ["../core/src/index.ts"],
+      "@nostro-labs/server": ["../server/src/index.ts"],
       "@nostro-labs/nostro/json": ["../core/src/model/json.ts"],
       "@nostro-labs/nostro/money": ["../core/src/money/index.ts"],
       "@nostro-labs/nostro/webhooks/verify": ["../core/src/webhooks/browser.ts"]

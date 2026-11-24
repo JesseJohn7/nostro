@@ -7,9 +7,12 @@
  * The CLI commands (`nostro sync`, `reconcile`, `post`, `serve`) all use these,
  * so a library user gets the same stop conditions without rewriting them.
  */
-import type { ExceptionCode, JournalEntryKind, MovementSource } from '../model/index.js'
+import type { ExceptionCode, JournalEntryKind } from '../model/index.js'
 import type { Store } from '../store/index.js'
-import { reconcile, sweepExpectations, sync } from './sync.js'
+import type { MovementSource } from './source.js'
+import { sync } from './sync.js'
+import { reconcile } from '../matching/reconcile.js'
+import { sweepExpectations } from '../matching/sweep.js'
 import type { AccountSyncReport } from './sync.js'
 import { postJournal } from '../journal/index.js'
 import type { PostOptions } from '../journal/index.js'

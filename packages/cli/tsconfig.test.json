@@ -11,6 +11,7 @@
       "@nostro-labs/nostro/json": ["../core/src/model/json.ts"],
       "@nostro-labs/nostro/webhooks/verify": ["../core/src/webhooks/browser.ts"],
       "@nostro-labs/nostro": ["../core/src/index.ts"],
+      "@nostro-labs/store-conformance": ["../store-conformance/src/index.ts"],
       "@nostro-labs/store-postgres": ["../store-postgres/src/index.ts"],
       "@nostro-labs/store-sqlite": ["../store-sqlite/src/index.ts"],
       "nostro-testkit": ["../testkit/src/index.ts"]

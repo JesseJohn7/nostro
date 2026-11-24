@@ -1,0 +1,13 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true,
+    // Typecheck against core's source, so nothing has to be built first.
+    "paths": {
+      "@nostro-labs/nostro/json": ["../core/src/model/json.ts"],
+      "@nostro-labs/nostro/money": ["../core/src/money/index.ts"],
+      "@nostro-labs/nostro/webhooks/verify": ["../core/src/webhooks/browser.ts"]
+    }
+  }
+}
