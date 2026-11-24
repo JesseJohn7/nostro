@@ -80,7 +80,7 @@ describe('applyMovement', () => {
     ])
     await healthy()
     const types = (await store.listEvents({ tenantId: T })).map((e) => e.type)
-    expect(types.slice(-3)).toEqual(['expectation.settled', 'exception.resolved', 'movement.decided'])
+    expect(types.slice(-4)).toEqual(['expectation.settled', 'exception.resolved', 'movement.decided', 'journal.posted'])
   })
 
   it('takes only what is owing unless told otherwise, and leaves the rest open for a person', async () => {

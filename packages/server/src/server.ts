@@ -337,12 +337,18 @@ export function createServer(options: ServerOptions): FastifyInstance {
         return reply.code(201).header('location', `/v1/accounts/${body.account}`).send(json)
       })
 
-      v1.post<{ Body: { account?: string } }>('/rounds', { schema: { body: createRoundBody } }, async (request, reply) => {
+      v1.post<{ Body: { account?: string } }>('/rounds', {
+        schema: { body: createRoundBody },
+        // The body is optional: no body asks for a round over every account.
+        preValidation: async (request) => {
+          request.body ??= {}
+        },
+      }, async (request, reply) => {
         const { tenantId, body } = request
         if (options.roundRunner === undefined) {
           throw new HttpProblem(501, 'not_supported', 'Manual rounds are not supported in this server configuration (serve hook not configured).')
         }
-        const { id, round } = await options.roundRunner.triggerRound(tenantId, body?.account)
+        const { id, round } = await options.roundRunner.triggerRound(tenantId, body.account)
         return reply.code(202).header('location', `/v1/rounds/${id}`).send(round)
       })
 
@@ -468,7 +474,11 @@ export function createServer(options: ServerOptions): FastifyInstance {
 
       v1.post<{ Body: ScheduleBody }>(
         '/schedules',
-        { schema: { body: scheduleBody }, preValidation: async (request) => onlyStrings(request.body, '') },
+        {
+          schema: { body: scheduleBody },
+          // A cadence's day is an integer, which the schema checks; everything else is a string.
+          preValidation: async (request) => onlyStrings({ ...(request.body as object | null), cadence: undefined }, ''),
+        },
         async (request, reply) => {
           const created = await store.transaction((tx) => tx.insertSchedule(toNewSchedule(request.tenantId, request.body)))
           return reply.code(201).header('location', `/v1/schedules/${created.id}`).send(scheduleJson(created))

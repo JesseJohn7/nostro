@@ -257,7 +257,7 @@ export interface ScheduleJson {
   direction: Schedule['direction']
   amount: string
   asset: string
-  memo: Schedule['memo']
+  memo: MemoJson | null
   payers: readonly string[]
   cadence: Schedule['cadence']
   startAt: string
@@ -275,7 +275,7 @@ export function scheduleJson(s: Schedule): ScheduleJson {
     direction: s.direction,
     amount: s.amount.toString(),
     asset: s.amount.asset,
-    memo: s.memo ?? null,
+    memo: memoJson(s.memo),
     payers: s.payers,
     cadence: s.cadence,
     startAt: s.startAt.toISOString(),
@@ -426,7 +426,7 @@ export function scheduleFromJson(j: ScheduleJson, tenantId = ''): Schedule {
     account: j.account,
     direction: j.direction,
     amount: moneyFromJson(j.amount, j.asset as AssetId),
-    memo: memoFromJson(j.memo === null ? null : { type: j.memo.type, value: String(j.memo.value) }),
+    memo: memoFromJson(j.memo),
     payers: [...j.payers],
     cadence: j.cadence,
     startAt: new Date(j.startAt),

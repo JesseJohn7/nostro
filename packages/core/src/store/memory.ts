@@ -344,7 +344,7 @@ abstract class MemoryReader implements StoreReader {
     this.check()
     let out = [...this.snapshot().schedules.values()].filter((sc) => sc.tenantId === q.tenantId)
     if (q.activeOnly) out = out.filter((sc) => sc.endedAt === null)
-    out.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime() || a.id.localeCompare(b.id))
+    out.sort((a, b) => a.startAt.getTime() - b.startAt.getTime() || (a.id < b.id ? -1 : 1))
     return out.slice(0, q.limit ?? 100)
   }
 

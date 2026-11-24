@@ -5,7 +5,7 @@ import { describe, expect, it } from 'vitest'
 import type { Store } from '@nostro-labs/nostro'
 import { HorizonEffectsSource, HorizonFeesSource, JOURNAL_CSV_COLUMNS, MemoryStore, Money, NATIVE, eventCursorKey, reconcile, rewindConsumer, sync } from '@nostro-labs/nostro'
 import { FakeHorizon } from 'nostro-testkit'
-import { apiKeys, createServer } from '../src/index.js'
+import { apiKeys, createServer, firstOf, keyDigest, storedKeys } from '../src/index.js'
 import type { RoundRecord, RoundRunner } from '../src/index.js'
 
 const A = `G${'A'.repeat(55)}`
@@ -315,6 +315,7 @@ describe('expectations', () => {
     expect((await app.inject({ url: `/v1/expectations/${e.id}`, headers: auth() })).json().expectation).toEqual(res.json())
     const events = (await app.inject({ url: '/v1/events', headers: auth() })).json().data
     expect(events).toEqual([
+      expect.objectContaining({ type: 'expectation.created', subjectId: e.id, data: { expectation: e } }),
       expect.objectContaining({ type: 'expectation.cancelled', subjectId: e.id, data: expect.objectContaining({ expectation: res.json() }) }),
     ])
     expect((await cancel(app, 'nope', { reason: 'n' })).json()).toMatchObject({ status: 404, code: 'not_found' })
@@ -359,6 +360,7 @@ describe('expectations', () => {
     })
     const events = (await app.inject({ url: '/v1/events', headers: auth() })).json().data
     expect(events).toEqual([
+      expect.objectContaining({ type: 'expectation.created', subjectId: original.id, data: { expectation: original } }),
       expect.objectContaining({
         type: 'expectation.amended',
         subjectId: original.id,
@@ -514,7 +516,7 @@ describe('resolving exceptions', () => {
     const settled = (await app.inject({ url: '/v1/expectations?status=settled', headers: auth() })).json().data
     expect(settled.map((e: { reference: string }) => e.reference)).toContain('INV-7')
     const types = (await app.inject({ url: '/v1/events', headers: auth() })).json().data.map((e: { type: string }) => e.type)
-    expect(types.slice(-3)).toEqual(['expectation.settled', 'exception.resolved', 'movement.decided'])
+    expect(types.slice(-4)).toEqual(['expectation.settled', 'exception.resolved', 'movement.decided', 'journal.posted'])
     // It has been decided now, so deciding it again is refused.
     expect((await resolve(id, { action: 'ignore', note: 'n' })).json()).toMatchObject({ status: 409, code: 'resolution_refused' })
   })
@@ -575,15 +577,22 @@ describe('events', () => {
     const get = async (query: string) => (await app.inject({ url: `/v1/events?${query}`, headers: auth() })).json()
     const all = await get('')
     expect(all.data.map((e: { type: string }) => e.type)).toEqual([
+      'movement.recorded',
+      'movement.recorded',
+      'movement.recorded',
+      'expectation.created',
       'expectation.settled',
       'movement.decided',
+      'journal.posted',
       'exception.opened',
       'movement.decided',
+      'journal.posted',
       'movement.decided',
+      'journal.posted',
     ])
-    expect(all.data[0].data.expectation).toMatchObject({ reference: 'INV-1042', status: 'settled', amount: '25.0000000' })
+    expect(all.data[4].data.expectation).toMatchObject({ reference: 'INV-1042', status: 'settled', amount: '25.0000000' })
     const first = await get('limit=2')
-    expect((await get(`after=${first.next}`)).data).toHaveLength(3)
+    expect((await get(`after=${first.next}`)).data).toEqual(all.data.slice(2))
     expect((await app.inject({ url: '/v1/events', headers: auth(OTHER_KEY) })).json()).toEqual({ data: [], next: null })
     expect((await app.inject({ url: '/v1/events?type=x', headers: auth() })).statusCode).toBe(400)
   })
@@ -1012,6 +1021,10 @@ describe('client-triggered rounds (issue #97)', () => {
     expect(postRes.headers.location).toBe('/v1/rounds/round-123')
     expect(postRes.json()).toMatchObject({ id: 'round-123', state: 'queued' })
 
+    // The body is optional, but when there is one it is still checked.
+    expect((await app.inject({ method: 'POST', url: '/v1/rounds', headers: auth() })).statusCode).toBe(202)
+    expect((await app.inject({ method: 'POST', url: '/v1/rounds', headers: auth(), payload: { account: 'nope' } })).statusCode).toBe(400)
+
     const getRes = await app.inject({ method: 'GET', url: '/v1/rounds/round-123', headers: auth() })
     expect(getRes.statusCode).toBe(200)
     expect(getRes.json()).toMatchObject({ id: 'round-123', state: 'queued' })
@@ -1020,5 +1033,137 @@ describe('client-triggered rounds (issue #97)', () => {
     const otherRes = await app.inject({ method: 'GET', url: '/v1/rounds/round-123', headers: auth(OTHER_KEY) })
     expect(otherRes.statusCode).toBe(404)
     expect(otherRes.json()).toMatchObject({ status: 404, code: 'not_found' })
+  })
+})
+
+describe('schedules', () => {
+  const body = {
+    referencePattern: 'RENT-{YYYY}-{MM}',
+    account: A,
+    amount: '1250.5',
+    memo: { type: 'id', value: '18446744073709551615' },
+    payers: [B],
+    cadence: { kind: 'monthly', day: 28 },
+    startAt: '2026-01-01T00:00:00.000Z',
+    endAt: '2027-01-01T00:00:00.000Z',
+  }
+
+  it('creates, reads, lists and ends a schedule, for its own tenant only', async () => {
+    const app = server(new MemoryStore())
+    const post = (payload: object, key = ACME_KEY) => app.inject({ method: 'POST', url: '/v1/schedules', headers: auth(key), payload })
+    const res = await post(body)
+    expect(res.statusCode, res.body).toBe(201)
+    const made = res.json()
+    expect(res.headers.location).toBe(`/v1/schedules/${made.id}`)
+    expect(made).toMatchObject({
+      referencePattern: 'RENT-{YYYY}-{MM}', account: A, direction: 'credit', amount: '1250.5000000', asset: 'native',
+      memo: { type: 'id', value: '18446744073709551615' }, payers: [B], cadence: { type: 'monthly', dayOfMonth: 28 }, endedAt: null,
+    })
+    expect((await app.inject({ url: `/v1/schedules/${made.id}`, headers: auth() })).json()).toEqual(made)
+    expect((await app.inject({ url: `/v1/schedules/${made.id}`, headers: auth(OTHER_KEY) })).statusCode).toBe(404)
+
+    for (const cadence of [{ kind: 'daily' }, { kind: 'weekly', day: 3 }]) {
+      expect((await post({ ...body, cadence, memo: { type: 'text', value: 'rent' }, asset: `USDC:${ISSUER}`, direction: 'debit' })).statusCode, JSON.stringify(cadence)).toBe(201)
+    }
+    const list = async (query = '') => (await app.inject({ url: `/v1/schedules${query}`, headers: auth() })).json().items as { id: string; cadence: unknown }[]
+    expect((await list()).map((x) => x.cadence)).toEqual(expect.arrayContaining([{ type: 'daily' }, { type: 'weekly', dayOfWeek: 3 }, { type: 'monthly', dayOfMonth: 28 }]))
+
+    const end = (key = ACME_KEY) => app.inject({ method: 'POST', url: `/v1/schedules/${made.id}/end`, headers: auth(key) })
+    expect((await end(OTHER_KEY)).statusCode).toBe(404)
+    const ended = (await end()).json()
+    expect(ended.endedAt).not.toBeNull()
+    expect((await end()).json()).toEqual(ended)
+    expect((await list('?activeOnly=true')).map((x) => x.id)).not.toContain(made.id)
+    expect((await app.inject({ url: '/v1/schedules', headers: auth(OTHER_KEY) })).json()).toEqual({ items: [] })
+  })
+
+  it('refuses a schedule it cannot keep exactly', async () => {
+    const app = server(new MemoryStore())
+    for (const [over, why] of [
+      [{ amount: 1250.5 }, /string/],
+      [{ amount: '0.00000001' }, /amount/],
+      [{ asset: 'USDC' }, /asset/],
+      [{ memo: { type: 'text', value: 'x'.repeat(29) } }, /28 bytes/],
+      [{ memo: { type: 'id', value: '18446744073709551616' } }, /2\^64/],
+      [{ memo: { type: 'hash', value: 'abc' } }, /64 hex/],
+      [{ cadence: { kind: 'monthly', day: 31 } }, /./],
+      [{ cadence: { kind: 'weekly', day: 1.5 } }, /./],
+    ] as const) {
+      const res = await app.inject({ method: 'POST', url: '/v1/schedules', headers: auth(), payload: { ...body, ...over } })
+      expect([400, 422], `${JSON.stringify(over)}: ${res.statusCode} ${res.body}`).toContain(res.statusCode)
+      expect(res.json().detail, JSON.stringify(over)).toMatch(why)
+    }
+  })
+})
+
+describe('watched accounts', () => {
+  it('lists, adds and removes accounts, with what the worker last did for each', async () => {
+    const store = new MemoryStore()
+    const app = server(store)
+    const call = (method: 'GET' | 'POST' | 'DELETE', url: string, payload?: object) =>
+      app.inject({ method, url, headers: auth(), ...(payload === undefined ? {} : { payload }) })
+    expect((await call('POST', '/v1/accounts', { account: A })).statusCode).toBe(201)
+    expect((await call('POST', '/v1/accounts', { account: A })).statusCode).toBe(200)
+    expect((await call('POST', '/v1/accounts', { account: 'C'.repeat(56) })).statusCode).toBe(400)
+    const at = new Date('2026-10-01T00:00:00Z')
+    await store.transaction((tx) =>
+      tx.recordSyncState({ tenantId: 'acme', network: 'testnet', source: 'horizon', account: A, cursor: '7', lastAttemptAt: at, lastSuccessAt: at, caughtUp: true, lastError: null, lastErrorAt: null }),
+    )
+    expect((await call('GET', '/v1/accounts')).json().data).toEqual([
+      {
+        account: A, source: 'api', addedAt: expect.any(String),
+        sync: [{ network: 'testnet', source: 'horizon', cursor: '7', lastAttemptAt: at.toISOString(), lastSuccessAt: at.toISOString(), caughtUp: true, lastError: null, lastErrorAt: null }],
+      },
+    ])
+    expect((await app.inject({ url: '/v1/accounts', headers: auth(OTHER_KEY) })).json()).toEqual({ data: [] })
+    expect((await call('DELETE', `/v1/accounts/${A}`)).statusCode).toBe(204)
+    expect((await call('DELETE', `/v1/accounts/${A}`)).statusCode).toBe(404)
+  })
+})
+
+describe('stored API keys', () => {
+  const PLAIN = 's'.repeat(64)
+  const withKey = async (scopes: string[] = ['read']) => {
+    const store = new MemoryStore()
+    await store.transaction((tx) => tx.insertApiKey({ id: 'k1', tenantId: 'acme', label: 'ci', digest: keyDigest(PLAIN), scopes, createdAt: new Date() }))
+    return store
+  }
+
+  it('authenticates by digest, ignores a scope it does not know, and refuses a revoked key at once', async () => {
+    const store = await withKey(['read', 'from-the-future'])
+    const keys = storedKeys(store)
+    expect(await keys.authenticate(PLAIN)).toEqual({ tenantId: 'acme', scopes: new Set(['read']), keyId: 'k1' })
+    expect(await keys.authenticate('x'.repeat(64))).toBeNull()
+    await store.transaction((tx) => tx.revokeApiKey('k1', new Date()))
+    expect(await keys.authenticate(PLAIN)).toBeNull()
+    await keys.flush()
+  })
+
+  it('writes the last use in a batch, and keeps it when the store refuses', async () => {
+    const store = await withKey()
+    const transaction = store.transaction.bind(store)
+    let down = true
+    store.transaction = (async (fn: never) => {
+      if (down) throw new Error('store down')
+      return transaction(fn)
+    }) as typeof store.transaction
+    const keys = storedKeys(store, { flushEveryMs: 5 })
+    await keys.authenticate(PLAIN)
+    await new Promise((resolve) => setTimeout(resolve, 40))
+    expect((await store.listApiKeys('acme'))[0]!.lastUsedAt).toBeNull()
+    await expect(keys.flush()).rejects.toThrow('store down')
+    down = false
+    await keys.flush()
+    expect((await store.listApiKeys('acme'))[0]!.lastUsedAt).toBeInstanceOf(Date)
+    await keys.flush()
+  })
+
+  it('serves a request with a stored key, trying each kind of key in turn', async () => {
+    const store = await withKey()
+    const keys = storedKeys(store)
+    const app = createServer({ store, authenticate: firstOf(apiKeys({ [OTHER_KEY]: 'other' }), keys.authenticate) })
+    for (const key of [PLAIN, OTHER_KEY]) expect((await app.inject({ url: '/v1/movements', headers: auth(key) })).statusCode).toBe(200)
+    expect((await app.inject({ url: '/v1/movements', headers: auth('n'.repeat(64)) })).statusCode).toBe(401)
+    await keys.flush()
   })
 })

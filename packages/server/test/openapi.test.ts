@@ -232,22 +232,19 @@ describe('the OpenAPI document', () => {
     const exp = expRes.json()
 
     // 2. insertMovements -> movement.recorded
-    const { inserted } = await store.transaction((tx) =>
-      tx.insertMovements([
-        {
-          tenantId: 'acme',
-          network: 'testnet',
-          source: 'horizon',
-          externalId: 'ext-evt-1',
-          account: A,
-          direction: 'credit',
-          kind: 'transfer',
-          amount: Money.parse('10', NATIVE),
-          ledger: 100,
-          occurredAt: new Date('2026-10-01T00:00:00Z'),
-        },
-      ]),
-    )
+    const payment = (externalId: string, amount: string) => ({
+      tenantId: 'acme',
+      network: 'testnet',
+      source: 'horizon',
+      externalId,
+      account: A,
+      direction: 'credit' as const,
+      kind: 'transfer' as const,
+      amount: Money.parse(amount, NATIVE),
+      ledger: 100,
+      occurredAt: new Date('2026-10-01T00:00:00Z'),
+    })
+    const { inserted } = await store.transaction((tx) => tx.insertMovements([payment('ext-evt-1', '4'), payment('ext-evt-2', '6')]))
     const mov = inserted[0]!
 
     // 3. allocate partial -> expectation.partially_paid
@@ -255,9 +252,9 @@ describe('the OpenAPI document', () => {
       await tx.allocate({ tenantId: 'acme', movementId: mov.id, expectationId: exp.id, amount: Money.parse('4', NATIVE), strategy: 'test' })
     })
 
-    // 4. allocate settled -> expectation.settled
+    // 4. allocate settled -> expectation.settled, from a second payment: one movement pays an expectation once
     await store.transaction(async (tx) => {
-      await tx.allocate({ tenantId: 'acme', movementId: mov.id, expectationId: exp.id, amount: Money.parse('6', NATIVE), strategy: 'test' })
+      await tx.allocate({ tenantId: 'acme', movementId: inserted[1]!.id, expectationId: exp.id, amount: Money.parse('6', NATIVE), strategy: 'test' })
     })
 
     // 5. setDisposition -> movement.decided
@@ -300,9 +297,15 @@ describe('the OpenAPI document', () => {
     expect(cancelRes.statusCode).toBe(200)
 
     // 10. amend expectation -> expectation.amended
+    const toAmend = (await server.inject({
+      method: 'POST',
+      url: '/v1/expectations',
+      headers,
+      payload: { reference: 'INV-AMEND', account: A, amount: '5' },
+    })).json()
     const amendRes = await server.inject({
       method: 'POST',
-      url: `/v1/expectations/${exp.id}/amend`,
+      url: `/v1/expectations/${toAmend.id}/amend`,
       headers,
       payload: { reason: 'corrected reference', amount: '12', muxedId: null },
     })

@@ -3,12 +3,19 @@ import {
   MemoryStore,
   Money,
   NATIVE,
+  allocationFromJson,
   allocationJson,
   asset,
+  exceptionFromJson,
   exceptionJson,
+  expectationFromJson,
   expectationJson,
+  journalEntryFromJson,
   journalEntryJson,
+  movementFromJson,
   movementJson,
+  scheduleFromJson,
+  scheduleJson,
 } from '../src/index.js'
 
 const T = 't'
@@ -113,5 +120,40 @@ describe('JSON for records', () => {
       tx.insertExpectation({ tenantId: T, reference: 'R', account: A, amount: Money.parse('25', NATIVE) }),
     )
     expect(expectationJson(e)).toMatchObject({ amount: '25.0000000', asset: 'native', memo: null, muxedId: null })
+  })
+
+  it('reads every record back as it was, through JSON text', async () => {
+    const { m, e, a, x, j } = await records()
+    const wire = <J>(json: J): J => JSON.parse(JSON.stringify(json)) as J
+    expect(movementFromJson(wire(movementJson(m)), T)).toEqual(m)
+    expect(expectationFromJson(wire(expectationJson(e)), T)).toEqual(e)
+    expect(allocationFromJson(wire(allocationJson(a)), T)).toEqual(a)
+    expect(exceptionFromJson(wire(exceptionJson(x)), T)).toEqual(x)
+    expect(journalEntryFromJson(wire(journalEntryJson(j)), T)).toEqual(j)
+    // The wire has no tenant; a caller that does not give one gets none.
+    expect(movementFromJson(wire(movementJson(m))).tenantId).toBe('')
+  })
+
+  it('reads an exception with an amount, and a movement with each kind of memo', async () => {
+    const { m } = await records()
+    for (const memo of [null, { type: 'text', value: 'x' }, { type: 'id', value: MAX }, { type: 'hash', value: 'a'.repeat(64) }, { type: 'return', value: 'b'.repeat(64) }] as const) {
+      const one = { ...m, memo }
+      expect(movementFromJson(JSON.parse(JSON.stringify(movementJson(one))), T)).toEqual(one)
+    }
+    const store = new MemoryStore()
+    const x = await store.transaction((tx) => tx.openException({ tenantId: T, code: 'MEMO_MISSING', account: A, amount: HUGE, detail: 'd' }))
+    expect(exceptionFromJson(JSON.parse(JSON.stringify(exceptionJson(x))), T)).toEqual(x)
+  })
+
+  it('writes and reads a schedule, whatever its memo', async () => {
+    const store = new MemoryStore()
+    for (const memo of [null, { type: 'id', value: MAX }, { type: 'text', value: 'rent' }] as const) {
+      const made = await store.transaction((tx) =>
+        tx.insertSchedule({ tenantId: T, referencePattern: 'R-{YYYY}', account: A, amount: HUGE, memo, payers: [B], cadence: { type: 'weekly', dayOfWeek: 1 }, startAt: new Date('2026-01-01T00:00:00Z'), endAt: new Date('2027-01-01T00:00:00Z') }),
+      )
+      const json = JSON.parse(JSON.stringify(scheduleJson(made)))
+      expect(json).toMatchObject({ amount: HUGE.toString(), memo: memo === null ? null : { type: memo.type, value: String(memo.value) }, endedAt: null })
+      expect(scheduleFromJson(json, T)).toEqual(made)
+    }
   })
 })

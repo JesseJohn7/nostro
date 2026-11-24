@@ -11,9 +11,12 @@ describe('OpenAPI request fuzz smoke test', () => {
     const values = ['%', '\\u0000', 'not-a-number', '-1', '999999999999999999999999', 'a b', '☃']
     for (const path of paths) for (const value of values) {
       const response = await app.inject({ url: path + '?limit=' + encodeURIComponent(value), headers: { authorization: 'Bearer ' + KEY } })
-      expect(response.statusCode).toBeGreaterThanOrEqual(200)
-      expect(response.statusCode).toBeLessThan(600)
-      expect(response.headers['content-type']).toMatch(/application\\/json/)
+      const what = `${path}?limit=${JSON.stringify(value)}: ${response.statusCode} ${response.body.slice(0, 200)}`
+      // Never an internal error: an answer, a documented refusal, or the documented 501.
+      expect(response.statusCode < 500 || response.statusCode === 501, what).toBe(true)
+      expect(response.headers['content-type'], what).toMatch(
+        response.statusCode >= 400 ? /^application\/problem\+json/ : /^(application\/json|text\/csv)/,
+      )
     }
   })
 })

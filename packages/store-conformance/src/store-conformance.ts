@@ -8,7 +8,17 @@ import { describeRefundConformance } from './refund-conformance.js'
  * what notices when one of them doesn't.
  */
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
-import type { Disposition, NewDeliveryAttempt, NewException, NewMovement, Store, StoreTx } from '@nostro-labs/nostro'
+import type {
+  Disposition,
+  NewAccountOpening,
+  NewDeliveryAttempt,
+  NewException,
+  NewInternalTransferLink,
+  NewMovement,
+  NewSchedule,
+  Store,
+  StoreTx,
+} from '@nostro-labs/nostro'
 import { describeJournalConformance } from './journal-conformance.js'
 import {
   ConsumerPositionConflict,
@@ -329,8 +339,9 @@ export function describeStoreConformance(
         await store.transaction(async (tx) => {
           await tx.insertApiKey(newKey('late', { createdAt: new Date('2026-02-01T00:00:00Z') }))
           await tx.insertApiKey(newKey('early', { createdAt: new Date('2026-01-01T00:00:00Z') }))
-          await tx.insertApiKey(newKey('other', { tenantId: T2, createdAt: new Date('2026-01-15T00:00:00Z') }))
         })
+        // A store may pin a transaction to one tenant, so the other tenant's key is written on its own.
+        await store.transaction((tx) => tx.insertApiKey(newKey('other', { tenantId: T2, createdAt: new Date('2026-01-15T00:00:00Z') })))
         expect((await store.listApiKeys()).map((k) => k.id)).toEqual(['early', 'other', 'late'])
         expect((await store.listApiKeys(T)).map((k) => k.id)).toEqual(['early', 'late'])
       })
@@ -1497,6 +1508,189 @@ export function describeStoreConformance(
         await expect(
           rewindConsumer(store, { tenantId: T, consumer: 'webhook', expectedSeq: events[0]!.seq, toSeq: 0, actor: 'x', at: AT }),
         ).rejects.toBeInstanceOf(EventHistoryPrunedError)
+      })
+    })
+
+    describe('schedules', () => {
+      const schedule = (over: Partial<NewSchedule> = {}): NewSchedule => ({
+        tenantId: T,
+        referencePattern: 'RENT-{YYYY}-{MM}',
+        account: ACCOUNT,
+        amount: usdc('1250.5'),
+        memo: { type: 'id', value: (1n << 64n) - 1n },
+        payers: [PAYER],
+        cadence: { type: 'monthly', dayOfMonth: 28 },
+        startAt: new Date('2026-01-01T00:00:00Z'),
+        endAt: new Date('2027-01-01T00:00:00Z'),
+        ...over,
+      })
+
+      it('keeps a schedule exactly, and scopes it to its tenant', async () => {
+        const made = await store.transaction((tx) => tx.insertSchedule(schedule()))
+        expect(made).toMatchObject({
+          tenantId: T, referencePattern: 'RENT-{YYYY}-{MM}', account: ACCOUNT, direction: 'credit',
+          memo: { type: 'id', value: (1n << 64n) - 1n }, payers: [PAYER], cadence: { type: 'monthly', dayOfMonth: 28 },
+          startAt: new Date('2026-01-01T00:00:00Z'), endAt: new Date('2027-01-01T00:00:00Z'), endedAt: null,
+        })
+        expect(made.amount.equals(usdc('1250.5'))).toBe(true)
+        expect(await store.getSchedule(T, made.id)).toEqual(made)
+        expect(await store.getSchedule(T2, made.id)).toBeNull()
+        expect(await store.getSchedule(T, 'missing')).toBeNull()
+
+        const bare = await store.transaction((tx) =>
+          tx.insertSchedule({ tenantId: T, referencePattern: 'D-{YYYY}', account: ACCOUNT, direction: 'debit', amount: usdc('1'), cadence: { type: 'daily' }, startAt: new Date('2026-02-01T00:00:00Z') }),
+        )
+        expect(bare).toMatchObject({ direction: 'debit', memo: null, payers: [], endAt: null, endedAt: null })
+      })
+
+      it('lists schedules by start, active ones only when asked, and bounds the list', async () => {
+        // Inserted out of order, so insertion order cannot pass for start order.
+        const [late, early] = await store.transaction(async (tx) => [
+          await tx.insertSchedule(schedule({ startAt: new Date('2026-06-01T00:00:00Z') })),
+          await tx.insertSchedule(schedule({ startAt: new Date('2026-03-01T00:00:00Z') })),
+        ] as const)
+        await store.transaction((tx) => tx.insertSchedule(schedule({ tenantId: T2 })))
+        const ids = async (over: object = {}) => (await store.listSchedules({ tenantId: T, ...over })).map((x) => x.id)
+        expect(await ids()).toEqual([early.id, late.id])
+        expect(await ids({ limit: 1 })).toEqual([early.id])
+
+        const endedAt = new Date('2026-04-01T00:00:00Z')
+        const ended = await store.transaction((tx) => tx.endSchedule(T, early.id, endedAt))
+        expect(ended.endedAt).toEqual(endedAt)
+        expect((await store.getSchedule(T, early.id))!.endedAt).toEqual(endedAt)
+        expect(await ids({ activeOnly: true })).toEqual([late.id])
+        expect(await ids()).toEqual([early.id, late.id])
+
+        await expect(store.transaction((tx) => tx.endSchedule(T2, late.id, endedAt))).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        await expect(store.transaction((tx) => tx.endSchedule(T, 'missing', endedAt))).rejects.toMatchObject({ code: 'NOT_FOUND' })
+      })
+
+      it('leaves nothing when the transaction throws', async () => {
+        await expect(store.transaction(async (tx) => {
+          await tx.insertSchedule(schedule())
+          throw new Error('abort')
+        })).rejects.toThrow('abort')
+        expect(await store.listSchedules({ tenantId: T })).toEqual([])
+      })
+    })
+
+    describe('decision records', () => {
+      it('keeps one snapshot per decided movement, in decision order, within a time range', async () => {
+        await store.transaction((tx) => tx.insertExpectation({ tenantId: T, reference: 'INV-9', account: ACCOUNT, amount: usdc('10') }))
+        const { inserted } = await store.transaction((tx) =>
+          tx.insertMovements([movement({ memo: { type: 'text', value: 'INV-9' } }), movement({ memo: null })]),
+        )
+        await reconcile({ store, tenantId: T, limit: 10 })
+        const all = await store.listDecisions({ tenantId: T })
+        expect(all.map((d) => d.movementId)).toEqual(inserted.map((m) => m.id))
+        expect(all[0]!.seq).toBeLessThan(all[1]!.seq)
+        expect(all[0]!.snapshot.inputs.movement.id).toBe(inserted[0]!.id)
+        expect(all[0]!.snapshot.inputs.candidates.map((c) => c.expectation.reference)).toEqual(['INV-9'])
+
+        expect(await store.getDecision(T, inserted[0]!.id)).toEqual(all[0])
+        expect(await store.getDecision(T2, inserted[0]!.id)).toBeNull()
+        expect(await store.getDecision(T, 'missing')).toBeNull()
+        expect(await store.listDecisions({ tenantId: T, movementId: inserted[1]!.id })).toEqual([all[1]])
+        expect(await store.listDecisions({ tenantId: T, limit: 1 })).toEqual([all[0]])
+        // From is inclusive, to is exclusive.
+        const last = all[1]!.decidedAt
+        expect(await store.listDecisions({ tenantId: T, from: new Date(last.getTime() + 1) })).toEqual([])
+        expect(await store.listDecisions({ tenantId: T, to: all[0]!.decidedAt })).toEqual([])
+        expect(await store.listDecisions({ tenantId: T, from: all[0]!.decidedAt, to: new Date(last.getTime() + 1) })).toEqual(all)
+        expect(await store.listDecisions({ tenantId: T2 })).toEqual([])
+      })
+    })
+
+    describe('internal transfer links', () => {
+      const TX = 'f'.repeat(64)
+      const pair = async () =>
+        (await store.transaction((tx) =>
+          tx.insertMovements([
+            movement({ direction: 'debit', txHash: TX }),
+            movement({ account: OTHER_ACCOUNT, txHash: TX }),
+            movement({ account: OTHER_ACCOUNT, txHash: TX }),
+          ]),
+        )).inserted
+      const link = (ids: readonly [string, string], over: Partial<NewInternalTransferLink> = {}): NewInternalTransferLink => ({
+        tenantId: T, network: 'testnet', txHash: TX, movementIds: ids, sameEntity: true, ...over,
+      })
+
+      it('links two movements once, and finds the link by id, transaction and movement', async () => {
+        const [a, b, c] = await pair()
+        const made = await store.transaction((tx) => tx.linkInternalTransfer(link([a!.id, b!.id])))
+        expect(made).toMatchObject({ tenantId: T, network: 'testnet', txHash: TX, sameEntity: true })
+        expect([...made.movementIds].sort()).toEqual([a!.id, b!.id].sort())
+        expect(await store.getInternalTransferLink(T, made.id)).toEqual(made)
+        expect(await store.getInternalTransferLink(T2, made.id)).toBeNull()
+        for (const q of [{}, { network: 'testnet' }, { txHash: TX }, { movementIds: [b!.id] }, { limit: 5 }]) {
+          expect(await store.listInternalTransferLinks({ tenantId: T, ...q }), JSON.stringify(q)).toEqual([made])
+        }
+        for (const q of [{ network: 'pubnet' }, { txHash: 'e'.repeat(64) }, { movementIds: [c!.id] }, { movementIds: [] }]) {
+          expect(await store.listInternalTransferLinks({ tenantId: T, ...q }), JSON.stringify(q)).toEqual([])
+        }
+        expect(await store.listInternalTransferLinks({ tenantId: T2 })).toEqual([])
+
+        // Neither the same pair again, in either order, nor one of them in another pair.
+        for (const ids of [[a!.id, b!.id], [b!.id, a!.id], [b!.id, c!.id], [c!.id, a!.id]] as const) {
+          await expect(store.transaction((tx) => tx.linkInternalTransfer(link(ids)))).rejects.toMatchObject(constraint('internal_transfer_duplicate'))
+        }
+      })
+
+      it('refuses a link that disagrees with its movements', async () => {
+        const [a, b] = await pair()
+        const ids = [a!.id, b!.id] as const
+        await expect(store.transaction((tx) => tx.linkInternalTransfer(link(ids, { network: 'pubnet' })))).rejects.toMatchObject(constraint('internal_transfer_invalid'))
+        await expect(store.transaction((tx) => tx.linkInternalTransfer(link(ids, { sameEntity: false })))).rejects.toMatchObject(constraint('internal_transfer_invalid'))
+        await expect(store.transaction((tx) => tx.linkInternalTransfer(link([a!.id, 'missing'])))).rejects.toMatchObject({ code: 'NOT_FOUND' })
+        expect(await store.listInternalTransferLinks({ tenantId: T })).toEqual([])
+      })
+    })
+
+    describe('account openings', () => {
+      it('lists openings by ledger, filtered and scoped to the tenant', async () => {
+        const opening = (account: string, ledger: number, tenantId = T): NewAccountOpening => ({
+          tenantId, network: 'testnet', account, ledger,
+          occurredAt: new Date('2026-01-01T00:00:00Z'), balances: [{ amount: usdc('5'), lastModifiedLedger: 1 }],
+        })
+        const [b, a] = await store.transaction(async (tx) => [
+          await tx.insertAccountOpening(opening(OTHER_ACCOUNT, 20)),
+          await tx.insertAccountOpening(opening(ACCOUNT, 10)),
+        ] as const)
+        await store.transaction((tx) => tx.insertAccountOpening(opening(ACCOUNT, 1, T2)))
+        expect(await store.listAccountOpenings({ tenantId: T })).toEqual([a, b])
+        expect(await store.listAccountOpenings({ tenantId: T, account: OTHER_ACCOUNT })).toEqual([b])
+        expect(await store.listAccountOpenings({ tenantId: T, network: 'pubnet' })).toEqual([])
+        expect(await store.listAccountOpenings({ tenantId: T, limit: 1 })).toEqual([a])
+      })
+    })
+
+    describe('export marks and accruals', () => {
+      it('remembers the last entry exported to each destination', async () => {
+        expect(await store.exportGetMark(T, 'xero')).toBeNull()
+        await store.exportSetMark(T, 'xero', 7)
+        await store.exportSetMark(T, 'qbo', 3)
+        await store.exportSetMark(T, 'xero', 9)
+        await store.exportSetMark(T2, 'xero', 1)
+        expect(await store.exportGetMark(T, 'xero')).toBe('9')
+        expect(await store.exportGetMark(T2, 'xero')).toBe('1')
+        const batches = [...(await store.exportListBatches(T))].sort((x, y) => x.destination.localeCompare(y.destination))
+        expect(batches.map((x) => [x.destination, x.last_seq])).toEqual([['qbo', 3], ['xero', 9]])
+        for (const x of batches) expect(Math.abs(x.last_exported_at - Date.now())).toBeLessThan(3_600_000)
+      })
+
+      it('posts an expectation accrual once, and only one that matches it', async () => {
+        expect(await store.accrualGetMode(T)).toBe(false)
+        const e = await store.transaction((tx) => tx.insertExpectation({ tenantId: T, reference: 'INV-ACC', account: ACCOUNT, amount: usdc('8') }))
+        const post = (over: { amount?: Money; reference?: string } = {}) =>
+          store.postAccrualExpectation(e.id, T, 'credit', over.amount ?? usdc('8'), over.reference ?? 'INV-ACC')
+        await post()
+        await post()
+        const entries = await store.listJournalEntries({ tenantId: T })
+        expect(entries.map((x) => [x.kind, x.lines.map((l) => [l.role, l.side, l.amount.toString(), l.expectationId])])).toEqual([
+          ['manual', [['receivable', 'debit', '8.0000000', e.id], ['uncategorized_income', 'credit', '8.0000000', e.id]]],
+        ])
+        await expect(post({ amount: usdc('9') })).rejects.toBeInstanceOf(ValidationError)
+        await expect(post({ reference: 'INV-OTHER' })).rejects.toBeInstanceOf(ValidationError)
       })
     })
 
