@@ -93,7 +93,7 @@ const MONEY = 'DECIMAL(40, 0)'
 
 const appendOnly = (s: string, table: string, message: string, guard = ''): string[] => {
   const condition = guard === '' ? '' : `  IF ${guard} THEN\n    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '${message}';\n  END IF;`
-  const body = condition === '' ? `  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '${message}'` : condition
+  const body = condition === '' ? `  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '${message}';` : condition
   return [
     `CREATE TRIGGER ${table}_append_only_u BEFORE UPDATE ON ${s}.${table}
        FOR EACH ROW BEGIN
@@ -399,8 +399,9 @@ export const MIGRATIONS: readonly ((s: string) => readonly string[])[] = [
        asset             ${T} NOT NULL,
        decimals          SMALLINT NOT NULL CONSTRAINT refund_links_decimals_check CHECK (decimals BETWEEN 0 AND 38),
        amount            ${MONEY} NOT NULL CONSTRAINT refund_links_amount_check CHECK (amount > 0),
-       residual_amount   ${MONEY} NOT NULL CONSTRAINT refund_links_residual_check CHECK (residual_amount >= 0 AND residual_amount <= amount),
-       created_at        ${TIME} NOT NULL
+       residual_amount   ${MONEY} NOT NULL,
+       created_at        ${TIME} NOT NULL,
+       CONSTRAINT refund_links_residual_check CHECK (residual_amount >= 0 AND residual_amount <= amount)
      )${ENGINE}`,
     `CREATE INDEX refund_credit ON ${s}.refund_links (tenant_id, credit_movement_id, seq)`,
     `CREATE INDEX movements_transaction ON ${s}.movements (tenant_id, account, tx_hash)`,
@@ -509,7 +510,10 @@ export const MIGRATIONS: readonly ((s: string) => readonly string[])[] = [
        same_entity TINYINT(1) NOT NULL,
        created_at  ${TIME} NOT NULL,
        CONSTRAINT internal_transfer_movements_check CHECK (movement_a <> movement_b),
-       UNIQUE (tenant_id, network, tx_hash, movement_a, movement_b)
+       -- The network and transaction are fixed by the movements. Adding them here
+       -- would take the key past InnoDB's 3072-byte limit.
+       UNIQUE (tenant_id, movement_a, movement_b),
+       KEY internal_transfer_tx (tenant_id, network, tx_hash)
      )${ENGINE}`,
     `CREATE TRIGGER internal_transfer_unique_movement BEFORE INSERT ON ${s}.internal_transfer_links
        FOR EACH ROW BEGIN
@@ -529,11 +533,12 @@ export const MIGRATIONS: readonly ((s: string) => readonly string[])[] = [
        id           ${T} PRIMARY KEY,
        tenant_id    ${T} NOT NULL,
        label        TEXT NOT NULL,
-       digest       CHAR(64) NOT NULL CONSTRAINT api_keys_digest_unique UNIQUE,
+       digest       CHAR(64) NOT NULL,
        scopes       LONGTEXT NOT NULL,
        created_at   ${TIME} NOT NULL,
        revoked_at   ${TIME},
-       last_used_at ${TIME}
+       last_used_at ${TIME},
+       CONSTRAINT api_keys_digest_unique UNIQUE (digest)
      )${ENGINE}`,
     `CREATE INDEX api_keys_tenant ON ${s}.api_keys (tenant_id, created_at)`,
 

@@ -1274,7 +1274,7 @@ class MysqlTx extends MysqlReader implements StoreTx {
          id, tenant_id, reference_pattern, account, direction, asset, decimals, amount,
          memo_type, memo_value, memo_text, payers, cadence, start_at, end_at, ended_at, created_at, updated_at
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [id, n.tenantId, n.referencePattern, n.direction ?? 'credit', n.amount.asset, n.amount.decimals, n.amount.raw.toString(), memoType, memoValue, memoText, JSON.stringify(n.payers ?? []), JSON.stringify(n.cadence), n.startAt, n.endAt ?? null, null, now, now],
+      [id, n.tenantId, n.referencePattern, n.account, n.direction ?? 'credit', n.amount.asset, n.amount.decimals, n.amount.raw.toString(), memoType, memoValue, memoText, JSON.stringify(n.payers ?? []), JSON.stringify(n.cadence), n.startAt, n.endAt ?? null, null, now, now],
     )
     const [row] = await this.run<ScheduleRow>(`SELECT * FROM ${this.s}.schedules WHERE id = ?`, [id])
     return toSchedule(row!)
@@ -1563,7 +1563,7 @@ class MysqlTx extends MysqlReader implements StoreTx {
     const linesInsert = valuesSql(lineRows)
     await this.run(
       `INSERT INTO ${this.s}.journal_lines (
-         entry_id, line_no, tenant_id, account, entity_id, role, side, asset, decimals, amount, expectation_id, exception_id
+         entry_id, tenant_id, line_no, account, entity_id, role, side, asset, decimals, amount, expectation_id, exception_id
         ) VALUES ${linesInsert.sql}`,
       linesInsert.params,
     )

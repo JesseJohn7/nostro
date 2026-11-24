@@ -30,6 +30,12 @@ async function freshStore(options: { now?: () => Date } = {}): Promise<MysqlStor
   })
   stores.push(store)
   await store.migrate()
+  // MySQL slows down as databases pile up, and each open pool holds connections.
+  const close = store.close.bind(store)
+  store.close = async () => {
+    await close()
+    await admin!.query(`DROP DATABASE IF EXISTS ${quote(database)}`)
+  }
   return store
 }
 
